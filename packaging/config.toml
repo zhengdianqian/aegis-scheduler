@@ -35,9 +35,10 @@ touch_ramp_ms = 60
 touch_ramp_stages = 3
 # 抬频结束后每 45ms 回落一级。
 touch_decay_ms = 45
-# 应用启动边沿（前台进程从空闲突然起负载）单独给 800ms 全簇高地板，
-# 覆盖冷启动首帧、dex/IO；结束后按 touch_decay_ms 正常回落。
-launch_lift_ms = 800
+# 应用启动边沿（前台进程从空闲突然起负载）单独给 1000ms 全簇高地板，
+# 覆盖冷启动首帧、dex/IO；窗口内前台持续有帧/线程活跃会自动续期，
+# 确认空闲后才按 touch_decay_ms 正常回落。
+launch_lift_ms = 1000
 launch_lift_level = 1.00
 frame_slack_ms = 3.0
 frame_burst_ms = 150
@@ -52,7 +53,8 @@ parked_headroom = 0.08
 [control.role_cap]
 efficiency = 1.00
 balanced = 1.00
-prime = 0.85
+# 默认不限制超大核：只有显式改小该值才会收窄 ceiling。
+prime = 1.00
 
 [charge]
 stop_at_percent = 80

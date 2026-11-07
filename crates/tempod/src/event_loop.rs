@@ -324,6 +324,10 @@ pub fn run(
     let mut last_foreground_us: u64 = 0;
     // Debounce for the app-start edge lift: one launch boost per 800 ms.
     let mut last_launch_us: u64 = 0;
+    // Launch lift stays until this timestamp; renewed while the foreground
+    // keeps producing work, so "draw shell first, load content later" apps
+    // are not decayed during their real compute phase.
+    let mut launch_until_us: u64 = 0;
 
     loop {
         poll.poll(&mut events, None)?;
@@ -414,12 +418,24 @@ pub fn run(
                                 .iter()
                                 .copied()
                                 .fold(0.0f32, f32::max);
-                            if was_quiet
+                            let launch_edge = was_quiet
                                 && sample.foreground_active
                                 && fg_peak >= 0.30
-                                && sample.ts_us.saturating_sub(last_launch_us) >= 800_000
-                            {
+                                && sample.ts_us.saturating_sub(last_launch_us) >= 800_000;
+                            // Renewal: inside the launch window the foreground
+                            // still shows real work (frames / active threads),
+                            // so keep the lift alive instead of trusting a single
+                            // low instantaneous sample.
+                            let launch_renew = !was_quiet
+                                && sample.ts_us < launch_until_us
+                                && sample.foreground_active
+                                && fg_peak >= 0.30
+                                && sample.ts_us.saturating_sub(last_launch_us) >= 100_000;
+                            if launch_edge || launch_renew {
                                 last_launch_us = sample.ts_us;
+                                launch_until_us = sample
+                                    .ts_us
+                                    .saturating_add(config.control.launch_lift_ms * 1_000);
                                 decisions = controller.on_app_launch(sample.ts_us);
                                 if let Ok(mut state) = status.lock() {
                                     state.launch_lifts += 1;

@@ -226,7 +226,7 @@ impl Default for ControlConfig {
             touch_ramp_ms: 60,
             touch_ramp_stages: 3,
             touch_decay_ms: 45,
-            launch_lift_ms: 800,
+            launch_lift_ms: 1000,
             launch_lift_level: 1.00,
             frame_slack_ms: 3.0,
             frame_burst_ms: 150,
@@ -244,7 +244,7 @@ impl Default for RoleCaps {
         Self {
             efficiency: 1.00,
             balanced: 1.00,
-            prime: 0.85,
+            prime: 1.00,
         }
     }
 }

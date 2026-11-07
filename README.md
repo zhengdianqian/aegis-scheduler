@@ -7,7 +7,7 @@ Aegis 是一个完全独立实现的 Android 调频模块（KernelSU / Magisk）
 - 许可证：**GPL-3.0-or-later**
 - 版权：`Copyright (c) 2026 默默的阿文`
 - 模块 id：`aegis_scheduler`｜对外显示名：**Aegis**
-- 版本：`v2.1.2`（`versionCode=6`）
+- 版本：`v2.2`（`versionCode=7`）
 - 模块描述：`自适应 CPU 调度+FAS + 充电控制`
 - 首发承诺机型：骁龙 8Gen2（`kalama` / `babylon`）
 
@@ -22,7 +22,7 @@ Aegis 是一个完全独立实现的 Android 调频模块（KernelSU / Magisk）
 | **自适应单档调度** | 统一的自适应模型，不区分游戏/日常/省电档位，按实时负载自动升降频 |
 | **只写下限，永不封顶** | 只写 `scaling_min_freq`；`scaling_max_freq` 始终保持硬件最大值，冷启动与重负载永远不会撞顶 |
 | **档位渐进** | 抬频三级递进（约 20 ms/级，60 ms 到达目标档），回落按滞回逐级下降（单步最多减半），不会从最低频直跳高频 |
-| **启动边沿** | 检测到应用启动（静默→前台、前台负载≥0.30）时，三簇地板一次性抬到 100% 并保持 800 ms，随后按 45 ms/级回落，覆盖首帧、dex/IO 与启动动画 |
+| **启动边沿** | 检测到应用启动（静默→前台、前台负载≥0.30）时，三簇地板一次性抬到 100% 并保持 1000 ms；窗口内前台持续有帧/线程活跃会自动续期，确认空闲后按 45 ms/级回落，覆盖首帧、dex/IO、启动动画与"先画壳后加载内容"类 App |
 | **FAS 帧感知**（默认关闭） | 仅对用户在 WebUI 手动勾选的应用生效，前台切换时解析一次并缓存，事件触发而非轮询；WebUI 与 APP 均显示中文应用名 |
 | **全事件驱动** | BPF ring、屏幕 inotify、evdev 触摸、FAS 结果、一次性 `timerfd`；静默时阻塞在 `epoll_wait`，无任何固定周期定时器 |
 | **开机安全** | `sys.boot_completed` 未置 1 前绝不写任何 cpufreq 节点（最多等 180 s，超时退出保留厂商默认）；开机后再留 10 s + 守护内部稳定期 |
@@ -38,7 +38,7 @@ Aegis 是一个完全独立实现的 Android 调频模块（KernelSU / Magisk）
 | `bin/Aegis` | 常驻守护，单一 epoll 事件循环，零固定周期定时器，空闲 CPU 接近 0 |
 | `bin/tempoctl` | 命令行控制与离线回放（`status` / `config.apply` / `restore` / `power.get` / `log.tail`） |
 | `webroot/` | 内置 WebUI（KernelSU / Magisk 模块页内嵌，也可浏览器打开），与 APP 内置资源为同一份 8 文件构建 |
-| `Aegis-v2.1.2.apk` | 独立控制端（包名 `com.aegis.scheduler`，WebView 壳，读写同一 socket） |
+| `Aegis-v2.2.apk` | 独立控制端（包名 `com.aegis.scheduler`，WebView 壳，读写同一 socket） |
 
 > 同时只保留一个控制端（`com.aegis.scheduler`）。若设备上存在旧包名的控制端请先卸载，避免两个进程同时写配置。
 
@@ -53,9 +53,9 @@ Aegis 是一个完全独立实现的 Android 调频模块（KernelSU / Magisk）
 ## 安装
 
 1. **卸载旧模块**：模块管理器里删除或禁用历史调度模块（本模块会自动给旧目录打 `disable`，但推荐手动卸载以免残留两份 WebUI）。旧目录请保留而非删除，便于回滚。
-2. 通过 **KernelSU / Magisk 刷入** `Aegis-v2.1.2.zip`。
+2. 通过 **KernelSU / Magisk 刷入** `Aegis-v2.2.zip`。
 3. 重启，等待 `sys.boot_completed=1`。开机阶段不写任何 cpufreq；开机完成并稳定后才接管。
-4. 打开 **WebUI**（模块页面内嵌），或安装 `Aegis-v2.1.2.apk`。
+4. 打开 **WebUI**（模块页面内嵌），或安装 `Aegis-v2.2.apk`。
 5. 首次运行 APP 需在 KernelSU「超级用户」页为 **Aegis** 打开开关。未授权时界面提示「控制服务未就绪」，仅控制命令不可用。
 
 ## 使用
