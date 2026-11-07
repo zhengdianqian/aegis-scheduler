@@ -90,7 +90,7 @@ sh /data/adb/modules/aegis_scheduler/scripts/restore.sh
 
 ## 已知限制
 
-- c0 的 `scaling_min_freq` 受厂商 PM QoS 固定为 **672000**，写 307200 无效；绕过需停用 perfservice，已明确禁止。
+- c0 的 `scaling_min_freq` 受厂商 PM QoS 波动影响：多数时段写 307200 会被回读为 **672000**；本次静态实测 307200 可保持（82.25% 时间）。绕过限制需停用 perfservice，已明确禁止。
 - 微信冷启动 **25.9%–26.5%**（90th 250 ms），为当前最弱项，与厂商首帧渲染路径相关。
 - 静默期厂商 perfservice 会周期性抬 c1/c2 地板，对账后写回，实测约 2–3 次/秒。
 - **充电控制本轮未做真机验证**（80/90/100 上限、100% 锁存、预约时段、温度停充均以沙盒结果为准）。
@@ -106,7 +106,7 @@ sh /data/adb/modules/aegis_scheduler/scripts/restore.sh
 SHA256：
 
 ```text
-99B067AD2900A01B1E92D6C791C1172E926E3DA7C888CC1F81C505DCE4AB87BE  Aegis-v2.1.1.zip
+71ED91366E89BEA338485BB98846B1225415C5BD1E93FE155975362A55C65158  Aegis-v2.1.1.zip
 6FBF772BE9A1BD800B64B5B36B8BDB0A3B5649B4FED5386E5688DFC23BF5F6E6  Aegis-v2.1.1.apk
 ```
 

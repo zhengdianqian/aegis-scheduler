@@ -4,8 +4,8 @@
 > §8 起为 v2.0.0 正式版数据（守护名 `Aegis`，versionCode=3）。
 
 设备：骁龙 8Gen2（`kalama` / `babylon`，本机），KernelSU root。
-对照组：厂商默认调度（禁用旧模块 `aegis_power_matrix`，`aegisd` 不参与；
-所有厂商服务原样运行）。实验组：Aegis `tempod` 运行并完成厂商调度屏蔽。
+对照组：厂商默认调度（历史调度模块已 disable，旧守护不参与；
+所有厂商服务原样运行）。实验组：Aegis 守护运行并只发布 CPU 地板。
 
 ## 1. 静态 A/B（亮屏静置，90 s，按 `time_in_state` 加权平均）
 

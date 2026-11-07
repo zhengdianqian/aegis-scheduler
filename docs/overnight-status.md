@@ -110,11 +110,11 @@ t0 后 6.11s `time_in_state`：c0 69.7%@672000、6.4%@787200、4.4%@2016000；c1
 - `pidof tempod`：空；`pidof Aegis`：单实例（8945）。模块运行脚本中已无 `tempod` 引用（`service.sh`/`uninstall.sh` 的清理改为 `Aegis`）。
 - 版本：`2.1.0`（Cargo workspace / module.properties / status 一致）。
 - 产物：`D:\dev\tempo-build-android\Aegis-v2.1.0.zip`，内含新 `bin/Aegis`（2447216 字节）与更新后的 `service.sh`/`uninstall.sh`/`shield.sh`/`cpufreq_backup.sh`/README；`webroot` 8 个文件 SHA256 与 `webui/dist` 完全一致。
-- 回滚路径：旧 `Aegis-v2.0.0.zip` 保留；`aegis_power_matrix` 仅 disable 保留；`/data/adb/tempo/orig` 记录 cpuinfo min/max 与原始 governor；`restore.sh`/`tempoctl restore` 可用。
+- 回滚路径：旧 `Aegis-v2.0.0.zip` 保留；历史调度模块仅 `disable` 保留；`/data/adb/tempo/orig` 记录 cpuinfo min/max 与原始 governor；`restore.sh`/`tempoctl restore` 可用。
 
 ## 六、已知风险
 
-- c0 的 `scaling_min_freq` 被厂商 PM QoS 固定在 672000，Aegis 写 307200 无效；这是静态频率不能更低的主因，强行绕过需停 perfservice，已明令禁止。
+- c0 的 `scaling_min_freq` 多数时段被厂商 PM QoS 固定在 672000，Aegis 写 307200 会被回读（v2.1.1 复测曾观测到 307200 可保持，见第七节）；强行绕过需停 perfservice，已明令禁止。
 - quiet 状态下厂商 perfservice 会周期性抬 c1/c2 地板，Aegis 对账后写回，实测 `writer.writes` 约 2–3 次/秒；CPU 已降至 0.38%，但写抖动仍存在，可后续把对账间隔从 1s 放宽到 2–3s 再评估。
 - `foreground_pids` 长期偏大（145–469），前台包名解析依赖 `dumpsys` 兜底；不阻塞功能，需后续定位。
 - 微信冷启动 Janky 29.3%、99th 300ms，仍是弱项；与厂商首帧渲染相关，需单独 profile。
@@ -170,9 +170,9 @@ t0 后 6.11s `time_in_state`：c0 69.7%@672000、6.4%@787200、4.4%@2016000；c1
 ### 6. 发布物与版本
 
 - 版本：Cargo workspace / `module.properties` / `status` 均为 `2.1.1`，`versionCode=5`；APP `versionName=2.1.1 / versionCode=5`。
-- 模块包：`Aegis-v2.1.1.zip`（1,660,057 字节，SHA256 `99B067AD2900A01B1E92D6C791C1172E926E3DA7C888CC1F81C505DCE4AB87BE`）。
+- 模块包：`Aegis-v2.1.1.zip`（1,660,092 字节，SHA256 `71ED91366E89BEA338485BB98846B1225415C5BD1E93FE155975362A55C65158`）。
 - APK：`Aegis-v2.1.1.apk`（971,016 字节，SHA256 `6FBF772BE9A1BD800B64B5B36B8BDB0A3B5649B4FED5386E5688DFC23BF5F6E6`）。
 - `webroot` 8 个 Web 文件 SHA256 与 `webui/dist` 全量一致（icon.png 为模块图标，独立复制）。
 - 设备收口：`pidof tempod` 为空，`/data/adb/tempo/tempod.new`、`tempod.log` 已删除；`pidof Aegis` 单实例。
-- `aegis_power_matrix` 保持仅 `disable`，未删除；`restore.sh` / `shield.sh restore` / `tempoctl restore` 保留可用。
+- 历史调度模块保持仅 `disable`，未删除；`restore.sh` / `shield.sh restore` / `tempoctl restore` 保留可用。
 

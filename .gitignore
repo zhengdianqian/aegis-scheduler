@@ -83,6 +83,9 @@ capture-*.jpg
 compile_commands.json
 rust-analyzer.json
 
+# ---- 内部设计稿（不公开）----
+docs/internal/
+
 # ---- 系统垃圾 ----
 .DS_Store
 .DS_Store?
