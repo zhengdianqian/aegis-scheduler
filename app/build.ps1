@@ -11,7 +11,7 @@ $webuiDist = Join-Path $webuiRoot 'dist'
 $assets = Join-Path $appRoot 'app\src\main\assets\webui'
 $apkOut = Join-Path $appRoot 'app\build\outputs\apk\debug\app-debug.apk'
 $deliveryDir = 'D:\dev\tempo-build-android\tempo-app'
-$deliveryApk = Join-Path $deliveryDir 'Aegis-v2.1.1.apk'
+$deliveryApk = Join-Path $deliveryDir 'Aegis-v2.1.2.apk'
 
 # 1. Regenerate the static WebUI bundle from sources.
 & (Join-Path $webuiRoot 'build.ps1')

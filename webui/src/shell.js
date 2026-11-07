@@ -305,7 +305,7 @@
           return;
         }
         if (command.indexOf('command -v tempoctl') !== -1) {
-          resolve({ code: 0, stdout: '/data/adb/modules/tempo_sched/bin/tempoctl\n', stderr: '' });
+          resolve({ code: 0, stdout: '/data/adb/modules/aegis_scheduler/bin/tempoctl\n', stderr: '' });
           return;
         }
         resolve({ code: 0, stdout: '', stderr: '' });

@@ -20,6 +20,10 @@ if (Test-Path "$root\LICENSE") { Copy-Item "$root\LICENSE" $stage }
 if (Test-Path "$root\README.md") { Copy-Item "$root\README.md" $stage }
 Copy-Item "$root\webui\dist\*" "$stage\webroot" -Recurse
 
+# Bundle the matching APK so the module zip is self-contained.
+$apk = 'D:\dev\tempo-build-android\tempo-app\Aegis-v{0}.apk' -f $Version
+if (Test-Path $apk) { Copy-Item $apk $stage }
+
 Remove-Item $zip -Force -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem

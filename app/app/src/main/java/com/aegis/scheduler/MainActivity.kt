@@ -20,6 +20,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -35,10 +36,13 @@ class MainActivity : Activity() {
 
     private lateinit var webView: WebView
     private val executor = Executors.newSingleThreadExecutor()
+    private val labelExecutor = Executors.newSingleThreadExecutor()
     private val iconCache = HashMap<String, String>()
     private var rootCheckStarted = false
     private var rootDialog: AlertDialog? = null
     private var appsCache: String? = null
+    @Volatile private var labelsLastTry = 0L
+    @Volatile private var labelsExportedAt = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -91,6 +95,7 @@ class MainActivity : Activity() {
         rootDialog?.dismiss()
         rootDialog = null
         executor.shutdownNow()
+        labelExecutor.shutdownNow()
         if (this::webView.isInitialized) webView.destroy()
         super.onDestroy()
     }
@@ -111,6 +116,9 @@ class MainActivity : Activity() {
                 .apply()
             if (!rooted) {
                 runOnUiThread { showRootDialog() }
+            } else {
+                // 启动时导出一次应用名映射，供 KernelSU WebUI 的 FAS 页使用。
+                scheduleLabelsExport(force = true)
             }
         }
     }
@@ -190,6 +198,68 @@ class MainActivity : Activity() {
             }
         }
         return Triple(127, "", lastError?.message ?: "无法执行命令")
+    }
+
+    /* ---------- labels ---------- */
+
+    /**
+     * 导出 `包名 → 应用名` 映射到模块配置目录，供 KernelSU WebUI 的 FAS 页读取。
+     * 只包含包名和应用名，不写路径、账号或其他信息。
+     */
+    private fun scheduleLabelsExport(force: Boolean = false) {
+        if (labelExecutor.isShutdown) return
+        labelExecutor.execute {
+            val now = System.currentTimeMillis()
+            if (!force && labelsExportedAt > 0 && now - labelsExportedAt < LABEL_RETRY_MS) return@execute
+            if (!force && now - labelsLastTry < LABEL_RETRY_MS) return@execute
+            labelsLastTry = now
+            exportLabels()
+        }
+    }
+
+    private fun exportLabels() {
+        try {
+            val manager = packageManager
+            val labels = JSONObject()
+            val previousLocale = Locale.getDefault()
+            try {
+                // 中文优先；缺少中文资源的应用由 loadLabel 自身回退。
+                Locale.setDefault(Locale.SIMPLIFIED_CHINESE)
+                manager.getInstalledApplications(0).forEach { application ->
+                    if (application.packageName == packageName) return@forEach
+                    val label = try {
+                        application.loadLabel(manager).toString().trim()
+                    } catch (ignored: Exception) {
+                        ""
+                    }
+                    if (label.isNotEmpty()) {
+                        labels.put(application.packageName, label)
+                    }
+                }
+            } finally {
+                Locale.setDefault(previousLocale)
+            }
+
+            val payload = JSONObject()
+                .put("version", 1)
+                .put("updated", System.currentTimeMillis())
+                .put("apps", labels)
+                .toString()
+
+            val cache = File(cacheDir, "aegis-labels.json")
+            cache.writeText(payload, Charsets.UTF_8)
+            val source = "'" + cache.absolutePath.replace("'", "'\\''") + "'"
+            val command = "mkdir -p /data/adb/tempo && cat " + source +
+                " > /data/adb/tempo/labels.json.tmp && chmod 600 /data/adb/tempo/labels.json.tmp" +
+                " && mv -f /data/adb/tempo/labels.json.tmp /data/adb/tempo/labels.json"
+            val result = runShell(command)
+            cache.delete()
+            if (result.first == 0) {
+                labelsExportedAt = System.currentTimeMillis()
+            }
+        } catch (ignored: Exception) {
+            // 导出失败不影响 APP 内的应用列表
+        }
     }
 
     /* ---------- apps ---------- */
@@ -284,6 +354,7 @@ class MainActivity : Activity() {
                 entries.forEach { array.put(it.third) }
                 val json = result.put("apps", array).put("error", JSONObject.NULL).toString()
                 appsCache = json
+                scheduleLabelsExport()
                 json
             } catch (error: Exception) {
                 result.put("apps", JSONArray())
@@ -296,5 +367,6 @@ class MainActivity : Activity() {
     companion object {
         private const val PREFS = "aegis"
         private const val KEY_ROOT_OK = "root_ok"
+        private const val LABEL_RETRY_MS = 10 * 60 * 1000L
     }
 }

@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '2.0.0';
+  var APP_VERSION = '2.1.2';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -231,9 +231,7 @@
 
   function appLabel(app) {
     if (app.name) return app.name;
-    var segment = String(app.package || '').split('.').pop() || app.package;
-    segment = segment.replace(/[-_]/g, ' ');
-    return segment.charAt(0).toUpperCase() + segment.slice(1);
+    return app.package || '';
   }
 
   function appHue(pkg) {
@@ -1505,17 +1503,46 @@
     state.fasAppsLoading = true;
     state.fasAppsError = null;
     if (state.tab === 'fas') updateFasList();
+
+    var finish = function (error, apps) {
+      state.fasAppsLoading = false;
+      state.fasApps = apps || [];
+      state.fasAppsError = error || null;
+      state.fasAppsLoaded = !error;
+      if (state.tab === 'fas') updateFasList();
+    };
+
     api.queryPackages().then(function (result) {
-      state.fasAppsLoading = false;
-      state.fasApps = result.apps || [];
-      state.fasAppsError = result.error || null;
-      state.fasAppsLoaded = !result.error;
-      if (state.tab === 'fas') updateFasList();
+      var apps = result.apps || [];
+      if (result.error || !apps.length) {
+        finish(result.error, apps);
+        return;
+      }
+      var needLabels = apps.some(function (app) { return !app.name; });
+      if (!needLabels) {
+        finish(null, apps);
+        return;
+      }
+      return api.queryLabels().then(function (labels) {
+        // 优先级：APP 导出的映射 > 系统查询到的名称 > 包名回退。
+        apps = apps.map(function (app) {
+          return {
+            package: app.package,
+            name: labels[app.package] || app.name || null,
+            icon: app.icon || null,
+            type: app.type || 'user'
+          };
+        });
+        apps.sort(function (a, b) {
+          if (a.type !== b.type) return a.type === 'user' ? -1 : 1;
+          return (a.name || a.package).localeCompare(b.name || b.package);
+        });
+        finish(null, apps);
+      }).catch(function () {
+        finish(null, apps);
+      });
     }).catch(function (error) {
-      state.fasAppsLoading = false;
-      state.fasAppsLoaded = false;
-      state.fasAppsError = '读取应用列表失败：' + String((error && error.message) || error);
-      if (state.tab === 'fas') updateFasList();
+      finish('读取应用列表失败：' + String((error && error.message) || error), []);
     });
   }
 

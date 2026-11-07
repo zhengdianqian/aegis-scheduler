@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "tempo-core"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "tempoctl"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "clap",
  "serde_json",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "tempod"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "aya",
  "clap",

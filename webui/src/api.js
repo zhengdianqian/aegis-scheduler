@@ -16,14 +16,17 @@
     configBak: '/data/adb/tempo/config.toml.bak',
     fas: '/data/adb/tempo/fas.json',
     chargePlan: '/data/adb/tempo/charge_plan.json',
+    labels: '/data/adb/tempo/labels.json',
     profile: '/data/adb/tempo/profile/babylon.toml',
     socket: '/data/adb/tempo/run/control.sock',
     logdir: '/data/adb/tempo/log',
-    moduleProp: '/data/adb/modules/tempo_sched/module.prop',
-    moduleDir: '/data/adb/modules/tempo_sched'
+    moduleProp: '/data/adb/modules/aegis_scheduler/module.prop',
+    moduleDir: '/data/adb/modules/aegis_scheduler'
   };
 
   var BIN_CANDIDATES = [
+    '/data/adb/modules/aegis_scheduler/bin/tempoctl',
+    '/data/adb/modules/aegis_scheduler/tempoctl',
     '/data/adb/modules/tempo_sched/bin/tempoctl',
     '/data/adb/modules/tempo_sched/tempoctl',
     '/data/adb/tempo/bin/tempoctl',
@@ -281,6 +284,45 @@
       return { apps: apps.slice(0, 800), error: null };
     }).catch(function (error) {
       return { apps: [], error: shorten(error.message, 160) };
+    });
+  };
+
+  var LABEL_STALE_MS = 30 * 24 * 60 * 60 * 1000;
+
+  /**
+   * 读取 APP 导出的 `包名 → 应用名` 映射。
+   * 文件缺失、格式异常或超过 30 天时静默返回空对象，由调用方回退到包名。
+   */
+  TempoApi.prototype.queryLabels = function () {
+    var self = this;
+    var command = 'cat "' + PATHS.labels + '" 2>/dev/null || echo __EMPTY__';
+
+    return self._exec(command, 6000).then(function (result) {
+      var output = text(result.stdout).trim();
+      if (!output || output === '__EMPTY__') return {};
+      var parsed = null;
+      try {
+        parsed = global.JSON.parse(output);
+      } catch (error) {
+        return {};
+      }
+      if (!parsed || parsed.version !== 1 || !parsed.apps || typeof parsed.apps !== 'object') {
+        return {};
+      }
+      if (typeof parsed.updated === 'number' && Date.now() - parsed.updated > LABEL_STALE_MS) {
+        return {};
+      }
+      var labels = {};
+      Object.keys(parsed.apps).forEach(function (pkg) {
+        var name = parsed.apps[pkg];
+        if (typeof name === 'string') {
+          name = name.trim();
+          if (name && name !== pkg) labels[pkg] = name;
+        }
+      });
+      return labels;
+    }).catch(function () {
+      return {};
     });
   };
 
