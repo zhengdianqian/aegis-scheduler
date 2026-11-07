@@ -1,0 +1,32 @@
+[package]
+name = "tempo-probe"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["默默的阿文"]
+
+# Built separately for the BPF target; not a member of the main workspace.
+[workspace]
+
+[[bin]]
+name = "tempo-probe"
+path = "src/main.rs"
+test = false
+bench = false
+doctest = false
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[profile.release]
+# LLVM no longer accepts -Os for BPF; O2 plus `opt-size` would be the modern
+# equivalent, and O2 is what bpf-linker expects.
+opt-level = 2
+lto = true
+panic = "abort"
+codegen-units = 1
+# BTF is generated from debug info; the loader needs it for map definitions.
+debug = true
+# Keep symbols and BTF: the loader needs them to resolve maps, programs and
+# section names. Never strip the probe object.
+strip = false

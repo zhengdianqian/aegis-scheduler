@@ -1,0 +1,91 @@
+# ---- Rust / Cargo ----
+target/
+**/target/
+*.rs.bk
+
+# ---- Android / Gradle ----
+.gradle/
+**/.gradle/
+build/
+**/build/
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+captures/
+.cxx/
+
+# ---- Node / WebUI ----
+node_modules/
+**/node_modules/
+webui/dist/
+dist/
+.pnpm-store/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- 构建产物 / 发布物 ----
+*.zip
+*.so
+*.dylib
+*.dll
+*.o
+*.a
+output/
+release/
+
+# ---- 签名与凭据（绝不入库）----
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+key.properties
+keystore.properties
+.env
+.env.*
+secrets.toml
+
+# ---- 运行日志 / 调试产物 ----
+*.log
+logcat*.txt
+dumpsys*.txt
+*.trace
+*.perfetto-trace
+time_in_state*.txt
+cpufreq*.txt
+top*.txt
+*.tmp
+*.bak
+*.orig
+*~
+*.swp
+
+# ---- 设备隐私数据（不要提交任何真机采集）----
+device-*/
+deviceinfo*.json
+serial*.txt
+adb-*/
+.screenshots/
+screenshots/
+shots/
+capture-*.png
+capture-*.jpg
+
+# ---- 本地工具配置 ----
+.vscode/
+.idea/
+*.iml
+.clangd/
+compile_commands.json
+rust-analyzer.json
+
+# ---- 系统垃圾 ----
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+desktop.ini

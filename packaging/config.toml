@@ -1,0 +1,76 @@
+# Aegis 默认配置（自有字段，单一自适应模式）
+# 数值为本机与同类 8Gen2 标定起点，Tier B 设备由标定流程覆盖。
+schema = 1
+
+[daemon]
+log_level = "info"
+profile_path = "/data/adb/tempo/profile/babylon.toml"
+
+[events]
+runtime_quantum_us = 50000
+demand_step = 0.10
+screen_path = ""
+frame_stride = 2
+quiet_decay_ms = 60
+
+[control]
+quiet_ratio = 0.50
+quiet_cap = 0.28
+floor_enter_ratio = 0.05
+floor_exit_ratio = 0.12
+floor_settle_ms = 60
+floor_exit_ms = 60
+fg_fast_ms = 100
+floor_residence_ms = 0
+drop_ratio = 0.08
+# 回落时每一步最多减半（drop_factor=2），并至少间隔 touch_decay_ms，
+# 避免从高负载一步砸回最低频。
+drop_factor = 2.0
+touch_lift_ms = 150
+# 触摸抬频的目标档位（三簇约 0.44 / 0.79 / 1.42 GHz 起步，逐级到
+# 0.96 / 1.52 / 1.76 GHz），不是最高档。
+touch_lift_level = 0.45
+# 三级抬频，60ms 内完成；每级 20ms，人眼不可感知，也不会一步顶到最高频。
+touch_ramp_ms = 60
+touch_ramp_stages = 3
+# 抬频结束后每 45ms 回落一级。
+touch_decay_ms = 45
+# 应用启动边沿（前台进程从空闲突然起负载）单独给 800ms 全簇高地板，
+# 覆盖冷启动首帧、dex/IO；结束后按 touch_decay_ms 正常回落。
+launch_lift_ms = 800
+launch_lift_level = 1.00
+frame_slack_ms = 3.0
+frame_burst_ms = 150
+frame_burst_level = 0.70
+reserve_ratio = 1.05
+step_hysteresis = 0.03
+# 空闲时保留的可用余量：ceiling 不会低于 floor + 该比例 × (硬件上限 - floor)。
+# 0.08 表示三簇静止时仍留有约 8% 的可调度空间，min 只是允许下探的目标，
+# 永远不会把三簇同时锁死在最低频。
+parked_headroom = 0.08
+
+[control.role_cap]
+efficiency = 1.00
+balanced = 1.00
+prime = 0.85
+
+[charge]
+stop_at_percent = 80
+resume_at_percent = 70
+temp_stop_c = 45.0
+temp_resume_c = 40.0
+# 仅 100% 上限使用“插电会话内保持”；80/90 使用回差自动复充。
+# 守护按 stop_at_percent == 100 推导，此字段仅用于兼容旧配置。
+latch_per_plug = false
+
+[thermal]
+guard_c = 45.0
+profile = "auto"
+
+[ui]
+language = "zh"
+
+[fas]
+enabled = false
+apps = []
+frame_budget_ms = 16.0

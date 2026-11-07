@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tempo-core",
+    "crates/tempod",
+    "crates/tempoctl",
+]
+
+[workspace.package]
+version = "2.1.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["默默的阿文"]
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+panic = "abort"
+strip = true
