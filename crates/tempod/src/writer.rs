@@ -49,16 +49,83 @@ struct Policy {
     last_cap: u32,
     /// Last time a ceiling write was issued for this cluster.
     last_cap_write: Option<Instant>,
-    /// Last time a floor write was issued for this cluster.
-    last_write: Option<Instant>,
     /// Last time the quiet floor was compared with the live value.
     last_reconcile: Option<Instant>,
-    /// When a floor write was silently rejected by a vendor QoS limit
-    /// (`scaling_min_freq` read back above the target). Further retries wait
-    /// until this instant so the daemon does not fight the vendor.
-    retry_after: Option<Instant>,
+    /// The controller settled on the lowest tier with no recent touch, launch
+    /// or load: only then may the floor be pulled down.
+    idle_floor: bool,
+    /// Last time a `scaling_min_freq` write was issued for this cluster.
+    last_floor_write: Option<Instant>,
+    /// Lowest floor this platform actually accepted (0 = not yet learned).
+    /// This device clamps the efficiency cluster to 672 MHz, so writing the
+    /// ladder target there would be rejected on every pass.
+    floor_effective: u32,
+    /// Consecutive floor attempts that did not reach the request.
+    floor_tries: u32,
+    /// Live floor observed on the previous attempt.
+    floor_seen: u32,
+    /// Request used by the previous attempt.
+    floor_request: u32,
+    /// True once a floor at or below the ladder target has been observed.
+    floor_achieved: bool,
     /// Last ceiling value this daemon requested and when.
     last_cap_request: Option<(u32, Instant)>,
+}
+
+/// Outcome of one idle floor evaluation.
+enum FloorStep {
+    /// Nothing to do.
+    Idle,
+    /// Write this value to `scaling_min_freq`.
+    Write(u32),
+    /// The platform clamps the floor at this value; stop asking for less.
+    Learned(u32),
+}
+
+impl Policy {
+    /// Decides the next floor action for an idle cluster.
+    ///
+    /// The platform may clamp `scaling_min_freq` above the request (this
+    /// device pins the efficiency cluster at 672 MHz). Asking for less every
+    /// pass would be a permanent fight, so the first two attempts discover the
+    /// accepted floor and later passes request it directly. A vendor boost is
+    /// retried with a short bounded back-off instead of tight-looping.
+    fn floor_step(&mut self, target: u32, now: Instant) -> FloorStep {
+        let Some(current) = read_u32(&self.dir.join("scaling_min_freq")) else {
+            return FloorStep::Idle;
+        };
+        let desired = target.max(self.floor_effective);
+        if current <= desired {
+            self.floor_tries = 0;
+            self.floor_seen = 0;
+            self.floor_achieved = true;
+            return FloorStep::Idle;
+        }
+        let wait = 500u64
+            .saturating_mul(1 << self.floor_tries.min(3))
+            .min(5000);
+        if self
+            .last_floor_write
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(wait))
+        {
+            return FloorStep::Idle;
+        }
+        if self.floor_request == desired && current == self.floor_seen {
+            self.floor_tries = self.floor_tries.saturating_add(1);
+        } else {
+            self.floor_tries = 1;
+            self.floor_seen = current;
+        }
+        self.floor_request = desired;
+        if self.floor_tries >= 2 && self.floor_effective == 0 && !self.floor_achieved {
+            // The platform rejected the ladder target twice with the same
+            // higher value: that value is the real floor of this cluster.
+            self.floor_effective = current;
+            self.floor_tries = 0;
+            return FloorStep::Learned(current);
+        }
+        FloorStep::Write(desired)
+    }
 }
 
 /// Minimum spacing between write pairs for the same cluster, so two commits in
@@ -72,9 +139,24 @@ const CAP_DEADBAND: f32 = 0.04;
 /// A ceiling request that does not move by at least the deadband is not
 /// repeated within this window.
 const CAP_RETRY: Duration = Duration::from_secs(10);
-/// After a floor write rejected by a vendor QoS limit, stop retrying for a
-/// while. Fighting a persistent QoS request only burns CPU and log lines.
-const BLOCKED_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether normal control also writes `scaling_min_freq` while the device is
+/// idle.
+///
+/// A vendor perf HAL raises the floor to 787 / 1056 / 1248 MHz on this device
+/// on every touch and app launch, and it does not decay on its own: measured
+/// idle, the ladder target 307 / 499 / 595 MHz was restored by a single write
+/// and stayed for 45 s. The floor is therefore written back, but only while
+/// the controller reports an idle cluster, and with a bounded back-off, so a
+/// boost window is never fought mid-interaction.
+/// `AEGIS_WRITE_FLOOR=0` turns it off for an A/B run on the same binary.
+const WRITE_FLOOR_ENV: &str = "AEGIS_WRITE_FLOOR";
+
+fn write_floor_enabled() -> bool {
+    std::env::var(WRITE_FLOOR_ENV)
+        .map(|value| !matches!(value.trim(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
+}
 
 pub struct CpufreqWriter {
     policies: Vec<Policy>,
@@ -86,6 +168,8 @@ pub struct CpufreqWriter {
     /// upper cap. The controller already emits a cap; this is a second,
     /// independent floor of protection against a bad decision.
     safety_ratio: f32,
+    /// Whether the ladder target is also written to `scaling_min_freq`.
+    write_floor: bool,
     /// Read-only guard. No sysfs write happens before this instant, so a slow
     /// boot cannot ever be made slower by the module.
     guard_until: Option<Instant>,
@@ -136,9 +220,14 @@ impl CpufreqWriter {
                 last_target: 0,
                 last_cap: hw_max,
                 last_cap_write: None,
-                last_write: None,
                 last_reconcile: None,
-                retry_after: None,
+                idle_floor: false,
+                last_floor_write: None,
+                floor_effective: 0,
+                floor_tries: 0,
+                floor_seen: 0,
+                floor_request: 0,
+                floor_achieved: false,
                 last_cap_request: None,
             });
         }
@@ -149,6 +238,7 @@ impl CpufreqWriter {
             floor_writes: 0,
             rejected_floor: 0,
             safety_ratio: safety_ratio.clamp(0.20, 0.70),
+            write_floor: write_floor_enabled(),
             guard_until: None,
             last_error: None,
         })
@@ -203,8 +293,26 @@ impl CpufreqWriter {
                 continue;
             }
             policy.last_reconcile = Some(now);
-            let current_min =
-                read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(policy.hw_min);
+            // A vendor perf service can raise the floor without any scheduling
+            // event, so the idle state repairs it here as well.
+            if self.write_floor && policy.idle_floor {
+                match policy.floor_step(policy.last_target, now) {
+                    FloorStep::Write(value) => {
+                        match write_khz(&policy.dir.join("scaling_min_freq"), value) {
+                            Ok(()) => {
+                                policy.last_floor_write = Some(now);
+                                self.floor_writes += 1;
+                                self.applied += 1;
+                            }
+                            Err(problem) => {
+                                failure.get_or_insert(problem);
+                            }
+                        }
+                    }
+                    FloorStep::Learned(_) => self.rejected_floor += 1,
+                    FloorStep::Idle => {}
+                }
+            }
             let cap = cap_for(policy, policy.last_target, live_max, self.safety_ratio);
             if !cap_needs_write(policy, live_max, cap, policy.last_target)
                 || cap_repeat_suppressed(policy, cap, policy.last_target, live_max, now)
@@ -220,15 +328,6 @@ impl CpufreqWriter {
             policy.last_cap_request = Some((cap, now));
             self.cap_writes += 1;
             self.applied += 1;
-            // A vendor floor may also drift above our target; pull it back only
-            // when it is not a rejected QoS request.
-            if current_min > policy.last_target
-                && !policy.retry_after.is_some_and(|retry| now < retry)
-            {
-                if write_khz(&policy.dir.join("scaling_min_freq"), policy.last_target).is_ok() {
-                    self.floor_writes += 1;
-                }
-            }
         }
         self.last_error = failure.clone();
         match failure {
@@ -294,34 +393,33 @@ impl CpufreqWriter {
                 self.applied += 1;
             }
 
-            let current_min =
-                read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(policy.hw_min);
-            if current_min == target || policy.retry_after.is_some_and(|retry| now < retry) {
+            // Low tier with no touch, launch or load pressure: the vendor boost
+            // floor can be lowered without fighting an interaction window.
+            policy.idle_floor = decision.idle;
+
+            if !self.write_floor || !policy.idle_floor {
+                tracing::debug!(cluster = policy.cluster, target, write_cap, live_max, "cap applied");
                 continue;
             }
-            if policy
-                .last_write
-                .is_some_and(|last| now.duration_since(last) < WRITE_SPACING)
-            {
-                continue;
+            match policy.floor_step(target, now) {
+                FloorStep::Write(value) => match write_khz(&policy.dir.join("scaling_min_freq"), value)
+                {
+                    Ok(()) => {
+                        policy.last_floor_write = Some(now);
+                        self.floor_writes += 1;
+                        self.applied += 1;
+                        tracing::debug!(cluster = policy.cluster, value, "floor lowered");
+                    }
+                    Err(problem) => {
+                        failure.get_or_insert(problem);
+                    }
+                },
+                FloorStep::Learned(value) => {
+                    self.rejected_floor += 1;
+                    tracing::debug!(cluster = policy.cluster, value, "platform floor learned");
+                }
+                FloorStep::Idle => {}
             }
-            if let Err(problem) = write_khz(&policy.dir.join("scaling_min_freq"), target) {
-                failure.get_or_insert(problem);
-                continue;
-            }
-            self.floor_writes += 1;
-            let readback = read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(target);
-            if readback > target {
-                // A vendor QoS request rejected the write. Back off instead of
-                // fighting it; the tier ladder continues from the live floor.
-                policy.retry_after = Some(now + BLOCKED_RETRY);
-                self.rejected_floor += 1;
-            } else {
-                policy.retry_after = None;
-            }
-            policy.last_write = Some(now);
-            self.applied += 1;
-            tracing::debug!(cluster = policy.cluster, target, write_cap, live_max, "tier applied");
         }
         self.last_error = failure.clone();
         match failure {

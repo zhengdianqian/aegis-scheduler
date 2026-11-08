@@ -158,7 +158,9 @@ tempoctl --config /data/adb/tempo/config.toml status --socket /data/adb/tempo/ru
 
 ## 4. 配置字段清单（写模型）
 
-字段名与 `config.rs` 完全一致（`deny_unknown_fields`，客户端不得发送额外键）。
+字段名与 `config.rs` 完全一致。守护对配置开启未知字段拒绝，因此客户端**不得凭空新增键**；
+但设备上已存在、而界面未暴露的合法字段（如 `floor_exit_ratio`、`fg_fast_ms`、`tier_table_max`、
+`startup_guard_ms`、`[scene]` 等）必须在写回时原样保留，不能因为保存一次参数就丢配置。
 所有数值均为“单一自适应模式”参数，不提供模式切换、不提供应用白名单。
 
 ### 4.1 分组、默认值、合法区间
@@ -255,7 +257,8 @@ tempoctl --config /data/adb/tempo/config.toml status --socket /data/adb/tempo/ru
   },
   "charge": {
     "stop_at_percent": 80, "resume_at_percent": 70,
-    "temp_stop_c": 45.0, "temp_resume_c": 40.0, "latch_per_plug": false
+    "temp_stop_c": 45.0, "temp_resume_c": 40.0, "latch_per_plug": false,
+    "full_current_ma": 100, "full_hold_seconds": 9, "full_voltage_mv": null
   },
   "thermal": {"guard_c": 45.0, "profile": "auto"},
   "ui": {"language": "zh"}
@@ -270,7 +273,8 @@ UI 内部统一用该 JSON 模型；与 TOML 的互转由客户端完成（TOML 
 
 ### 5.1 标准流程（不依赖守护新增命令）
 
-1. 由内存模型生成**完整** TOML（所有分组都写出，避免默认值歧义）。
+1. 以读取到的**完整文档**为基座，把界面暴露的字段合并回原文档；未暴露字段原样保留
+   （`Toml.applyModel`）。不得用内存模型整份重建，否则会丢设备的既有调参。
 2. 写入 `CFG_NEW`（`cat > ... <<'EOF'`，保持 UTF-8、LF）。
 3. 校验：`tempoctl --config CFG_NEW --profile PROFILE validate`
    - 退出码 0 且输出 JSON `ok=true` → 继续；
@@ -293,6 +297,16 @@ UI 内部统一用该 JSON 模型；与 TOML 的互转由客户端完成（TOML 
 ### 5.3 回滚
 
 UI 提供“恢复上一份配置”：`cp -f CFG_BAK CFG` + 回读。仅在 `CFG_BAK` 存在时可用。
+
+### 5.4 读取/解析失败（分页降级）
+
+- `config` 输出解析失败时不再整页报错：`loadConfig` 返回
+  `{doc, model, degraded:true, degradeReason}`，其中 `doc/model` 是容错解析能读到的部分加默认值。
+- 参数页与充电页各自独立渲染：能读到的字段照常显示，读不到的用默认值，并在页面内提示
+  “读取失败，已用默认值”；一个语法错误不得连带另一页失效。
+- 降级状态下**禁用保存与回滚**，避免用默认值覆盖设备配置；提供“重新读取”。
+- TOML 解析必须支持：多行数组、尾随逗号、行内注释、数字下划线分隔、字符串转义、
+  `[table]`、`[[array of tables]]`（设备 `device.toml` 的簇表即数组表）。
 
 ---
 

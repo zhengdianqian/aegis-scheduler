@@ -812,71 +812,83 @@ pub fn run(
             let mut closed = false;
 
             if let Some(connection) = connections.get_mut(&token) {
-                let mut chunk = [0u8; 1024];
-                match connection.stream.read(&mut chunk) {
-                    Ok(0) => closed = true,
-                    Ok(count) => {
-                        connection.buffer.extend_from_slice(&chunk[..count]);
-                        while let Some(position) =
-                            connection.buffer.iter().position(|byte| *byte == b'\n')
-                        {
-                            let line = String::from_utf8_lossy(&connection.buffer[..position])
-                                .trim()
-                                .to_owned();
-                            connection.buffer.drain(..=position);
-                            if line.is_empty() {
-                                continue;
-                            }
-                            let runtime =
-                                status.lock().map(|state| state.clone()).unwrap_or_default();
-                            let mut context = ControlContext {
-                                config: &mut config,
-                                profile: &profile,
-                                runtime: &runtime,
-                                config_path,
-                                log_path,
-                                started,
-                                writer: writer.as_mut(),
-                            };
-                            let (text, outcome) = ipc::handle(&mut context, &line);
-                            responses.push(text);
-                            if outcome == Outcome::Reloaded {
-                                controller = Controller::new(profile.clone(), config.clone());
-                                let decisions = controller.on_screen(now_us(), screen_on);
-                                commit(&decisions, &mut writer, &status);
-                                match controller.next_deadline(now_us()) {
-                                    Some(deadline) => deadline_source.arm(deadline.at_us),
-                                    None => deadline_source.disarm(),
+                // Readiness is edge triggered, so the socket must be drained
+                // until WouldBlock. A `config.apply` payload is larger than a
+                // single read; stopping after the first chunk left the request
+                // unfinished and the client (APP / tempoctl) waiting forever.
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match connection.stream.read(&mut chunk) {
+                        Ok(0) => {
+                            closed = true;
+                            break;
+                        }
+                        Ok(count) => {
+                            connection.buffer.extend_from_slice(&chunk[..count]);
+                            while let Some(position) =
+                                connection.buffer.iter().position(|byte| *byte == b'\n')
+                            {
+                                let line = String::from_utf8_lossy(&connection.buffer[..position])
+                                    .trim()
+                                    .to_owned();
+                                connection.buffer.drain(..=position);
+                                if line.is_empty() {
+                                    continue;
                                 }
-                                if let Ok(mut state) = status.lock() {
-                                    state.config_generation =
-                                        state.config_generation.saturating_add(1);
-                                    state.restart_required =
-                                        config.daemon.profile_path != startup_profile_path
-                                            || config.daemon.log_level != startup_log_level;
-                                }
-                                refresh_fas(
-                                    &config,
-                                    &foreground,
-                                    &mut fas,
-                                    &status,
-                                    screen_on,
-                                );
-                                if let Some(watcher) = charge.as_mut() {
-                                    let decision = watcher.update(&config, now_us());
-                                    tracing::info!(
-                                        action = decision.action.as_str(),
-                                        reasons = decision.reasons_joined().as_str(),
-                                        "charge reloaded after config.apply"
+                                let runtime =
+                                    status.lock().map(|state| state.clone()).unwrap_or_default();
+                                let mut context = ControlContext {
+                                    config: &mut config,
+                                    profile: &profile,
+                                    runtime: &runtime,
+                                    config_path,
+                                    log_path,
+                                    started,
+                                    writer: writer.as_mut(),
+                                };
+                                let (text, outcome) = ipc::handle(&mut context, &line);
+                                responses.push(text);
+                                if outcome == Outcome::Reloaded {
+                                    controller = Controller::new(profile.clone(), config.clone());
+                                    let decisions = controller.on_screen(now_us(), screen_on);
+                                    commit(&decisions, &mut writer, &status);
+                                    match controller.next_deadline(now_us()) {
+                                        Some(deadline) => deadline_source.arm(deadline.at_us),
+                                        None => deadline_source.disarm(),
+                                    }
+                                    if let Ok(mut state) = status.lock() {
+                                        state.config_generation =
+                                            state.config_generation.saturating_add(1);
+                                        state.restart_required =
+                                            config.daemon.profile_path != startup_profile_path
+                                                || config.daemon.log_level != startup_log_level;
+                                    }
+                                    refresh_fas(
+                                        &config,
+                                        &foreground,
+                                        &mut fas,
+                                        &status,
+                                        screen_on,
                                     );
-                                    publish_charge(watcher, &status);
+                                    if let Some(watcher) = charge.as_mut() {
+                                        let decision = watcher.update(&config, now_us());
+                                        tracing::info!(
+                                            action = decision.action.as_str(),
+                                            reasons = decision.reasons_joined().as_str(),
+                                            "charge reloaded after config.apply"
+                                        );
+                                        publish_charge(watcher, &status);
+                                    }
+                                    arm_charge_timer(charge.as_ref(), &charge_timer);
                                 }
-                                arm_charge_timer(charge.as_ref(), &charge_timer);
                             }
                         }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            closed = true;
+                            break;
+                        }
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => closed = true,
                 }
             } else {
                 closed = true;

@@ -74,6 +74,9 @@ pub struct Decision {
     pub tier_count: u32,
     pub reason: DecisionReason,
     pub changed: bool,
+    /// True when the cluster sits on its lowest tier with no touch, launch or
+    /// load pressure. Only then may the writer lower the vendor boost floor.
+    pub idle: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -695,6 +698,7 @@ impl Controller {
                 tier_count: count as u32,
                 reason,
                 changed,
+                idle: self.quiet && new_tier == 0,
             });
         }
         decisions
