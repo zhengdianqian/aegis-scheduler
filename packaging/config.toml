@@ -27,9 +27,9 @@ drop_ratio = 0.08
 # 避免从高负载一步砸回最低频。
 drop_factor = 2.0
 touch_lift_ms = 150
-# 触摸抬频的目标档位（三簇约 0.44 / 0.79 / 1.42 GHz 起步，逐级到
-# 0.96 / 1.52 / 1.76 GHz），不是最高档。
-touch_lift_level = 0.45
+# 触摸抬频的目标档位：只抬到中等（约 0.77 / 1.36 / 1.63 GHz 起步），
+# 长按照压倍速、拖动进度条不会一按就冲高档；持续产帧/超预算再逐级上。
+touch_lift_level = 0.30
 # 三级抬频，60ms 内完成；每级 20ms，人眼不可感知，也不会一步顶到最高频。
 touch_ramp_ms = 60
 touch_ramp_stages = 3
@@ -40,6 +40,14 @@ touch_decay_ms = 45
 # 确认空闲后才按 touch_decay_ms 正常回落。
 launch_lift_ms = 1000
 launch_lift_level = 1.00
+# 事件抬频时超大核最多到中等档；持续负载由 load curve 负责。
+prime_lift_level = 0.45
+# 即使持续滑动，超大核也不常驻顶档；只有真正重载帧压力才逐级逼近上限。
+prime_load_cap = 0.78
+# 软上限：scaling_max_freq 只保留“地板 + 该比例 × 硬件跨度”的空间。
+# 静态/输入法界面下厂商 boost 或触摸提示无法再把簇拉到顶档；
+# 真实帧压力会先抬地板，软上限随之抬高。
+ceiling_headroom = 0.18
 frame_slack_ms = 3.0
 frame_burst_ms = 150
 frame_burst_level = 0.70

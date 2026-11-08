@@ -9,7 +9,7 @@
 //! reading `/proc/<tid>/cmdline`, and caches the result. The package name feeds
 //! FAS eligibility and the runtime status; nothing here runs periodically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 
 const MAX_TIDS: usize = 512;
@@ -46,6 +46,7 @@ const SYSTEM_NAMES: &[&str] = &[
 #[derive(Debug, Default)]
 pub struct ForegroundResolver {
     package: Option<String>,
+    imes: Option<HashSet<String>>,
 }
 
 impl ForegroundResolver {
@@ -65,8 +66,20 @@ impl ForegroundResolver {
     /// activity is the only reliable source for "which app is in front". The
     /// `/proc` scan remains as a fallback when the shell helper is unavailable.
     pub fn resolve(&mut self, tids: &[u32]) -> Option<&str> {
+        if self.imes.is_none() {
+            self.imes = Some(ime_packages());
+        }
         let package = resumed_activity().or_else(|| top_process(tids));
-        self.package = package.map(|name| name.split(':').next().unwrap_or(&name).to_owned());
+        let name = package.map(|name| name.split(':').next().unwrap_or(&name).to_owned());
+        // An input method stealing the focused window is an overlay event, not
+        // an app switch: keep the app behind it so IME show/hide cannot trigger
+        // foreground lifts or FAS churn.
+        if let Some(name) = name.as_deref() {
+            if is_ime(name, self.imes.as_ref().unwrap()) {
+                return self.package.as_deref();
+            }
+        }
+        self.package = name;
         self.package.as_deref()
     }
 }
@@ -155,6 +168,40 @@ fn process_name(tid: u32) -> Option<String> {
 fn is_system(name: &str) -> bool {
     let base = name.split(':').next().unwrap_or(name);
     SYSTEM_NAMES.iter().any(|system| *system == base)
+}
+
+/// Packages of the configured input methods. Read once per resolver lifetime
+/// from Settings; the IME list changes rarely and never during a gesture.
+fn ime_packages() -> HashSet<String> {
+    let mut set = HashSet::new();
+    for key in ["default_input_method", "enabled_input_methods"] {
+        let Ok(output) = std::process::Command::new("/system/bin/settings")
+            .args(["get", "secure", key])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        for token in String::from_utf8_lossy(&output.stdout).split(':') {
+            if let Some(slash) = token.find('/') {
+                let package = token[..slash].trim();
+                if package.contains('.') {
+                    set.insert(package.to_owned());
+                }
+            }
+        }
+    }
+    set
+}
+
+fn is_ime(name: &str, imes: &HashSet<String>) -> bool {
+    if imes.contains(name) {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.contains("inputmethod") || lower.contains("input_method") || lower.ends_with("wetype")
 }
 
 #[cfg(test)]

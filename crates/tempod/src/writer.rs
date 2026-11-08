@@ -4,14 +4,14 @@
 
 //! Controlled cpufreq writer.
 //!
-//! The daemon is the only writer. It publishes a per-cluster **floor** through
-//! `scaling_min_freq` only: the hardware maximum is never lowered, so heavy
-//! work (cold starts, bursts, games) always has the full hardware range
-//! available. A floor is a target the governor may sit on, never a hard lock,
-//! and `scaling_max_freq` is only repaired upward at startup if an older build
-//! left it capped. Before every write the live ceiling is checked against the
-//! effective hardware maximum; a lower ceiling (for example a vendor thermal
-//! limit) makes the write be refused and logged instead of fought.
+//! The daemon publishes a per-cluster **floor** through `scaling_min_freq` and
+//! a soft **ceiling** through `scaling_max_freq`. The floor is a target the
+//! governor may sit on, never a hard lock. The ceiling is `floor +
+//! span * ceiling_headroom`, so the hardware maximum stays available whenever
+//! the measured demand earns it, while a vendor boost or an input hint can no
+//! longer slam a cluster to its top tier on a static screen. Before every write
+//! the live ceiling is compared with the target; a lower live ceiling (for
+//! example a vendor thermal limit) is respected instead of fought.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,12 @@ struct Policy {
     hw_max: u32,
     /// Hardware step list, ascending, used to snap a floor onto a real step.
     freqs: Vec<u32>,
+    /// Span of the ceiling above the floor, as a fraction of the hardware span.
+    cap_headroom: f32,
+    /// Last floor target applied. Used by the idle reconcile pass.
+    last_target: u32,
+    /// Last time a ceiling write was issued for this cluster.
+    last_cap_write: Option<Instant>,
     /// Last time a floor write was issued for this cluster.
     last_write: Option<Instant>,
     /// When a quiet downshift first became pending. A vendor boost hint can
@@ -74,7 +80,7 @@ pub struct CpufreqWriter {
 impl CpufreqWriter {
     /// Binds one policy directory per cluster. Missing or unreadable policy
     /// nodes are a capability failure: the caller must not schedule.
-    pub fn discover(profile: &DeviceProfile, _parked_headroom: f32) -> Result<Self, String> {
+    pub fn discover(profile: &DeviceProfile, ceiling_headroom: f32) -> Result<Self, String> {
         let mut policies = Vec::with_capacity(profile.clusters.len());
         for (cluster, entry) in profile.clusters.iter().enumerate() {
             let cpu = *entry
@@ -102,33 +108,10 @@ impl CpufreqWriter {
             freqs.sort_unstable();
             freqs.dedup();
 
-            // Repair a ceiling left below the hardware maximum by an older
-            // build. This is the only ever upward max write; it is never used
-            // again afterwards, so a vendor thermal limit is never fought.
-            let mut hw_max = live_max;
-            if live_max < hw_ceiling {
-                write_khz(&dir.join("scaling_max_freq"), hw_ceiling)?;
-                // Vendor QoS applies the ceiling asynchronously and may clamp
-                // it in more than one step (e.g. 3360000 -> 2726400 ->
-                // 2342400). Keep the lowest value observed during a short
-                // settle window so a transient read-back is never mistaken
-                // for the effective hardware maximum. A too-high `hw_max`
-                // would make every later floor write fail the ceiling check.
-                let mut settled = hw_ceiling;
-                for _ in 0..6 {
-                    std::thread::sleep(Duration::from_millis(50));
-                    if let Some(value) = read_u32(&dir.join("scaling_max_freq")) {
-                        settled = settled.min(value);
-                    }
-                }
-                hw_max = settled;
-                tracing::warn!(
-                    cluster,
-                    live_max,
-                    repaired = hw_max,
-                    "ceiling was below hardware max; restored"
-                );
-            }
+            // The theoretical hardware ceiling is the reference for the cap.
+            // A vendor thermal clamp is respected per write by clamping to the
+            // live ceiling right before writing.
+            let hw_max = hw_ceiling.max(live_max);
             // Keep the floor below the effective ceiling at all times.
             let pristine_min = hw_min.min(hw_max);
             policies.push(Policy {
@@ -140,6 +123,9 @@ impl CpufreqWriter {
                 hw_min: pristine_min,
                 hw_max,
                 freqs,
+                cap_headroom: ceiling_headroom,
+                last_target: 0,
+                last_cap_write: None,
                 last_write: None,
                 quiet_pending_since: None,
                 last_reconcile: None,
@@ -153,20 +139,61 @@ impl CpufreqWriter {
         })
     }
 
-    /// Retained for compatibility with the configuration surface. The new
-    /// design no longer parks a ceiling, so the headroom has no effect.
-    pub fn set_parked_headroom(&mut self, _parked_headroom: f32) {}
+    /// Re-derives the soft ceiling from the last floor target without waiting
+    /// for a scheduling event. Vendor perf services move floors while the
+    /// screen is static; this keeps the cap honest at a slow cadence.
+    pub fn reconcile(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let mut failure: Option<String> = None;
+        for policy in &mut self.policies {
+            if policy.last_target == 0 {
+                continue;
+            }
+            let live_max = read_u32(&policy.dir.join("scaling_max_freq")).unwrap_or(policy.hw_max);
+            if live_max <= policy.hw_min {
+                continue;
+            }
+            let current_min =
+                read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(policy.hw_min);
+            let cap = soft_cap(policy, policy.last_target.min(live_max), live_max, current_min);
+            if live_max == cap {
+                continue;
+            }
+            if let Some(last) = policy.last_cap_write {
+                if now.duration_since(last) < WRITE_SPACING {
+                    continue;
+                }
+            }
+            if let Err(problem) = write_khz(&policy.dir.join("scaling_max_freq"), cap) {
+                failure.get_or_insert(problem);
+                continue;
+            }
+            policy.last_cap_write = Some(now);
+            self.applied += 1;
+        }
+        self.last_error = failure.clone();
+        match failure {
+            Some(problem) => Err(problem),
+            None => Ok(()),
+        }
+    }
+
+    /// Applies a live ceiling headroom change from a configuration reload.
+    pub fn set_ceiling_headroom(&mut self, ceiling_headroom: f32) {
+        for policy in &mut self.policies {
+            policy.cap_headroom = ceiling_headroom;
+        }
+    }
 
     pub fn is_empty(&self) -> bool {
         self.policies.is_empty()
     }
 
-    /// Applies each decision as a **floor** on `scaling_min_freq`.
-    /// `scaling_max_freq` is never written here; the hardware ceiling stays
-    /// intact. A live ceiling below the effective hardware maximum (usually a
-    /// vendor thermal cap) refuses the write and records the reason.
+    /// Applies each decision as a **floor** on `scaling_min_freq` and a soft
+    /// ceiling on `scaling_max_freq`. A live ceiling below the requested value
+    /// (usually a vendor thermal clamp) is respected, never fought.
     pub fn apply(&mut self, decisions: &[Decision]) -> Result<(), String> {
-        let mut refusal: Option<String> = None;
+        let mut failure: Option<String> = None;
         for decision in decisions {
             let Some(policy) = self
                 .policies
@@ -175,23 +202,17 @@ impl CpufreqWriter {
             else {
                 continue;
             };
-            // An unchanged target needs no sysfs read or write. Only a real
-            // change (boost, decay step, quiet entry) or a pending quiet
-            // downshift pays for a read/write. In the quiet state the floor is
-            // re-checked about once a second, because MIUI's perf service may
-            // raise `scaling_min_freq` on its own.
-            if !decision.changed && policy.quiet_pending_since.is_none() {
-                let quiet = matches!(
-                    decision.reason,
-                    DecisionReason::Quiet | DecisionReason::ScreenOff
-                );
-                if !quiet {
-                    continue;
-                }
-                let now = Instant::now();
-                if policy.retry_after.is_some_and(|retry| now < retry) {
-                    continue;
-                }
+            let now = Instant::now();
+            let quiet = matches!(
+                decision.reason,
+                DecisionReason::Quiet | DecisionReason::ScreenOff
+            );
+            // The quiet state is reconciled about once every few seconds, so a
+            // vendor perf service that raised the floor or the ceiling is pulled
+            // back without fighting it on every sample. A rejected floor write
+            // must not block the ceiling from being re-derived: the two nodes
+            // are reconciled independently.
+            if quiet && !decision.changed {
                 if policy
                     .last_reconcile
                     .is_some_and(|last| now.duration_since(last) < RECONCILE_INTERVAL)
@@ -200,65 +221,87 @@ impl CpufreqWriter {
                 }
                 policy.last_reconcile = Some(now);
             }
-            let live_max = read_u32(&policy.dir.join("scaling_max_freq")).unwrap_or(0);
-            if live_max < policy.hw_max {
-                let message = format!(
-                    "cluster {} live ceiling {live_max} below hardware max {}; write refused",
-                    policy.cluster, policy.hw_max
-                );
-                tracing::error!(cluster = policy.cluster, live_max, hw_max = policy.hw_max, "{message}");
-                refusal.get_or_insert(message);
+            let live_max = read_u32(&policy.dir.join("scaling_max_freq")).unwrap_or(policy.hw_max);
+            if live_max <= policy.hw_min {
+                // Locked by a vendor range; there is nothing left to schedule.
                 continue;
             }
             let mut target = decision.ceiling_khz.clamp(policy.hw_min, policy.hw_max);
-            // Never let the floor exceed the live ceiling. A vendor writer may
-            // raise the floor above the requested target; keep it as is.
-            target = target.min(live_max);
             if let Some(step) = snap_down(&policy.freqs, target) {
                 target = step.max(policy.hw_min);
             }
-            let current_min = read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(0);
-            if current_min == target {
-                policy.quiet_pending_since = None;
-                continue;
-            }
-            let now = Instant::now();
-            let quiet = matches!(decision.reason, DecisionReason::Quiet);
-            if quiet && target < current_min {
-                let since = *policy.quiet_pending_since.get_or_insert(now);
-                if now.duration_since(since) < QUIET_SETTLE {
+            // Never let the floor exceed the live ceiling.
+            target = target.min(live_max);
+
+            let current_min = read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(policy.hw_min);
+            policy.last_target = target;
+            // The soft ceiling starts above the live floor, otherwise the kernel
+            // locks the cluster (min == max) and it can never ramp again.
+            let cap = soft_cap(policy, target, live_max, current_min);
+
+            // Raise the ceiling before the floor climbs, so a min write never
+            // exceeds the live max and gets rejected by the kernel.
+            if cap > live_max {
+                if let Err(problem) = write_khz(&policy.dir.join("scaling_max_freq"), cap) {
+                    failure.get_or_insert(problem);
                     continue;
                 }
-            } else {
-                policy.quiet_pending_since = None;
-            }
-            if let Some(last) = policy.last_write {
-                if now.duration_since(last) < WRITE_SPACING {
+                policy.last_cap_write = Some(now);
+                self.applied += 1;
+            } else if live_max != cap {
+                if let Some(last) = policy.last_cap_write {
+                    if now.duration_since(last) < WRITE_SPACING {
+                        continue;
+                    }
+                }
+                if let Err(problem) = write_khz(&policy.dir.join("scaling_max_freq"), cap) {
+                    failure.get_or_insert(problem);
                     continue;
                 }
-            }
-            write_khz(&policy.dir.join("scaling_min_freq"), target)?;
-            let readback = read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(target);
-            if readback > target {
-                // A vendor QoS request (for example perfservice's screen-on
-                // floor) rejected the write. Back off instead of fighting it.
-                policy.retry_after = Some(now + BLOCKED_RETRY);
+                policy.last_cap_write = Some(now);
+                self.applied += 1;
                 tracing::debug!(
                     cluster = policy.cluster,
                     target,
-                    readback,
-                    "floor rejected by vendor QoS; retry deferred"
+                    cap,
+                    live_max,
+                    "floor and ceiling applied"
                 );
-            } else {
-                policy.retry_after = None;
             }
-            policy.last_write = Some(now);
-            policy.quiet_pending_since = None;
-            self.applied += 1;
-            tracing::debug!(cluster = policy.cluster, target, live_max, "floor applied");
+
+            if current_min != target && !policy.retry_after.is_some_and(|retry| now < retry) {
+                if quiet && target < current_min {
+                    let since = *policy.quiet_pending_since.get_or_insert(now);
+                    if now.duration_since(since) < QUIET_SETTLE {
+                        continue;
+                    }
+                } else {
+                    policy.quiet_pending_since = None;
+                }
+                if let Some(last) = policy.last_write {
+                    if now.duration_since(last) < WRITE_SPACING {
+                        continue;
+                    }
+                }
+                if let Err(problem) = write_khz(&policy.dir.join("scaling_min_freq"), target) {
+                    failure.get_or_insert(problem);
+                    continue;
+                }
+                let readback = read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(target);
+                if readback > target {
+                    // A vendor QoS request (perfservice's screen-on floor) rejected
+                    // the write. Back off instead of fighting it.
+                    policy.retry_after = Some(now + BLOCKED_RETRY);
+                } else {
+                    policy.retry_after = None;
+                }
+                policy.last_write = Some(now);
+                policy.quiet_pending_since = None;
+                self.applied += 1;
+            }
         }
-        self.last_error = refusal.clone();
-        match refusal {
+        self.last_error = failure.clone();
+        match failure {
             Some(problem) => Err(problem),
             None => Ok(()),
         }
@@ -369,6 +412,22 @@ pub fn read_u32(path: &Path) -> Option<u32> {
 
 fn write_khz(path: &Path, value: u32) -> Result<(), String> {
     write_text(path, &value.to_string())
+}
+
+/// Soft ceiling for a cluster: enough room above the floor for a frame to
+/// ramp, but never the whole hardware span.
+fn soft_cap(policy: &Policy, target: u32, live_max: u32, current_min: u32) -> u32 {
+    let span = policy.hw_max.saturating_sub(policy.hw_min);
+    let ceiling_limit = if live_max <= current_min {
+        policy.hw_max
+    } else {
+        live_max
+    };
+    let headroom = (span as f32 * policy.cap_headroom) as u32;
+    let base = target.max(current_min).min(ceiling_limit);
+    base.saturating_add(headroom)
+        .clamp(policy.hw_min, ceiling_limit)
+        .max(base)
 }
 
 /// Largest hardware step that does not exceed `value`.

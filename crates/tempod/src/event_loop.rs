@@ -41,6 +41,7 @@ const CHARGE: Token = Token(11);
 const CHARGE_TIMER: Token = Token(12);
 const CONFIG_WATCH: Token = Token(13);
 const VERIFY: Token = Token(14);
+const CEILING_TIMER: Token = Token(15);
 const FIRST_CONNECTION: usize = 16;
 
 struct Connection {
@@ -99,6 +100,15 @@ pub fn run(
         .register(&mut verify_timer, VERIFY, Interest::READABLE)
         .map_err(|error| context("register verify timer", error))?;
 
+    // Slow periodic reconcile of the soft cpufreq ceiling. A vendor perf
+    // service moves its own floors without generating a probe event, so the
+    // static state still needs a cheap low-frequency check.
+    let mut ceiling_timer =
+        OneShotTimer::new().map_err(|error| context("create ceiling timer", error))?;
+    poll.registry()
+        .register(&mut ceiling_timer, CEILING_TIMER, Interest::READABLE)
+        .map_err(|error| context("register ceiling timer", error))?;
+
     let status: Arc<Mutex<RuntimeStatus>> = Arc::new(Mutex::new(RuntimeStatus {
         config_generation: 1,
         ..RuntimeStatus::default()
@@ -112,7 +122,7 @@ pub fn run(
     // The writer is the only component that touches cpufreq. Without the
     // capability the daemon stays observe-only rather than writing blind.
     let mut writer = if apply {
-        match CpufreqWriter::discover(&profile, config.control.parked_headroom) {
+        match CpufreqWriter::discover(&profile, config.control.ceiling_headroom) {
             Ok(writer) => {
                 let backup = writer.backup_json();
                 let _ = std::fs::write(run_dir.join("cpufreq-backup.json"), backup);
@@ -161,6 +171,7 @@ pub fn run(
     let startup_decisions = screen_decisions;
     let mut verify_retries = 0u8;
     verify_timer.arm(now_us() + 20_000_000);
+    ceiling_timer.arm(now_us() + 3_000_000);
     if let Ok(mut state) = status.lock() {
         state.screen_on = screen_on;
         state.screen_source = match screen.as_ref() {
@@ -379,17 +390,25 @@ pub fn run(
                             {
                                 last_foreground_us = sample.ts_us;
                                 let ids = session.foreground_ids();
+                                let previous = foreground.package().map(str::to_owned);
                                 foreground.resolve(&ids);
+                                let package_changed =
+                                    foreground.package() != previous.as_deref();
                                 if let Ok(mut state) = status.lock() {
                                     state.foreground_package =
                                         foreground.package().map(str::to_owned);
                                     state.foreground_pids = ids.len();
                                 }
-                                let decisions = controller.on_foreground_changed(sample.ts_us);
-                                commit(&decisions, &mut writer, &status);
-                                match controller.next_deadline(sample.ts_us) {
-                                    Some(deadline) => deadline_source.arm(deadline.at_us),
-                                    None => deadline_source.disarm(),
+                                // IME overlays change the focused window without
+                                // changing the app; only a real package switch
+                                // earns the warm-start lift.
+                                if package_changed {
+                                    let decisions = controller.on_foreground_changed(sample.ts_us);
+                                    commit(&decisions, &mut writer, &status);
+                                    match controller.next_deadline(sample.ts_us) {
+                                        Some(deadline) => deadline_source.arm(deadline.at_us),
+                                        None => deadline_source.disarm(),
+                                    }
                                 }
                                 if refresh_fas_sidecar(&mut config, &mut fas_stamp) {
                                     tracing::info!("fas configuration reloaded from sidecar");
@@ -578,7 +597,7 @@ pub fn run(
                                 || parsed.daemon.log_level != startup_log_level;
                             config = parsed;
                             if let Some(writer) = writer.as_mut() {
-                                writer.set_parked_headroom(config.control.parked_headroom);
+                                writer.set_ceiling_headroom(config.control.ceiling_headroom);
                             }
                             controller = Controller::new(profile.clone(), config.clone());
                             let decisions = controller.on_screen(now_us(), screen_on);
@@ -683,6 +702,18 @@ pub fn run(
                 continue;
             }
 
+            if token == CEILING_TIMER {
+                ceiling_timer.drain();
+                if let Some(writer) = writer.as_mut() {
+                    let _ = writer.reconcile();
+                }
+                if let Ok(mut state) = status.lock() {
+                    state.writes = writer.as_ref().map(CpufreqWriter::applied).unwrap_or(0);
+                }
+                ceiling_timer.arm(now_us() + 3_000_000);
+                continue;
+            }
+
             if token == DEADLINE {
                 deadline_source.drain();
                 let at_us = now_us();
@@ -729,7 +760,7 @@ pub fn run(
                             responses.push(text);
                             if outcome == Outcome::Reloaded {
                                 if let Some(writer) = writer.as_mut() {
-                                    writer.set_parked_headroom(config.control.parked_headroom);
+                                    writer.set_ceiling_headroom(config.control.ceiling_headroom);
                                 }
                                 controller = Controller::new(profile.clone(), config.clone());
                                 let decisions = controller.on_screen(now_us(), screen_on);

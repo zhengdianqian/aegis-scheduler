@@ -791,6 +791,15 @@ impl Controller {
             let applies = self.lift_all_roles || cluster.role != Role::Prime;
             let level = Self::ramp_level(self.lift_ramp, ts_us)
                 .unwrap_or(self.config.control.touch_lift_level);
+            // Event lifts must not park the prime cluster at its top tier:
+            // window animations, IME overlays and focus changes are not proof
+            // of compute. Real load still climbs through the load curve and
+            // over-budget frames through the burst window.
+            let level = if cluster.role == Role::Prime {
+                level.min(self.config.control.prime_lift_level)
+            } else {
+                level
+            };
             if applies {
                 if self.floor_low {
                     // Leaving the floor: the staged level itself is the
@@ -820,6 +829,10 @@ impl Controller {
                 fraction = level;
                 reason = DecisionReason::FrameBurst;
             }
+        }
+
+        if cluster.role == Role::Prime {
+            fraction = fraction.min(self.config.control.prime_load_cap);
         }
 
         fraction = fraction.min(self.config.control.role_cap.for_role(cluster.role));

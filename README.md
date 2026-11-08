@@ -7,7 +7,7 @@ Aegis 是一个完全独立实现的 Android 调频模块（KernelSU / Magisk）
 - 许可证：**GPL-3.0-or-later**
 - 版权：`Copyright (c) 2026 默默的阿文`
 - 模块 id：`aegis_scheduler`｜对外显示名：**Aegis**
-- 版本：`v2.2`（`versionCode=7`）
+- 版本：`v2.3`（`versionCode=8`）
 - 模块描述：`自适应 CPU 调度+FAS + 充电控制`
 - 首发承诺机型：骁龙 8Gen2（`kalama` / `babylon`）
 
@@ -38,7 +38,7 @@ Aegis 是一个完全独立实现的 Android 调频模块（KernelSU / Magisk）
 | `bin/Aegis` | 常驻守护，单一 epoll 事件循环，零固定周期定时器，空闲 CPU 接近 0 |
 | `bin/tempoctl` | 命令行控制与离线回放（`status` / `config.apply` / `restore` / `power.get` / `log.tail`） |
 | `webroot/` | 内置 WebUI（KernelSU / Magisk 模块页内嵌，也可浏览器打开），与 APP 内置资源为同一份 8 文件构建 |
-| `Aegis-v2.2.apk` | 独立控制端（包名 `com.aegis.scheduler`，WebView 壳，读写同一 socket） |
+| `Aegis-v2.3.apk` | 独立控制端（包名 `com.aegis.scheduler`，WebView 壳，读写同一 socket） |
 
 > 同时只保留一个控制端（`com.aegis.scheduler`）。若设备上存在旧包名的控制端请先卸载，避免两个进程同时写配置。
 
@@ -53,9 +53,9 @@ Aegis 是一个完全独立实现的 Android 调频模块（KernelSU / Magisk）
 ## 安装
 
 1. **卸载旧模块**：模块管理器里删除或禁用历史调度模块（本模块会自动给旧目录打 `disable`，但推荐手动卸载以免残留两份 WebUI）。旧目录请保留而非删除，便于回滚。
-2. 通过 **KernelSU / Magisk 刷入** `Aegis-v2.2.zip`。
+2. 通过 **KernelSU / Magisk 刷入** `Aegis-v2.3.zip`。
 3. 重启，等待 `sys.boot_completed=1`。开机阶段不写任何 cpufreq；开机完成并稳定后才接管。
-4. 打开 **WebUI**（模块页面内嵌），或安装 `Aegis-v2.2.apk`。
+4. 打开 **WebUI**（模块页面内嵌），或安装 `Aegis-v2.3.apk`。
 5. 首次运行 APP 需在 KernelSU「超级用户」页为 **Aegis** 打开开关。未授权时界面提示「控制服务未就绪」，仅控制命令不可用。
 
 ## 使用
@@ -101,12 +101,15 @@ Unix socket：`/data/adb/tempo/run/control.sock`，一行 JSON 请求 / 一行 J
 | `floor_exit_ms` | 60 | 退出静默需保持的时间 |
 | `fg_fast_ms` | 100 | 退出判据的快速滤波时间常数 |
 | `touch_lift_ms` | 150 | 手指抬起后保持抬频的窗口 |
-| `touch_lift_level` | 0.45 | 抬频目标（簇跨度的比例，中档不到顶） |
+| `touch_lift_level` | 0.30 | 抬频目标（簇跨度的比例，只到中档，按压不飙高档） |
 | `touch_ramp_ms` / `touch_ramp_stages` | 60 / 3 | 三级抬频，约 20 ms 一级 |
 | `touch_decay_ms` | 45 | 回落每一级的最小间隔 |
 | `drop_factor` | 2.0 | 单次回落最多降到当前的 1/2 |
-| `launch_lift_ms` / `launch_lift_level` | 800 / 1.00 | 应用启动边沿的短窗口高地板 |
+| `launch_lift_ms` / `launch_lift_level` | 1000 / 1.00 | 应用启动边沿的短窗口高地板 |
 | `frame_burst_ms` / `frame_burst_level` | 150 / 0.70 | 帧超时突发的抬频窗口与目标 |
+| `prime_lift_level` | 0.45 | 超大核的事件抬频上限（启动/触摸都受此约束） |
+| `prime_load_cap` | 0.78 | 超大核的持续负载上限，只有重载帧压力才逼近顶档 |
+| `ceiling_headroom` | 0.18 | 软上限：`scaling_max_freq = 地板 + 该比例 × 硬件跨度` |
 | `parked_headroom` | 0.08 | 静默余量，保证上限始终高于地板，绝不锁最低频 |
 
 ### `[fas]`

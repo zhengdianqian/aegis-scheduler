@@ -53,15 +53,33 @@ function input(overrides) {
 }
 
 function full(overrides) {
-  return input(Object.assign({ stopAt: 100, resumeAt: 70, latchPerPlug: true }, overrides || {}));
+  return input(Object.assign({
+    stopAt: 100,
+    resumeAt: 70,
+    latchPerPlug: true,
+    currentMa: 1200,
+    statusFull: false
+  }, overrides || {}));
 }
 
-function describeResult(result) {
-  return (result.allowCharge ? '允许' : '停充') + ' | ' + result.action + ' | ' + (result.primary || '-');
+/* 涓流阶段的时间轴：T0 为 2026-11-02 12:00:00，tick(n) 表示第 n 秒。 */
+const T0 = new Date(2026, 10, 2, 12, 0, 0).getTime();
+function tick(seconds) {
+  return new Date(T0 + seconds * 1000);
+}
+
+function trickle(overrides) {
+  return full(Object.assign({ percent: 100, currentMa: 80, statusFull: false }, overrides || {}));
+}
+
+function describeResult(result, withPhase) {
+  return (result.allowCharge ? '允许' : '停充') + ' | ' + result.action + ' | ' + (result.primary || '-') +
+    (withPhase ? ' | ' + result.phase : '');
 }
 
 function describeExpected(expected) {
-  return (expected.allow ? '允许' : '停充') + ' | ' + expected.action + ' | ' + (expected.primary || '-');
+  return (expected.allow ? '允许' : '停充') + ' | ' + expected.action + ' | ' + (expected.primary || '-') +
+    (expected.phase ? ' | ' + expected.phase : '');
 }
 
 function record(scenario, step, expected, actual, pass, note) {
@@ -84,10 +102,11 @@ function simulate(scenario, steps) {
     const result = C.step(state, item.input);
     state = result.state;
     const expectedText = describeExpected(item.expect);
-    const actualText = describeResult(result);
+    const actualText = describeResult(result, !!item.expect.phase);
     const pass = result.allowCharge === item.expect.allow &&
       result.action === item.expect.action &&
-      (result.primary || '-') === (item.expect.primary || '-');
+      (result.primary || '-') === (item.expect.primary || '-') &&
+      (item.expect.phase ? result.phase === item.expect.phase : true);
     record(scenario, label, expectedText, actualText, pass, result.reasons.map((reason) => reason.code).join('>'));
   });
   return state;
@@ -117,30 +136,31 @@ simulate('普通上限 90%', [
   { label: '再次到达 82%', input: input({ percent: 82, stopAt: 90, resumeAt: 80 }), expect: { allow: true, action: 'none', primary: null } }
 ]);
 
-/* ---------- 3. 100% 充满即停：锁存与重新插电 ---------- */
-simulate('100% 充满即停 / 重新插电', [
-  { label: '99% 充电中', input: full({ percent: 99 }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '到达 100%', input: full({ percent: 100 }), expect: { allow: false, action: 'stop', primary: 'full_latch' } },
-  { label: '保持 100%', input: full({ percent: 100 }), expect: { allow: false, action: 'hold', primary: 'full_latch' } },
-  { label: '保持 95%（不回落复充）', input: full({ percent: 95 }), expect: { allow: false, action: 'hold', primary: 'full_latch' } },
-  { label: '拔出充电器', input: full({ percent: 95, plugged: false }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '重新插电（100%）', input: full({ percent: 100 }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '重新插电后 99%', input: full({ percent: 99 }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '再次到达 100%', input: full({ percent: 100 }), expect: { allow: false, action: 'stop', primary: 'full_latch' } },
-  { label: '保持 99%（仍锁存）', input: full({ percent: 99 }), expect: { allow: false, action: 'hold', primary: 'full_latch' } },
-  { label: '再次拔出', input: full({ percent: 99, plugged: false }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '再次插电（99%）', input: full({ percent: 99 }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '再次到达 100%', input: full({ percent: 100 }), expect: { allow: false, action: 'stop', primary: 'full_latch' } }
+/* ---------- 3. 100% 涓流至满充：锁存与重新插电 ---------- */
+simulate('100% 涓流至满充 / 重新插电', [
+  { label: '99% 充电中', input: full({ percent: 99, now: tick(0) }), expect: { allow: true, action: 'none', primary: null, phase: 'charging' } },
+  { label: '到达 100%（大电流）', input: full({ percent: 100, currentMa: 1200, now: tick(0) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '涓流 0s（80mA）', input: trickle({ now: tick(0) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '涓流 5s', input: trickle({ now: tick(5) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '涓流满 9s', input: trickle({ now: tick(10) }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } },
+  { label: '锁存后保持（0mA）', input: trickle({ currentMa: 0, now: tick(13) }), expect: { allow: false, action: 'hold', primary: 'full_latch' } },
+  { label: '锁存后回落到 95%', input: full({ percent: 95, currentMa: 0, now: tick(20) }), expect: { allow: false, action: 'hold', primary: 'full_latch' } },
+  { label: '拔出充电器', input: full({ percent: 95, plugged: false, now: tick(30) }), expect: { allow: true, action: 'none', primary: null } },
+  { label: '重新插电（100% 大电流）', input: full({ percent: 100, currentMa: 1200, now: tick(40) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '重新插电后涓流 0s', input: trickle({ now: tick(40) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '重新插电后涓流 5s', input: trickle({ now: tick(45) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '重新插电后涓流满 9s', input: trickle({ now: tick(50) }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } },
+  { label: '再次锁存后回落到 99%', input: full({ percent: 99, currentMa: 0, now: tick(55) }), expect: { allow: false, action: 'hold', primary: 'full_latch' } }
 ]);
 
 /* ---------- 4. 上限配置变更 ---------- */
 simulate('上限配置变更', [
-  { label: '100% 策略下 85%', input: full({ percent: 85 }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '100% 策略下充满', input: full({ percent: 100 }), expect: { allow: false, action: 'stop', primary: 'full_latch' } },
-  { label: '改为 80% 上限', input: input({ percent: 100 }), expect: { allow: false, action: 'hold', primary: 'upper_bound' } },
+  { label: '100% 策略下 85%', input: full({ percent: 85, currentMa: 1200 }), expect: { allow: true, action: 'none', primary: null } },
+  { label: '100% 策略下充满（大电流）', input: full({ percent: 100, currentMa: 1200 }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '改为 80% 上限', input: input({ percent: 100 }), expect: { allow: false, action: 'stop', primary: 'upper_bound' } },
   { label: '回落到 70%', input: input({ percent: 70 }), expect: { allow: true, action: 'resume', primary: null } },
   { label: '改回 100% 上限', input: full({ percent: 70 }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '改回后充满', input: full({ percent: 100 }), expect: { allow: false, action: 'stop', primary: 'full_latch' } }
+  { label: '改回后充满（大电流）', input: full({ percent: 100, currentMa: 1200 }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } }
 ]);
 
 /* ---------- 5. 预约时段：跨零点与跨星期 ---------- */
@@ -174,16 +194,17 @@ simulate('预约时段进出', [
   { label: '周三 12:00 保持停充', input: input({ now: new Date(2026, 10, 4, 12, 0), plan: planOf() }), expect: { allow: false, action: 'hold', primary: 'plan_window' } }
 ]);
 
-/* ---------- 7. 预约时段与 100% 锁存的优先级 ---------- */
-simulate('预约 vs 100% 锁存', [
+/* ---------- 7. 预约时段与 100% 涓流锁存的优先级 ---------- */
+simulate('预约 vs 100% 涓流锁存', [
   { label: '周一 23:30 时段内 99%', input: full({ now: new Date(2026, 10, 2, 23, 30), percent: 99, plan: planOf() }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '时段内充满', input: full({ now: new Date(2026, 10, 2, 23, 30), percent: 100, plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'full_latch' } },
-  { label: '跨到周二 12:00 时段外', input: full({ now: new Date(2026, 10, 3, 12, 0), percent: 100, plan: planOf() }), expect: { allow: false, action: 'hold', primary: 'full_latch' } },
+  { label: '时段内到 100%（大电流）', input: full({ now: new Date(2026, 10, 2, 23, 30), percent: 100, plan: planOf() }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '时段内涓流开始', input: trickle({ now: new Date(2026, 10, 2, 23, 30, 10), plan: planOf() }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '时段内涓流满 9s', input: trickle({ now: new Date(2026, 10, 2, 23, 30, 20), plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } },
+  { label: '跨到周二 12:00 时段外', input: full({ now: new Date(2026, 10, 3, 12, 0), percent: 100, currentMa: 0, plan: planOf() }), expect: { allow: false, action: 'hold', primary: 'full_latch' } },
   { label: '时段外拔出', input: full({ now: new Date(2026, 10, 3, 12, 0), percent: 100, plugged: false, plan: planOf() }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '时段外重新插电', input: full({ now: new Date(2026, 10, 3, 12, 0), percent: 100, plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'plan_window' } },
-  { label: '等到 23:30 进入时段', input: full({ now: new Date(2026, 10, 3, 23, 30), percent: 100, plan: planOf() }), expect: { allow: true, action: 'resume', primary: null } },
-  { label: '时段内回落到 99%', input: full({ now: new Date(2026, 10, 3, 23, 30), percent: 99, plan: planOf() }), expect: { allow: true, action: 'none', primary: null } },
-  { label: '时段内再次充满', input: full({ now: new Date(2026, 10, 3, 23, 30), percent: 100, plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'full_latch' } }
+  { label: '时段外重新插电（100%）', input: full({ now: new Date(2026, 10, 3, 12, 0), percent: 100, currentMa: 1200, plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'plan_window' } },
+  { label: '等到 23:30 进入时段', input: trickle({ now: new Date(2026, 10, 3, 23, 30), plan: planOf() }), expect: { allow: true, action: 'resume', primary: null, phase: 'trickle' } },
+  { label: '时段内涓流满 9s', input: trickle({ now: new Date(2026, 10, 3, 23, 30, 10), plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } }
 ]);
 
 /* ---------- 8. 温度停充与回落复充 ---------- */
@@ -242,6 +263,72 @@ simulate('配置变更恢复', [
   { label: '到达 90%', input: input({ percent: 90, stopAt: 90, resumeAt: 80 }), expect: { allow: false, action: 'stop', primary: 'upper_bound' } },
   { label: '上限改回 80%，当前 85%', input: input({ percent: 85 }), expect: { allow: false, action: 'hold', primary: 'upper_bound' } },
   { label: '回落到 70%', input: input({ percent: 70 }), expect: { allow: true, action: 'resume', primary: null } }
+]);
+
+/* ---------- 12. 100% 涓流专项 ---------- */
+
+/* 12.2 涓流中拔出重插：重新插电后涓流计时清零，必须重新满 9 秒 */
+simulate('涓流中拔出重插', [
+  { label: '涓流 0s', input: trickle({ now: tick(0) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '涓流 5s', input: trickle({ now: tick(5) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '涓流中拔出', input: trickle({ now: tick(6), plugged: false }), expect: { allow: true, action: 'none', primary: null } },
+  { label: '重新插电（大电流）', input: full({ percent: 100, now: tick(20), currentMa: 1200 }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '重插后涓流 0s', input: trickle({ now: tick(20) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '重插后涓流 5s（旧计时已清零）', input: trickle({ now: tick(25) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '重插后涓流满 9s', input: trickle({ now: tick(30) }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } }
+]);
+
+/* 12.3 涓流中温度超限：温度优先停充，回落恢复后涓流计时重新开始 */
+simulate('涓流中温度超限', [
+  { label: '涓流 0s', input: trickle({ now: tick(0) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '涓流 5s 达 45°C', input: trickle({ now: tick(5), tempC: 45 }), expect: { allow: false, action: 'stop', primary: 'temp_high' } },
+  { label: '回落到 40°C', input: trickle({ now: tick(8), tempC: 40 }), expect: { allow: true, action: 'resume', primary: null, phase: 'trickle' } },
+  { label: '恢复后涓流 0s', input: trickle({ now: tick(8), tempC: 40 }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '恢复后涓流满 9s', input: trickle({ now: tick(17), tempC: 40 }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } }
+]);
+
+/* 12.4 涓流中进入 / 退出预约时段 */
+simulate('涓流中预约时段进出', [
+  { label: '周一 23:30 时段内涓流 0s', input: trickle({ now: new Date(2026, 10, 2, 23, 30, 0), plan: planOf() }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '时段内涓流 5s', input: trickle({ now: new Date(2026, 10, 2, 23, 30, 5), plan: planOf() }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '周二 07:00 退出时段', input: trickle({ now: new Date(2026, 10, 3, 7, 0, 0), plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'plan_window' } },
+  { label: '时段外保持', input: trickle({ now: new Date(2026, 10, 3, 12, 0, 0), plan: planOf() }), expect: { allow: false, action: 'hold', primary: 'plan_window' } },
+  { label: '周二 23:00 重新进入时段', input: trickle({ now: new Date(2026, 10, 3, 23, 0, 0), plan: planOf() }), expect: { allow: true, action: 'resume', primary: null, phase: 'trickle' } },
+  { label: '进入后涓流满 9s', input: trickle({ now: new Date(2026, 10, 3, 23, 0, 9), plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } }
+]);
+
+/* 12.5 涓流中把上限改成 90% */
+simulate('涓流中改上限为 90%', [
+  { label: '涓流 0s', input: trickle({ now: tick(0) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '涓流 5s', input: trickle({ now: tick(5) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '改为 90% 上限（当前 100%）', input: input({ percent: 100, stopAt: 90, resumeAt: 80 }), expect: { allow: false, action: 'stop', primary: 'upper_bound' } },
+  { label: '回落到 85%', input: input({ percent: 85, stopAt: 90, resumeAt: 80 }), expect: { allow: false, action: 'hold', primary: 'upper_bound' } },
+  { label: '回落到 80%', input: input({ percent: 80, stopAt: 90, resumeAt: 80 }), expect: { allow: true, action: 'resume', primary: null } },
+  { label: '再改回 100% 上限（当前 85%）', input: full({ percent: 85 }), expect: { allow: true, action: 'none', primary: null } }
+]);
+
+/* 12.6 重启时处于涓流阶段：不沿用旧锁存，需重新满充 */
+(function () {
+  const cases = [
+    { label: '重启时 100% + 大电流', input: full({ percent: 100, currentMa: 1200 }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+    { label: '重启时 100% + 涓流电流', input: trickle({}), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+    { label: '重启时电池直接报 Full', input: full({ percent: 100, statusFull: true, currentMa: 0 }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } }
+  ];
+  cases.forEach((item) => {
+    const result = C.boot(item.input);
+    record('重启时处于涓流阶段', item.label, describeExpected(item.expect), describeResult(result, true), result.allowCharge === item.expect.allow && result.action === item.expect.action && (result.primary || '-') === (item.expect.primary || '-') && result.phase === item.expect.phase);
+  });
+})();
+
+/* 12.7 电流抖动不误判满充：短暂回升必须重新累计 9 秒 */
+simulate('电流抖动不误判满充', [
+  { label: '涓流 0s（80mA）', input: trickle({ now: tick(0) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '4s 电流回升 1200mA', input: trickle({ currentMa: 1200, now: tick(4) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '8s 回落到 80mA', input: trickle({ now: tick(8) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '12s 再次回升 1200mA', input: trickle({ currentMa: 1200, now: tick(12) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '15s 回落到 80mA', input: trickle({ now: tick(15) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '20s 仍低电流（累计仅 5s）', input: trickle({ now: tick(20) }), expect: { allow: true, action: 'none', primary: null, phase: 'trickle' } },
+  { label: '24s 满 9s', input: trickle({ now: tick(24) }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } }
 ]);
 
 /* ---------- 11. 派生规则与计划规范化 ---------- */

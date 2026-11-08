@@ -97,6 +97,19 @@ pub struct ControlConfig {
     pub touch_lift_level: f32,
     pub launch_lift_ms: u64,
     pub launch_lift_level: f32,
+    /// Event lifts (launch / foreground change) cap the prime cluster here so
+    /// a window animation or IME overlay cannot slam it to the top tier.
+    /// Sustained load and over-budget frames can still climb higher.
+    pub prime_lift_level: f32,
+    /// Even under sustained UI load the prime cluster is budgeted below its
+    /// top tier; only genuinely heavy frame pressure earns the last steps.
+    pub prime_load_cap: f32,
+    /// Span above the current floor that the governor may still use. The
+    /// writer caps `scaling_max_freq` at `floor + span * ceiling_headroom`,
+    /// so a vendor boost or an input hint can no longer slam a cluster to its
+    /// top tier while the measured demand stays low. Real frame pressure
+    /// raises the floor first, which lifts the cap with it.
+    pub ceiling_headroom: f32,
     /// Time to climb through all touch ramp stages. Three stages within this
     /// window keep the perceived response under ~50 ms.
     pub touch_ramp_ms: u64,
@@ -220,14 +233,17 @@ impl Default for ControlConfig {
             // Gentle frame-driven lift: two 2x steps instead of a 4x slam.
             drop_factor: 2.0,
             touch_lift_ms: 150,
-            // Mid tier, not the top of the prime cluster. 0.45 lands near
-            // 1.08 / 1.54 / 1.84 GHz for the three clusters on babylon.
-            touch_lift_level: 0.45,
+            // Mid tier, not the top of the prime cluster. 0.30 lands near
+            // 0.82 / 1.19 / 1.42 GHz for the three clusters on babylon.
+            touch_lift_level: 0.30,
             touch_ramp_ms: 60,
             touch_ramp_stages: 3,
             touch_decay_ms: 45,
             launch_lift_ms: 1000,
             launch_lift_level: 1.00,
+            prime_lift_level: 0.45,
+            prime_load_cap: 0.78,
+            ceiling_headroom: 0.18,
             frame_slack_ms: 3.0,
             frame_burst_ms: 150,
             frame_burst_level: 0.70,
@@ -394,6 +410,9 @@ impl Config {
         }
         if !(0.0..=0.30).contains(&c.parked_headroom) {
             bad.push("control.parked_headroom must be 0.0..=0.30".to_owned());
+        }
+        if !(0.05..=0.50).contains(&c.ceiling_headroom) {
+            bad.push("control.ceiling_headroom must be 0.05..=0.50".to_owned());
         }
         if !(0.5..=20.0).contains(&c.frame_slack_ms) {
             bad.push("control.frame_slack_ms must be 0.5..=20.0".to_owned());

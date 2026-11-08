@@ -11,7 +11,7 @@
     status: {
       ok: true,
       service: 'Aegis',
-      version: '2.2',
+      version: '2.3',
       stage: 'P2-observe-only',
       mode: 'observe-only',
       scheduler_writes: false,
@@ -115,8 +115,8 @@
     moduleProp: [
       'id=aegis_scheduler',
       'name=Aegis',
-      'version=2.2',
-      'versionCode=7',
+      'version=2.3',
+      'versionCode=8',
       'author=默默的阿文',
       'description=自适应 CPU 调度+FAS + 充电控制'
     ].join('\n'),
