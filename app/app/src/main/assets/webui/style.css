@@ -1141,6 +1141,10 @@ body::before {
 .preset-btn { height: 26px; padding: 0 11px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255, 255, 255, 0.05); color: var(--muted); font: inherit; font-size: 11px; cursor: pointer; }
 .preset-btn.is-active { color: #c9fff6; border-color: rgba(85, 224, 207, 0.35); background: rgba(85, 224, 207, 0.14); }
 .cfg-policy { margin: 10px 0 6px; padding: 9px 11px; border-radius: 12px; border: 1px solid rgba(127, 178, 255, 0.18); background: rgba(127, 178, 255, 0.08); font-size: 11.3px; color: #c6dbff; line-height: 1.5; }
+.cfg-degrade { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; border-color: rgba(255, 183, 77, 0.28); background: rgba(255, 183, 77, 0.08); }
+.cfg-degrade__info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.cfg-degrade__info b { font-size: 12.5px; color: #ffd79a; }
+.cfg-degrade__info small { font-size: 11px; color: var(--muted); line-height: 1.45; word-break: break-word; }
 
 /* ---------- 焦点 ---------- */
 

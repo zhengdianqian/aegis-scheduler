@@ -175,6 +175,9 @@
       CFG_FIELD_MAP[def.path] = def;
     });
   });
+  /* 保存时只覆盖界面暴露的字段，其余字段按设备原样保留。 */
+  var CFG_WRITE_PATHS = CFG_FIELDS.map(function (def) { return def.path; })
+    .concat(['charge.latch_per_plug']);
 
   function escapeHtml(value) {
     return String(value == null ? '' : value)
@@ -733,17 +736,34 @@
     return JSON.stringify(state.cfg.original) !== JSON.stringify(state.cfg.draft);
   }
 
+  /** 参数页与充电页各自的降级提示：读不到的字段用默认值，且不允许保存。 */
+  function renderConfigDegrade() {
+    if (!state.cfg.degraded) return '';
+    return '' +
+      '<section class="card cfg-degrade">' +
+        '<div class="cfg-degrade__info">' +
+          '<b>读取失败，已用默认值</b>' +
+          '<small>' + escapeHtml(state.cfg.degradeReason || '配置暂时无法解析，当前显示的是默认值。') + '</small>' +
+        '</div>' +
+        '<button class="ghost-btn ghost-btn--sm" data-action="cfg-reload">重新读取</button>' +
+      '</section>';
+  }
+
   function renderSavebar(errors) {
     var count = Object.keys(errors).length;
     var dirty = configDirty();
+    var blocked = state.cfg.degraded;
     var summary;
-    if (state.cfg.saving) summary = state.cfg.saveMessage || '保存中…';
+    if (blocked) summary = '读取未完成，已用默认值';
+    else if (state.cfg.saving) summary = state.cfg.saveMessage || '保存中…';
     else if (count) summary = count + ' 项参数需要调整';
     else if (dirty) summary = '有未保存的更改';
     else summary = '与当前配置一致';
 
     var message = state.cfg.saveMessage ||
-      (count ? firstErrorText(errors) : '保存后立即生效，可随时恢复上一份设置');
+      (blocked
+        ? '为避免覆盖设备配置，读取成功前不能保存'
+        : (count ? firstErrorText(errors) : '保存后立即生效，可随时恢复上一份设置'));
     var tone = state.cfg.saveTone ? ' savebar__msg--' + state.cfg.saveTone : '';
 
     return '' +
@@ -753,8 +773,8 @@
           '<small id="cfg-message" class="savebar__msg' + tone + '">' + escapeHtml(message) + '</small>' +
         '</div>' +
         '<div class="savebar__actions">' +
-          '<button class="ghost-btn" data-action="cfg-rollback"' + (state.cfg.saving ? ' disabled' : '') + '>恢复上一份</button>' +
-          '<button class="primary-btn" data-action="cfg-save"' + (state.cfg.saving || count > 0 || !dirty ? ' disabled' : '') + '>' +
+          '<button class="ghost-btn" data-action="cfg-rollback"' + (state.cfg.saving || blocked ? ' disabled' : '') + '>恢复上一份</button>' +
+          '<button class="primary-btn" data-action="cfg-save"' + (state.cfg.saving || blocked || count > 0 || !dirty ? ' disabled' : '') + '>' +
             (state.cfg.saving ? '保存中…' : '保存并校验') +
           '</button>' +
         '</div>' +
@@ -781,6 +801,7 @@
     var errors = validateConfigModel(state.cfg.draft);
     return '' +
       '<div class="section-title"><h2>参数</h2><span>修改后保存生效</span></div>' +
+      renderConfigDegrade() +
       CFG_GROUPS.map(function (group) {
         return '' +
           '<section class="card cfg-group">' +
@@ -1097,6 +1118,7 @@
     var errors = validateConfigModel(state.cfg.draft);
     return '' +
       '<div class="section-title"><h2>充电与温控</h2><span>实时状态与上限设置</span></div>' +
+      renderConfigDegrade() +
       '<section class="card power-live" id="power-live">' + renderPowerLive() + '</section>' +
       renderChargePlan() +
       POWER_GROUPS.map(function (group) {
@@ -1179,18 +1201,40 @@
     return (state.data && state.data.binary) || null;
   }
 
+  /** 读取失败或语法异常时：用默认值渲染两页，并禁用保存以免覆盖设备配置。 */
+  function degradeConfig(reason) {
+    var model = Tempo.Toml.normalize({});
+    state.cfg.loading = false;
+    state.cfg.loaded = true;
+    state.cfg.error = null;
+    state.cfg.doc = Tempo.Toml.clone(model);
+    state.cfg.model = model;
+    state.cfg.original = Tempo.Toml.clone(model);
+    state.cfg.draft = Tempo.Toml.clone(model);
+    state.cfg.degraded = true;
+    state.cfg.degradeReason = String(reason || '读取失败，已用默认值');
+    state.cfg.saveMessage = null;
+    state.cfg.saveTone = null;
+    deriveChargeLatch(state.cfg.draft);
+    resetChargeMachine();
+    render();
+  }
+
   function loadConfigIntoState(binary) {
     return api.loadConfig(binary).then(function (result) {
       state.cfg.loading = false;
-      if (result.error) {
-        state.cfg.loaded = false;
-        state.cfg.error = result.error;
-        render();
+      if (result.error || !result.model) {
+        degradeConfig(result.error || '读取失败，已用默认值');
         return false;
       }
+      state.cfg.doc = result.doc || Tempo.Toml.clone(result.model);
       state.cfg.model = result.model;
       state.cfg.original = Tempo.Toml.clone(result.model);
       state.cfg.draft = Tempo.Toml.clone(result.model);
+      state.cfg.degraded = !!result.degraded;
+      state.cfg.degradeReason = result.degraded
+        ? ('读取失败，已用默认值：' + (result.degradeReason || '配置格式异常'))
+        : null;
       deriveChargeLatch(state.cfg.draft);
       if (state.cfg.original.charge && state.cfg.original.charge.latch_per_plug !== state.cfg.draft.charge.latch_per_plug) {
         state.cfg.saveMessage = '停充行为会随上限自动调整，保存后写入设备';
@@ -1216,10 +1260,7 @@
       return;
     }
     api.resolveBinary().then(loadConfigIntoState).catch(function (error) {
-      state.cfg.loading = false;
-      state.cfg.loaded = false;
-      state.cfg.error = '无法连接控制服务：' + String((error && error.message) || error);
-      render();
+      degradeConfig('无法连接控制服务：' + String((error && error.message) || error));
     });
   }
 
@@ -1241,7 +1282,7 @@
   }
 
   function saveConfig() {
-    if (!state.cfg.loaded || state.cfg.saving) return;
+    if (!state.cfg.loaded || state.cfg.saving || state.cfg.degraded) return;
     deriveChargeLatch(state.cfg.draft);
     var errors = validateConfigModel(state.cfg.draft);
     if (Object.keys(errors).length) {
@@ -1264,7 +1305,8 @@
     };
 
     var run = function (binary) {
-      api.applyConfig(binary, state.cfg.draft, function (step) {
+      var doc = Tempo.Toml.applyModel(state.cfg.doc, state.cfg.draft, CFG_WRITE_PATHS);
+      api.applyConfig(binary, doc, function (step) {
         state.cfg.saveMessage = stepText[step] || '保存中…';
         state.cfg.saveTone = 'info';
         applyValidationUi();
@@ -1277,9 +1319,14 @@
           return;
         }
         if (result.model) {
+          state.cfg.doc = result.doc || Tempo.Toml.clone(result.model);
           state.cfg.model = result.model;
           state.cfg.original = Tempo.Toml.clone(result.model);
           state.cfg.draft = Tempo.Toml.clone(result.model);
+          state.cfg.degraded = !!result.degraded;
+          state.cfg.degradeReason = result.degraded
+            ? ('读取失败，已用默认值：' + (result.degradeReason || '配置格式异常'))
+            : null;
           deriveChargeLatch(state.cfg.draft);
         }
         state.cfg.saveMessage = '已保存并生效';
@@ -1472,9 +1519,12 @@
       loaded: false,
       loading: false,
       error: null,
+      doc: null,
       model: null,
       original: null,
       draft: null,
+      degraded: false,
+      degradeReason: null,
       saving: false,
       saveMessage: null,
       saveTone: null

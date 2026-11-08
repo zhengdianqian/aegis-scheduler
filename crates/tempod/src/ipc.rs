@@ -337,11 +337,22 @@ fn apply_config(ctx: &mut ControlContext<'_>, request: &serde_json::Value) -> Re
     let encoded = parsed
         .to_toml_string()
         .map_err(|error| format!("encode: {error}"))?;
-    let previous = fs::read_to_string(ctx.config_path).unwrap_or_default();
-    fs::write(ctx.config_path, &encoded).map_err(|error| format!("write config: {error}"))?;
-    if let Err(error) = Config::load(ctx.config_path) {
-        let _ = fs::write(ctx.config_path, previous);
-        return Err(format!("reload rejected: {error}"));
+
+    // Write to a side file, read it back through the same loader, then rename
+    // over the live config. A rejected document never replaces the old one.
+    let tmp = ctx.config_path.with_extension("toml.apply");
+    fs::write(&tmp, encoded.as_bytes()).map_err(|error| format!("write tmp: {error}"))?;
+    if let Err(error) = Config::load(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("readback rejected: {error}"));
+    }
+    let backup = ctx.config_path.with_extension("toml.bak");
+    if ctx.config_path.exists() {
+        let _ = fs::copy(ctx.config_path, &backup);
+    }
+    if let Err(error) = fs::rename(&tmp, ctx.config_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("replace config: {error}"));
     }
 
     let restart_required = parsed.daemon.profile_path != ctx.config.daemon.profile_path

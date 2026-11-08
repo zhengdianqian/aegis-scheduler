@@ -2,11 +2,17 @@
 /* Copyright (C) 2026 默默的阿文 */
 
 /*
- * toml.js —— config.toml 的极简读写。
+ * toml.js —— config.toml 的完整读写。
  *
- * 只覆盖本项目配置使用的 TOML 子集：表头、键值、字符串、数字、布尔、字符串数组。
+ * 支持本项目及守护规范化输出会用到的 TOML 结构：
+ *   - 表头 [a.b] 与数组表 [[a.b]]
+ *   - 多行数组、尾随逗号、行内注释、嵌套数组
+ *   - 数字下划线分隔、十六/八/二进制、inf/nan
+ *   - 基本字符串转义（\n \t \r \b \f \" \\ \uXXXX \UXXXXXXXX）与字面量字符串
+ *   - 点分键与内联表
+ *
  * 不引入第三方解析器，保证 WebUI 在 file:// 下零依赖运行。
- * 输出始终是完整配置（所有分组都写出），避免默认值歧义。
+ * 输出按文档原有分组顺序重排，保留所有未在界面暴露的字段，避免回写时丢配置。
  */
 (function (global) {
   'use strict';
@@ -52,7 +58,10 @@
       resume_at_percent: 70,
       temp_stop_c: 45.0,
       temp_resume_c: 40.0,
-      latch_per_plug: false
+      latch_per_plug: false,
+      full_current_ma: 100,
+      full_hold_seconds: 9,
+      full_voltage_mv: null
     },
     thermal: {
       guard_c: 45.0,
@@ -95,22 +104,78 @@
     node[parts[parts.length - 1]] = value;
   }
 
-  /* ---------- 解析 ---------- */
+  /* ---------- 基础扫描 ---------- */
 
-  function stripComment(line) {
+  function skipSpace(source, index) {
+    var i = index;
+    while (i < source.length) {
+      var ch = source.charAt(i);
+      if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+        i += 1;
+        continue;
+      }
+      if (ch === '#') {
+        while (i < source.length && source.charAt(i) !== '\n') i += 1;
+        continue;
+      }
+      break;
+    }
+    return i;
+  }
+
+  /** 从 index 起跳过空白与注释，剩余内容只允许是空白/注释。 */
+  function restIsBlank(source, index) {
+    return skipSpace(source, index) >= source.length;
+  }
+
+  /** 扫描一段文本的引号与括号是否闭合（注释内不计）。 */
+  function scanBalance(source) {
+    var quote = null;
+    var escaped = false;
+    var depth = 0;
+    for (var i = 0; i < source.length; i += 1) {
+      var ch = source.charAt(i);
+      if (quote) {
+        if (quote === '"' && escaped) {
+          escaped = false;
+          continue;
+        }
+        if (quote === '"' && ch === '\\') {
+          escaped = true;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '#') {
+        while (i < source.length && source.charAt(i) !== '\n') i += 1;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === '[' || ch === '{') depth += 1;
+      else if (ch === ']' || ch === '}') depth -= 1;
+    }
+    return { complete: depth === 0 && !quote, depth: depth };
+  }
+
+  /** 一行文本去掉行内注释（尊重引号）。仅用于单行表头。 */
+  function stripLineComment(line) {
     var quote = null;
     var escaped = false;
     for (var i = 0; i < line.length; i += 1) {
       var ch = line.charAt(i);
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (ch === '\\' && quote === '"') {
-        escaped = true;
-        continue;
-      }
       if (quote) {
+        if (quote === '"' && escaped) {
+          escaped = false;
+          continue;
+        }
+        if (quote === '"' && ch === '\\') {
+          escaped = true;
+          continue;
+        }
         if (ch === quote) quote = null;
         continue;
       }
@@ -123,137 +188,352 @@
     return line;
   }
 
-  function splitTopLevel(body) {
-    var items = [];
-    var depth = 0;
+  /** 在语句里找顶层 "="（跳过引号与注释）。 */
+  function findAssign(source) {
     var quote = null;
     var escaped = false;
-    var current = '';
-    for (var i = 0; i < body.length; i += 1) {
-      var ch = body.charAt(i);
-      if (escaped) {
-        current += ch;
-        escaped = false;
+    for (var i = 0; i < source.length; i += 1) {
+      var ch = source.charAt(i);
+      if (quote) {
+        if (quote === '"' && escaped) {
+          escaped = false;
+          continue;
+        }
+        if (quote === '"' && ch === '\\') {
+          escaped = true;
+          continue;
+        }
+        if (ch === quote) quote = null;
         continue;
       }
-      if (quote) {
-        current += ch;
-        if (ch === '\\' && quote === '"') escaped = true;
-        else if (ch === quote) quote = null;
+      if (ch === '#') {
+        while (i < source.length && source.charAt(i) !== '\n') i += 1;
         continue;
       }
       if (ch === '"' || ch === "'") {
         quote = ch;
-        current += ch;
         continue;
       }
-      if (ch === '[') depth += 1;
-      if (ch === ']') depth -= 1;
-      if (ch === ',' && depth === 0) {
-        items.push(current.trim());
-        current = '';
+      if (ch === '=') return i;
+      if (ch === '\n') return -1;
+    }
+    return -1;
+  }
+
+  /* ---------- 值解析 ---------- */
+
+  function decodeEscape(ch) {
+    switch (ch) {
+      case 'b': return '\b';
+      case 't': return '\t';
+      case 'n': return '\n';
+      case 'f': return '\f';
+      case 'r': return '\r';
+      case '"': return '"';
+      case '\\': return '\\';
+      default: return ch;
+    }
+  }
+
+  function readBasicString(source, index, lineNo) {
+    var out = '';
+    var i = index + 1;
+    while (i < source.length) {
+      var ch = source.charAt(i);
+      if (ch === '"') return { value: out, index: i + 1 };
+      if (ch === '\\') {
+        var next = source.charAt(i + 1);
+        if (next === 'u' || next === 'U') {
+          var len = next === 'u' ? 4 : 8;
+          var hex = source.slice(i + 2, i + 2 + len);
+          if (!new RegExp('^[0-9a-fA-F]{' + len + '}$').test(hex)) {
+            throw new Error('第 ' + lineNo + ' 行：无效的转义序列');
+          }
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 2 + len;
+          continue;
+        }
+        out += decodeEscape(next);
+        i += 2;
         continue;
       }
-      current += ch;
+      out += ch;
+      i += 1;
     }
-    if (current.trim()) items.push(current.trim());
-    return items;
+    throw new Error('第 ' + lineNo + ' 行：字符串未闭合');
   }
 
-  function unquote(raw, lineNo) {
-    var quote = raw.charAt(0);
-    var inner = raw.slice(1, raw.length - 1);
-    if (quote === "'") return inner;
-    return inner.replace(/\\(u[0-9a-fA-F]{4}|.)/g, function (match, code) {
-      if (code === 'n') return '\n';
-      if (code === 't') return '\t';
-      if (code === 'r') return '\r';
-      if (code.charAt(0) === 'u') return '';
-      return code;
-    });
+  function readLiteralString(source, index, lineNo) {
+    var end = source.indexOf("'", index + 1);
+    if (end === -1) throw new Error('第 ' + lineNo + ' 行：字符串未闭合');
+    return { value: source.slice(index + 1, end), index: end + 1 };
   }
 
-  function parseValue(raw, lineNo) {
-    var value = raw.trim();
-    if (!value) throw new Error('第 ' + lineNo + ' 行：缺少值');
+  function parseNumberToken(token, lineNo) {
+    var raw = token.replace(/_/g, '');
+    var lower = raw.toLowerCase();
+    if (lower === 'inf' || lower === '+inf') return Infinity;
+    if (lower === '-inf') return -Infinity;
+    if (lower === 'nan' || lower === '+nan' || lower === '-nan') return NaN;
+    var sign = 1;
+    var body = raw;
+    if (body.charAt(0) === '+') body = body.slice(1);
+    else if (body.charAt(0) === '-') { sign = -1; body = body.slice(1); }
+    if (/^0x[0-9a-f]+$/i.test(body)) return sign * parseInt(body.slice(2), 16);
+    if (/^0o[0-7]+$/i.test(body)) return sign * parseInt(body.slice(2), 8);
+    if (/^0b[01]+$/i.test(body)) return sign * parseInt(body.slice(2), 2);
+    if (/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(raw)) return Number(raw);
+    throw new Error('第 ' + lineNo + ' 行：无法识别的值 "' + token + '"');
+  }
 
-    if (value.charAt(0) === '"' || value.charAt(0) === "'") {
-      if (value.charAt(value.length - 1) !== value.charAt(0)) {
-        throw new Error('第 ' + lineNo + ' 行：字符串未闭合');
+  function readBareToken(source, index) {
+    var i = index;
+    while (i < source.length) {
+      var ch = source.charAt(i);
+      if (ch === ',' || ch === ']' || ch === '}' || ch === '#' || ch === '\n' || ch === '\r') break;
+      i += 1;
+    }
+    return { raw: source.slice(index, i).trim(), index: i };
+  }
+
+  function readValue(source, index, lineNo) {
+    var i = skipSpace(source, index);
+    var ch = source.charAt(i);
+    if (ch === '"') return readBasicString(source, i, lineNo);
+    if (ch === "'") return readLiteralString(source, i, lineNo);
+    if (ch === '[') return readArray(source, i, lineNo);
+    if (ch === '{') return readInlineTable(source, i, lineNo);
+    var token = readBareToken(source, i);
+    if (!token.raw) throw new Error('第 ' + lineNo + ' 行：缺少值');
+    if (token.raw === 'true') return { value: true, index: token.index };
+    if (token.raw === 'false') return { value: false, index: token.index };
+    var value = parseNumberToken(token.raw, lineNo);
+    return { value: value, index: token.index };
+  }
+
+  function readArray(source, index, lineNo) {
+    var items = [];
+    var i = index + 1;
+    while (true) {
+      i = skipSpace(source, i);
+      if (i >= source.length) throw new Error('第 ' + lineNo + ' 行：数组未闭合');
+      if (source.charAt(i) === ']') return { value: items, index: i + 1 };
+      var parsed = readValue(source, i, lineNo);
+      items.push(parsed.value);
+      i = skipSpace(source, parsed.index);
+      if (source.charAt(i) === ',') {
+        i += 1;
+        continue;
       }
-      return unquote(value, lineNo);
+      if (source.charAt(i) === ']') return { value: items, index: i + 1 };
+      throw new Error('第 ' + lineNo + ' 行：数组缺少逗号或未闭合');
     }
-    if (value.charAt(0) === '[') {
-      if (value.charAt(value.length - 1) !== ']') {
-        throw new Error('第 ' + lineNo + ' 行：数组未闭合');
-      }
-      return splitTopLevel(value.slice(1, -1)).map(function (item) {
-        return parseValue(item, lineNo);
-      });
-    }
-    if (value === 'true') return true;
-    if (value === 'false') return false;
-
-    var number = Number(value.replace(/_/g, ''));
-    if (isFinite(number)) return number;
-    throw new Error('第 ' + lineNo + ' 行：无法识别的值 "' + value + '"');
   }
 
-  function parse(source) {
+  function readInlineTable(source, index, lineNo) {
+    var table = {};
+    var i = index + 1;
+    while (true) {
+      i = skipSpace(source, i);
+      if (i >= source.length) throw new Error('第 ' + lineNo + ' 行：内联表未闭合');
+      if (source.charAt(i) === '}') return { value: table, index: i + 1 };
+      var eq = findAssign(source.slice(i));
+      if (eq < 0) throw new Error('第 ' + lineNo + ' 行：内联表缺少 "="');
+      var keyParts = parseKeyPath(source.slice(i, i + eq), lineNo);
+      var parsed = readValue(source, i + eq + 1, lineNo);
+      assignPath(table, keyParts, parsed.value);
+      i = skipSpace(source, parsed.index);
+      if (source.charAt(i) === ',') {
+        i += 1;
+        continue;
+      }
+      if (source.charAt(i) === '}') return { value: table, index: i + 1 };
+      throw new Error('第 ' + lineNo + ' 行：内联表缺少逗号或未闭合');
+    }
+  }
+
+  function parseKeyPath(raw, lineNo) {
+    var parts = [];
+    var i = 0;
+    var source = raw;
+    while (i < source.length) {
+      while (i < source.length && /[ \t\r\n]/.test(source.charAt(i))) i += 1;
+      if (i >= source.length) break;
+      var ch = source.charAt(i);
+      var part;
+      if (ch === '"') {
+        var basic = readBasicString(source, i, lineNo);
+        part = basic.value;
+        i = basic.index;
+      } else if (ch === "'") {
+        var literal = readLiteralString(source, i, lineNo);
+        part = literal.value;
+        i = literal.index;
+      } else {
+        var start = i;
+        while (i < source.length && source.charAt(i) !== '.') i += 1;
+        part = source.slice(start, i).trim();
+      }
+      if (!part) throw new Error('第 ' + lineNo + ' 行：键名为空');
+      parts.push(part);
+      while (i < source.length && /[ \t\r\n]/.test(source.charAt(i))) i += 1;
+      if (i < source.length) {
+        if (source.charAt(i) !== '.') throw new Error('第 ' + lineNo + ' 行：键名格式无效');
+        i += 1;
+      }
+    }
+    return parts;
+  }
+
+  function assignPath(base, parts, value) {
+    var node = base;
+    for (var i = 0; i < parts.length - 1; i += 1) {
+      if (!isObject(node[parts[i]])) node[parts[i]] = {};
+      node = node[parts[i]];
+    }
+    node[parts[parts.length - 1]] = value;
+  }
+
+  /* ---------- 语句解析 ---------- */
+
+  function looksLikeStatementStart(line) {
+    var trimmed = stripLineComment(line).trim();
+    if (!trimmed) return false;
+    if (trimmed.charAt(0) === '[') return true;
+    var eq = findAssign(trimmed);
+    if (eq <= 0) return false;
+    // 数组续行通常以引号/数字开头且带逗号；这里要求 "=" 前没有逗号。
+    return trimmed.slice(0, eq).indexOf(',') === -1;
+  }
+
+  function parseInternal(source, options) {
+    var body = text(source).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+    var lines = body.split('\n');
     var root = {};
-    var table = root;
-    var lines = text(source).split(/\r?\n/);
+    var current = root;
+    var pending = null;
+    var errors = options.errors || null;
+    var lenient = !!options.lenient;
 
-    lines.forEach(function (rawLine, index) {
-      var lineNo = index + 1;
-      var line = stripComment(rawLine).trim();
-      if (!line) return;
+    function report(error, lineNo) {
+      var message = error && error.message ? error.message : String(error);
+      if (errors) {
+        errors.push({ line: lineNo, message: message });
+      }
+      if (!lenient) throw error;
+    }
 
-      if (line.charAt(0) === '[') {
-        if (line.charAt(line.length - 1) !== ']') {
+    function descend(node, part) {
+      var value = node[part];
+      if (Array.isArray(value)) value = value[value.length - 1];
+      if (!isObject(value)) {
+        value = {};
+        node[part] = value;
+      }
+      return value;
+    }
+
+    function applyStatement(stmt) {
+      var lineNo = stmt.lineNo;
+      var trimmed = stmt.text.replace(/^[ \t\r\n]+/, '');
+      if (trimmed.charAt(0) === '[') {
+        var header = stripLineComment(trimmed).trim();
+        var isArray = header.slice(0, 2) === '[[';
+        var close = isArray ? ']]' : ']';
+        if (header.slice(-close.length) !== close) {
           throw new Error('第 ' + lineNo + ' 行：表头未闭合');
         }
-        var name = line.slice(1, -1).trim();
-        if (!name) throw new Error('第 ' + lineNo + ' 行：表头为空');
-        var parts = name.split('.').map(function (part) { return part.trim(); });
-        table = root;
-        parts.forEach(function (part) {
-          if (!isObject(table[part])) table[part] = {};
-          table = table[part];
-        });
+        var inner = header.slice(isArray ? 2 : 1, -close.length).trim();
+        if (!inner) throw new Error('第 ' + lineNo + ' 行：表头为空');
+        var parts = parseKeyPath(inner, lineNo);
+        var node = root;
+        for (var i = 0; i < parts.length - 1; i += 1) node = descend(node, parts[i]);
+        var last = parts[parts.length - 1];
+        if (isArray) {
+          if (!Array.isArray(node[last])) node[last] = [];
+          var item = {};
+          node[last].push(item);
+          current = item;
+        } else {
+          current = descend(node, last);
+        }
         return;
       }
 
-      var eq = -1;
-      var quote = null;
-      for (var i = 0; i < line.length; i += 1) {
-        var ch = line.charAt(i);
-        if (quote) {
-          if (ch === quote) quote = null;
-          continue;
-        }
-        if (ch === '"' || ch === "'") {
-          quote = ch;
-          continue;
-        }
-        if (ch === '=') {
-          eq = i;
-          break;
-        }
-      }
+      var eq = findAssign(trimmed);
       if (eq <= 0) throw new Error('第 ' + lineNo + ' 行：缺少 "="');
-      var key = line.slice(0, eq).trim().replace(/^["']|["']$/g, '');
-      table[key] = parseValue(line.slice(eq + 1), lineNo);
-    });
+      var keyParts = parseKeyPath(trimmed.slice(0, eq), lineNo);
+      var parsed = readValue(trimmed, eq + 1, lineNo);
+      if (!restIsBlank(trimmed, parsed.index)) {
+        throw new Error('第 ' + lineNo + ' 行：值后存在无法识别的内容');
+      }
+      assignPath(current, keyParts, parsed.value);
+    }
+
+    function flushPending() {
+      var stmt = pending;
+      pending = null;
+      if (!stmt) return;
+      try {
+        applyStatement(stmt);
+      } catch (error) {
+        report(error, stmt.lineNo);
+      }
+    }
+
+    for (var index = 0; index < lines.length; index += 1) {
+      var line = lines[index];
+      if (pending) {
+        pending.text += '\n' + line;
+        if (scanBalance(pending.text).complete) {
+          flushPending();
+        } else if (lenient && looksLikeStatementStart(line)) {
+          report(new Error('第 ' + pending.lineNo + ' 行：语句未闭合，已跳过'), pending.lineNo);
+          pending = null;
+        }
+        continue;
+      }
+      if (!stripLineComment(line).trim()) continue;
+      pending = { text: line, lineNo: index + 1 };
+      if (scanBalance(line).complete) flushPending();
+    }
+
+    if (pending) {
+      var reason = scanBalance(pending.text).complete ? null : '语句未闭合';
+      report(new Error('第 ' + pending.lineNo + ' 行：' + (reason || '语句解析失败')), pending.lineNo);
+      if (!lenient) return root;
+      pending = null;
+    }
 
     return root;
+  }
+
+  function parse(source) {
+    return parseInternal(source, { lenient: false });
+  }
+
+  /**
+   * 容错解析：逐语句跳过无法解析的片段，返回能读到的部分。
+   * 供参数页/充电页降级显示使用，不用于写回。
+   */
+  function parseLenient(source) {
+    var errors = [];
+    var doc = parseInternal(source, { lenient: true, errors: errors });
+    return { doc: doc, errors: errors };
   }
 
   /* ---------- 规范化为内存模型 ---------- */
 
   function pickNumber(source, path, fallback) {
     var value = readPath(source, path);
-    return isFinite(Number(value)) && value !== '' && value !== null ? Number(value) : fallback;
+    if (value === '' || value === null || value === undefined) return fallback;
+    return isFinite(Number(value)) ? Number(value) : fallback;
+  }
+
+  function pickNumberOrNull(source, path) {
+    var value = readPath(source, path);
+    if (value === '' || value === null || value === undefined) return null;
+    return isFinite(Number(value)) ? Number(value) : null;
   }
 
   function pickString(source, path, fallback) {
@@ -274,7 +554,7 @@
   function normalize(source) {
     var src = isObject(source) ? source : {};
     var d = DEFAULTS;
-    var model = {
+    return {
       schema: 1,
       daemon: {
         log_level: pickString(src, 'daemon.log_level', d.daemon.log_level),
@@ -313,7 +593,10 @@
         resume_at_percent: pickNumber(src, 'charge.resume_at_percent', d.charge.resume_at_percent),
         temp_stop_c: pickNumber(src, 'charge.temp_stop_c', d.charge.temp_stop_c),
         temp_resume_c: pickNumber(src, 'charge.temp_resume_c', d.charge.temp_resume_c),
-        latch_per_plug: pickBool(src, 'charge.latch_per_plug', d.charge.latch_per_plug)
+        latch_per_plug: pickBool(src, 'charge.latch_per_plug', d.charge.latch_per_plug),
+        full_current_ma: pickNumber(src, 'charge.full_current_ma', d.charge.full_current_ma),
+        full_hold_seconds: pickNumber(src, 'charge.full_hold_seconds', d.charge.full_hold_seconds),
+        full_voltage_mv: pickNumberOrNull(src, 'charge.full_voltage_mv')
       },
       thermal: {
         guard_c: pickNumber(src, 'thermal.guard_c', d.thermal.guard_c),
@@ -323,89 +606,120 @@
         language: pickString(src, 'ui.language', d.ui.language)
       }
     };
-    return model;
   }
 
   /* ---------- 生成 ---------- */
 
-  function intText(value) {
-    return String(Math.round(Number(value)));
+  function isBareKey(key) {
+    return /^[A-Za-z0-9_-]+$/.test(key);
   }
 
-  function floatText(value) {
+  function keyText(key) {
+    return isBareKey(key) ? key : quote(key);
+  }
+
+  function pathText(parts) {
+    return parts.map(keyText).join('.');
+  }
+
+  function numberText(value) {
     var number = Number(value);
-    var out = number.toFixed(4).replace(/0+$/, '');
-    if (out.charAt(out.length - 1) === '.') out += '0';
-    return out;
+    if (number !== number) return 'nan';
+    if (number === Infinity) return 'inf';
+    if (number === -Infinity) return '-inf';
+    if (Object.is(number, -0)) return '-0.0';
+    return String(number);
   }
 
   function quote(value) {
-    return '"' + text(value)
+    var body = text(value)
       .replace(/\\/g, '\\\\')
       .replace(/"/g, '\\"')
       .replace(/\n/g, '\\n')
       .replace(/\r/g, '\\r')
-      .replace(/\t/g, '\\t') + '"';
+      .replace(/\t/g, '\\t')
+      .replace(/\f/g, '\\f')
+      .replace(/[\u0000-\u001f\u007f]/g, function (ch) {
+        var code = ch.charCodeAt(0).toString(16);
+        while (code.length < 4) code = '0' + code;
+        return '\\u' + code;
+      });
+    return '"' + body + '"';
   }
 
-  function stringify(model) {
-    var m = normalize(model);
-    var lines = [
-      '# Aegis 调度配置（控制台生成，schema = 1）',
-      'schema = ' + intText(m.schema),
-      '',
-      '[daemon]',
-      'log_level = ' + quote(m.daemon.log_level),
-      'profile_path = ' + quote(m.daemon.profile_path),
-      '',
-      '[events]',
-      'runtime_quantum_us = ' + intText(m.events.runtime_quantum_us),
-      'demand_step = ' + floatText(m.events.demand_step),
-      'screen_path = ' + quote(m.events.screen_path),
-      'frame_stride = ' + intText(m.events.frame_stride),
-      'quiet_decay_ms = ' + intText(m.events.quiet_decay_ms),
-      '',
-      '[control]',
-      'quiet_ratio = ' + floatText(m.control.quiet_ratio),
-      'quiet_cap = ' + floatText(m.control.quiet_cap),
-      'floor_enter_ratio = ' + floatText(m.control.floor_enter_ratio),
-      'floor_settle_ms = ' + intText(m.control.floor_settle_ms),
-      'floor_residence_ms = ' + intText(m.control.floor_residence_ms),
-      'drop_ratio = ' + floatText(m.control.drop_ratio),
-      'drop_factor = ' + floatText(m.control.drop_factor),
-      'touch_lift_ms = ' + intText(m.control.touch_lift_ms),
-      'touch_lift_level = ' + floatText(m.control.touch_lift_level),
-      'frame_slack_ms = ' + floatText(m.control.frame_slack_ms),
-      'frame_burst_ms = ' + intText(m.control.frame_burst_ms),
-      'frame_burst_level = ' + floatText(m.control.frame_burst_level),
-      'reserve_ratio = ' + floatText(m.control.reserve_ratio),
-      'step_hysteresis = ' + floatText(m.control.step_hysteresis),
-      '',
-      '[control.role_cap]',
-      'efficiency = ' + floatText(m.control.role_cap.efficiency),
-      'balanced = ' + floatText(m.control.role_cap.balanced),
-      'prime = ' + floatText(m.control.role_cap.prime),
-      '',
-      '[charge]',
-      'stop_at_percent = ' + intText(m.charge.stop_at_percent),
-      'resume_at_percent = ' + intText(m.charge.resume_at_percent),
-      'temp_stop_c = ' + floatText(m.charge.temp_stop_c),
-      'temp_resume_c = ' + floatText(m.charge.temp_resume_c),
-      'latch_per_plug = ' + (m.charge.latch_per_plug ? 'true' : 'false'),
-      '',
-      '[thermal]',
-      'guard_c = ' + floatText(m.thermal.guard_c),
-      'profile = ' + quote(m.thermal.profile),
-      '',
-      '[ui]',
-      'language = ' + quote(m.ui.language)
-    ];
-    return lines.join('\n') + '\n';
+  function valueText(value) {
+    if (typeof value === 'string') return quote(value);
+    if (typeof value === 'boolean') return value ? 'true' : 'false';
+    if (typeof value === 'number') return numberText(value);
+    if (Array.isArray(value)) {
+      return '[' + value.map(valueText).join(', ') + ']';
+    }
+    if (isObject(value)) {
+      return '{ ' + Object.keys(value).map(function (key) {
+        return keyText(key) + ' = ' + valueText(value[key]);
+      }).join(', ') + ' }';
+    }
+    return '""';
+  }
+
+  function isTableArray(value) {
+    return Array.isArray(value) && value.length > 0 && value.every(isObject);
+  }
+
+  function isSection(value) {
+    return isObject(value) || isTableArray(value);
+  }
+
+  function emitBody(out, obj, path) {
+    Object.keys(obj).forEach(function (key) {
+      if (isSection(obj[key])) return;
+      out.push(keyText(key) + ' = ' + valueText(obj[key]));
+    });
+    Object.keys(obj).forEach(function (key) {
+      var value = obj[key];
+      if (!isObject(value)) return;
+      if (out.length) out.push('');
+      out.push('[' + pathText(path.concat(key)) + ']');
+      emitBody(out, value, path.concat(key));
+    });
+    Object.keys(obj).forEach(function (key) {
+      var value = obj[key];
+      if (!isTableArray(value)) return;
+      value.forEach(function (item) {
+        if (out.length) out.push('');
+        out.push('[[' + pathText(path.concat(key)) + ']]');
+        emitBody(out, item, path.concat(key));
+      });
+    });
+  }
+
+  /** 序列化整份文档：保留所有分组与数组表，输出合法 TOML。 */
+  function stringify(doc) {
+    var root = isObject(doc) ? doc : {};
+    var out = [];
+    emitBody(out, root, []);
+    return out.join('\n') + '\n';
+  }
+
+  /**
+   * 把界面模型里的字段合并回原始文档，未在界面暴露的字段原样保留。
+   * paths 为点分路径数组；不在 paths 中的键不会被覆盖。
+   */
+  function applyModel(doc, model, paths) {
+    var out = clone(isObject(doc) ? doc : {});
+    (paths || []).forEach(function (path) {
+      var value = readPath(model, path);
+      if (value === undefined) return;
+      writePath(out, path, value);
+    });
+    return out;
   }
 
   Tempo.Toml = {
     parse: parse,
+    parseLenient: parseLenient,
     stringify: stringify,
+    applyModel: applyModel,
     normalize: normalize,
     defaults: function () { return clone(DEFAULTS); },
     clone: clone,

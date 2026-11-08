@@ -129,7 +129,7 @@ fn wait_for_boot() -> bool {
 fn main() -> ExitCode {
     let args = Args::parse();
 
-    let config = match Config::load(&args.config) {
+    let mut config = match Config::load(&args.config) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("Aegis: configuration rejected: {error}");
@@ -148,6 +148,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Pin the profile path that actually loaded and rewrite the config in the
+    // canonical one-line-array form. Old v2 files carried a stale path and
+    // multi-line arrays that the console could not parse.
+    if args.profile.is_some() {
+        config.daemon.profile_path = profile_path.display().to_string();
+    }
+    match config.normalize_file(&args.config) {
+        Ok(true) => eprintln!("Aegis: config rewritten in canonical form"),
+        Ok(false) => {}
+        Err(error) => eprintln!("Aegis: config normalization skipped: {error}"),
+    }
 
     let builder = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(config.daemon.log_level.as_str()))

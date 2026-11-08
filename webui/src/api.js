@@ -556,11 +556,14 @@
   /**
    * 读取当前配置。走 tempoctl 的 config 子命令，
    * 与守护 config.get 读到的是同一份文件，且会先经过同一套校验。
+   *
+   * 解析失败不再当作整页错误：返回能读到的文档 + 降级标记，
+   * 由参数页与充电页各自按默认值渲染并提示。
    */
   TempoApi.prototype.loadConfig = function (binary) {
     var self = this;
     if (!binary) {
-      return Promise.resolve({ toml: null, model: null, error: '控制服务未就绪' });
+      return Promise.resolve({ toml: null, doc: null, model: null, error: '控制服务未就绪', degraded: false, degradeReason: null });
     }
     var command = [
       '"' + binary + '"',
@@ -573,13 +576,36 @@
       if (result.code !== 0 || !output.trim()) {
         throw new Error(firstLine(output) || ('读取配置失败（退出码 ' + result.code + '）'));
       }
-      return {
-        toml: output,
-        model: Tempo.Toml.normalize(Tempo.Toml.parse(output)),
-        error: null
-      };
+      try {
+        var doc = Tempo.Toml.parse(output);
+        return {
+          toml: output,
+          doc: doc,
+          model: Tempo.Toml.normalize(doc),
+          error: null,
+          degraded: false,
+          degradeReason: null
+        };
+      } catch (parseError) {
+        var salvaged = Tempo.Toml.parseLenient(output);
+        return {
+          toml: output,
+          doc: salvaged.doc,
+          model: Tempo.Toml.normalize(salvaged.doc),
+          error: null,
+          degraded: true,
+          degradeReason: shorten(parseError.message, 200)
+        };
+      }
     }).catch(function (error) {
-      return { toml: null, model: null, error: shorten(error.message, 240) };
+      return {
+        toml: null,
+        doc: null,
+        model: null,
+        error: shorten(error.message, 240),
+        degraded: false,
+        degradeReason: null
+      };
     });
   };
 
@@ -668,13 +694,13 @@
    * 完整保存流程：写草稿 → tempoctl validate → 备份 → 原子替换 → 回读。
    * onStep 依次收到 'write' / 'validate' / 'commit' / 'readback'。
    */
-  TempoApi.prototype.applyConfig = function (binary, model, onStep) {
+  TempoApi.prototype.applyConfig = function (binary, doc, onStep) {
     var self = this;
     var notify = function (step) {
       if (typeof onStep === 'function') onStep(step);
     };
 
-    return self.writeConfigDraft(Tempo.Toml.stringify(model)).then(function () {
+    return self.writeConfigDraft(Tempo.Toml.stringify(doc)).then(function () {
       notify('validate');
       return self.validateConfig(binary, PATHS.configNew);
     }).then(function (checked) {
@@ -693,8 +719,11 @@
         return {
           ok: true,
           step: 'readback',
+          doc: readback.doc,
           model: readback.model,
           toml: readback.toml,
+          degraded: readback.degraded,
+          degradeReason: readback.degradeReason,
           error: readback.error || null
         };
       });

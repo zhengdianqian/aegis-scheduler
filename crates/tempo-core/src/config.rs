@@ -418,8 +418,36 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Canonical, minimal TOML. Arrays stay on one line, there are no trailing
+    /// commas and no inline comments, so the same subset the console parses is
+    /// always what the daemon emits. The result is parsed back and validated
+    /// before it is handed out: an invalid document is never returned.
     pub fn to_toml_string(&self) -> Result<String, CoreError> {
-        Ok(toml::to_string_pretty(self)?)
+        let text = toml::to_string(self)?;
+        let parsed: Self = toml::from_str(&text)?;
+        parsed.validate()?;
+        Ok(text)
+    }
+
+    /// Rewrite `path` in canonical form when the stored file differs. The new
+    /// document is written to a temporary file, read back and validated, then
+    /// renamed over the original; a failure leaves the old file untouched.
+    /// Returns `true` when the file was replaced.
+    pub fn normalize_file(&self, path: &Path) -> Result<bool, CoreError> {
+        let canonical = self.to_toml_string()?;
+        let current = std::fs::read_to_string(path).unwrap_or_default();
+        if current.trim() == canonical.trim() {
+            return Ok(false);
+        }
+        let tmp = path.with_extension("toml.apply");
+        std::fs::write(&tmp, canonical.as_bytes())?;
+        let readback = Self::load(&tmp);
+        if let Err(error) = readback {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(true)
     }
 
     /// Reject configurations that could produce unsafe or ambiguous behaviour.
@@ -685,6 +713,25 @@ mod tests {
         assert_eq!(parsed.control.floor_enter_ratio, 0.05);
         assert_eq!(parsed.control.floor_exit_ratio, 0.12);
         assert_eq!(parsed.control.fg_fast_ms, 100);
+    }
+
+    /// The console parses one line at a time: arrays must never span lines and
+    /// the document must contain no inline comments or trailing commas.
+    #[test]
+    fn config_serializes_compact_arrays() {
+        let cfg = Config::default();
+        let text = cfg.to_toml_string().expect("serialize");
+        for line in text.lines() {
+            let body = line.trim();
+            if let Some((_, value)) = body.split_once('=') {
+                let value = value.trim();
+                if value.starts_with('[') {
+                    assert!(value.ends_with(']'), "array must close on one line: {line}");
+                    assert!(!value.contains('#'), "no inline comments: {line}");
+                }
+            }
+            assert!(!body.ends_with(','), "no trailing comma: {line}");
+        }
     }
 
     #[test]
