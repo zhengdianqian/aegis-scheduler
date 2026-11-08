@@ -42,6 +42,10 @@ const CHARGE_TIMER: Token = Token(12);
 const CONFIG_WATCH: Token = Token(13);
 const VERIFY: Token = Token(14);
 const CEILING_TIMER: Token = Token(15);
+/// 静默期只做低频率的安全校正。事件提交本身已经维护上限；3 秒一次只会
+/// 在厂商地板抖动时反复重写 scaling_max_freq（~1 次/秒，每次 ~10 ms 系统
+/// 时间），既耗 CPU 又制造周期性卡顿。
+const CEILING_INTERVAL_US: u64 = 15_000_000;
 const FIRST_CONNECTION: usize = 16;
 
 struct Connection {
@@ -171,7 +175,7 @@ pub fn run(
     let startup_decisions = screen_decisions;
     let mut verify_retries = 0u8;
     verify_timer.arm(now_us() + 20_000_000);
-    ceiling_timer.arm(now_us() + 3_000_000);
+    ceiling_timer.arm(now_us() + CEILING_INTERVAL_US);
     if let Ok(mut state) = status.lock() {
         state.screen_on = screen_on;
         state.screen_source = match screen.as_ref() {
@@ -258,6 +262,7 @@ pub fn run(
                 reasons = decision.reasons_joined().as_str(),
                 "charge control attached"
             );
+            publish_charge(&watcher, &status);
             Some(watcher)
         }
         Err(error) => {
@@ -376,7 +381,10 @@ pub fn run(
                 if let Some(session) = probe.as_mut() {
                     if controller.is_screen_on() {
                         if let Some(sample) = session.drain() {
-                            if sample.ts_us.saturating_sub(last_probe_us) < 50_000 {
+                            // 50 ms 的探针事件在静态页面里几乎全部是“无事可做”的
+                            // 空唤醒；合并到 100 ms 一处处理，只保留一半的
+                            // epoll 唤醒与状态拷贝，交互档位仍然远快于一次触控。
+                            if sample.ts_us.saturating_sub(last_probe_us) < 100_000 {
                                 continue;
                             }
                             last_probe_us = sample.ts_us;
@@ -449,17 +457,22 @@ pub fn run(
                                 && sample.ts_us < launch_until_us
                                 && sample.foreground_active
                                 && fg_peak >= 0.30
-                                && sample.ts_us.saturating_sub(last_launch_us) >= 100_000;
+                                && sample.ts_us.saturating_sub(last_launch_us) >= 800_000;
                             if launch_edge || launch_renew {
                                 last_launch_us = sample.ts_us;
                                 launch_until_us = sample
                                     .ts_us
                                     .saturating_add(config.control.launch_lift_ms * 1_000);
+                                // 100 ms 续期会把同一组 1.00 档反复提交、反复写
+                                // cpufreq 节点；800 ms 续期既保住启动窗口，又把
+                                // 节点读取/写入频率降到原来的 1/8。
                                 decisions = controller.on_app_launch(sample.ts_us);
-                                if let Ok(mut state) = status.lock() {
-                                    state.launch_lifts += 1;
+                                if launch_edge {
+                                    if let Ok(mut state) = status.lock() {
+                                        state.launch_lifts += 1;
+                                    }
+                                    tracing::debug!(fg_peak, "app launch edge: launch lift");
                                 }
-                                tracing::debug!(fg_peak, "app launch edge: launch lift");
                             }
                             let quiet = controller.is_quiet();
                             record(&status, &decisions, Some(&sample), Some(quiet));
@@ -558,6 +571,10 @@ pub fn run(
                         tracing::info!(
                             action = decision.action.as_str(),
                             stopped = watcher.is_stopped(),
+                            phase = watcher.phase(),
+                            trickle = watcher.is_trickling(),
+                            latched = watcher.is_latched(),
+                            current_ma = ?watcher.last_current_ma(),
                             reasons = decision.reasons_joined().as_str(),
                             "charge state updated"
                         );
@@ -575,8 +592,12 @@ pub fn run(
                     tracing::info!(
                         action = decision.action.as_str(),
                         stopped = watcher.is_stopped(),
+                        phase = watcher.phase(),
+                        trickle = watcher.is_trickling(),
+                        latched = watcher.is_latched(),
+                        current_ma = ?watcher.last_current_ma(),
                         reasons = decision.reasons_joined().as_str(),
-                        "charge schedule boundary"
+                        "charge trickle sample"
                     );
                     publish_charge(watcher, &status);
                 }
@@ -690,6 +711,18 @@ pub fn run(
                 }
                 if let Ok(mut state) = status.lock() {
                     state.writes = writer.as_ref().map(CpufreqWriter::applied).unwrap_or(0);
+                    state.cap_writes = writer
+                        .as_ref()
+                        .map(CpufreqWriter::cap_writes)
+                        .unwrap_or(0);
+                    state.floor_writes = writer
+                        .as_ref()
+                        .map(CpufreqWriter::floor_writes)
+                        .unwrap_or(0);
+                    state.rejected_floor = writer
+                        .as_ref()
+                        .map(CpufreqWriter::rejected_floor)
+                        .unwrap_or(0);
                 }
                 // A late vendor write can still park a policy on its minimum.
                 // Re-check once more; this remains a bounded one-shot, not a
@@ -709,8 +742,20 @@ pub fn run(
                 }
                 if let Ok(mut state) = status.lock() {
                     state.writes = writer.as_ref().map(CpufreqWriter::applied).unwrap_or(0);
+                    state.cap_writes = writer
+                        .as_ref()
+                        .map(CpufreqWriter::cap_writes)
+                        .unwrap_or(0);
+                    state.floor_writes = writer
+                        .as_ref()
+                        .map(CpufreqWriter::floor_writes)
+                        .unwrap_or(0);
+                    state.rejected_floor = writer
+                        .as_ref()
+                        .map(CpufreqWriter::rejected_floor)
+                        .unwrap_or(0);
                 }
-                ceiling_timer.arm(now_us() + 3_000_000);
+                ceiling_timer.arm(now_us() + CEILING_INTERVAL_US);
                 continue;
             }
 
@@ -889,14 +934,32 @@ fn commit(
     status: &Arc<Mutex<RuntimeStatus>>,
 ) {
     let mut error = None;
-    if let Some(writer) = writer.as_mut() {
-        if let Err(problem) = writer.apply(decisions) {
-            error = Some(problem);
+    // Steady state: every decision still carries the same ceiling/floor, so a
+    // write pass would only re-read the same nodes. Apply only when at least one
+    // cluster actually moved; the periodic ceiling reconcile and the quiet
+    // transition cover vendor-side drift.
+    if decisions.iter().any(|decision| decision.changed) {
+        if let Some(writer) = writer.as_mut() {
+            if let Err(problem) = writer.apply(decisions) {
+                error = Some(problem);
+            }
         }
     }
     if let Ok(mut state) = status.lock() {
         state.decisions = decisions.to_vec();
         state.writes = writer.as_ref().map(CpufreqWriter::applied).unwrap_or(0);
+        state.cap_writes = writer
+            .as_ref()
+            .map(CpufreqWriter::cap_writes)
+            .unwrap_or(0);
+        state.floor_writes = writer
+            .as_ref()
+            .map(CpufreqWriter::floor_writes)
+            .unwrap_or(0);
+        state.rejected_floor = writer
+            .as_ref()
+            .map(CpufreqWriter::rejected_floor)
+            .unwrap_or(0);
         state.write_error = error;
     }
 }
@@ -969,12 +1032,21 @@ fn publish_charge(watcher: &ChargeWatcher, status: &Arc<Mutex<RuntimeStatus>>) {
         state.charge_reasons = watcher.reasons();
         state.charge_plan_allowed = watcher.plan_allowed();
         state.charge_plan_enabled = watcher.plan_enabled();
+        state.charge_phase = watcher.phase().to_owned();
+        state.charge_trickle = watcher.is_trickling();
+        state.charge_latched = watcher.is_latched();
+        state.charge_current_ma = watcher.last_current_ma();
     }
 }
 
 /// Arms a single one-shot timer at the next reservation boundary. No timer is
 /// pending when the plan is disabled, so an idle device has no scheduled wakeup.
+/// 100% 涓流阶段例外：按 3 秒一拍读取真实电流/满充状态，凑满 9 秒证据后锁存。
 fn arm_charge_timer(watcher: Option<&ChargeWatcher>, timer: &OneShotTimer) {
+    if watcher.is_some_and(ChargeWatcher::is_trickling) {
+        timer.arm(now_us() + 3_000_000);
+        return;
+    }
     match watcher.and_then(ChargeWatcher::next_boundary_secs) {
         Some(seconds) if seconds > 0 => {
             timer.arm(now_us() + seconds as u64 * 1_000_000);

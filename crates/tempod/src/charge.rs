@@ -23,6 +23,15 @@ use tempo_core::Config;
 
 const BATTERY: &str = "/sys/class/power_supply/battery";
 
+/// Battery node directory. `AEGIS_BATTERY_DIR` exists only so the exact same
+/// binary can be driven against a synthetic node set during verification; the
+/// normal path always reads the real power-supply nodes.
+fn battery_dir() -> PathBuf {
+    std::env::var_os("AEGIS_BATTERY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(BATTERY))
+}
+
 struct Candidate {
     path: &'static str,
     stop: &'static str,
@@ -95,14 +104,29 @@ pub struct ChargeWatcher {
     plan: ChargePlan,
     plan_allowed: bool,
     last: Option<ChargeDecision>,
+    last_current_ma: Option<i32>,
 }
 
 impl ChargeWatcher {
     pub fn open(plan_path: PathBuf) -> io::Result<Self> {
-        let candidate = CANDIDATES
-            .iter()
-            .find(|candidate| writable(Path::new(candidate.path)))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no writable charge switch"))?;
+        // Verification hook: point the same binary at a scratch switch so a
+        // synthetic full-charge run never touches the real charger.
+        let (node, stop, start) = match std::env::var_os("AEGIS_CHARGE_SWITCH") {
+            Some(path) => (PathBuf::from(path), "1", "0"),
+            None => {
+                let candidate = CANDIDATES
+                    .iter()
+                    .find(|candidate| writable(Path::new(candidate.path)))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "no writable charge switch")
+                    })?;
+                (
+                    PathBuf::from(candidate.path),
+                    candidate.stop,
+                    candidate.start,
+                )
+            }
+        };
 
         let fd = unsafe {
             libc::socket(
@@ -130,12 +154,13 @@ impl ChargeWatcher {
             return Err(error);
         }
 
+        let original = read_node(&node);
         Ok(Self {
             fd,
-            node: PathBuf::from(candidate.path),
-            stop: candidate.stop,
-            start: candidate.start,
-            original: read_node(Path::new(candidate.path)),
+            node,
+            stop,
+            start,
+            original,
             governor: ChargeGovernor::new(),
             stopped: false,
             events: 0,
@@ -144,6 +169,7 @@ impl ChargeWatcher {
             plan: ChargePlan::default(),
             plan_allowed: true,
             last: None,
+            last_current_ma: None,
         })
     }
 
@@ -157,6 +183,23 @@ impl ChargeWatcher {
 
     pub fn is_stopped(&self) -> bool {
         self.stopped
+    }
+
+    /// 100% 涓流阶段：此时守护按 3 秒一拍读取 current/status 收集满充证据。
+    pub fn is_trickling(&self) -> bool {
+        self.governor.is_trickling()
+    }
+
+    pub fn is_latched(&self) -> bool {
+        self.governor.is_latched()
+    }
+
+    pub fn phase(&self) -> &'static str {
+        self.governor.phase()
+    }
+
+    pub fn last_current_ma(&self) -> Option<i32> {
+        self.last_current_ma
     }
 
     pub fn plan_allowed(&self) -> bool {
@@ -204,13 +247,26 @@ impl ChargeWatcher {
         let (day, minute, _) = local_now();
         self.plan_allowed = self.plan.allows(day, minute);
 
-        let sample = ChargeSample {
+        let battery = battery_dir();
+        let percent = read_u32(&battery.join("capacity")).map(|value| value as u8);
+        let mut sample = ChargeSample {
             ts_us,
-            percent: read_u32(&Path::new(BATTERY).join("capacity")).map(|value| value as u8),
-            temp_c: read_u32(&Path::new(BATTERY).join("temp"))
-                .map(|value| value as f32 / 10.0),
+            percent,
+            temp_c: read_u32(&battery.join("temp")).map(|value| value as f32 / 10.0),
             plugged: external_power_present(),
+            ..ChargeSample::default()
         };
+        // 只有 100% 涓流阶段才需要电流/电压/status 证据，避免把节点读取
+        // 变成常驻开销。
+        if config.charge.stop_at_percent == 100
+            && percent.is_some_and(|value| value >= config.charge.stop_at_percent)
+        {
+            sample.current_ma = read_i32(&battery.join("current_now")).map(|value| value / 1000);
+            sample.voltage_mv = read_u32(&battery.join("voltage_now")).map(|value| value / 1000);
+            sample.status_full = read_text(&battery.join("status"))
+                .is_some_and(|status| status.eq_ignore_ascii_case("full"));
+        }
+        self.last_current_ma = sample.current_ma.map(|value| value.unsigned_abs() as i32);
         let was_stopped = self.stopped;
         let decision = self
             .governor
@@ -226,7 +282,7 @@ impl ChargeWatcher {
             match decision.action {
                 ChargeAction::Stop => self.write(self.stop),
                 ChargeAction::Resume => self.write(self.start),
-                ChargeAction::None => {}
+                ChargeAction::None | ChargeAction::Hold => {}
             }
         }
         self.stopped = self.governor.is_stopped();
@@ -360,6 +416,10 @@ fn read_text(path: &Path) -> Option<String> {
 }
 
 fn read_u32(path: &Path) -> Option<u32> {
+    read_text(path)?.parse().ok()
+}
+
+fn read_i32(path: &Path) -> Option<i32> {
     read_text(path)?.parse().ok()
 }
 

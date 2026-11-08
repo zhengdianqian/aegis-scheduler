@@ -7,7 +7,10 @@ log_level = "info"
 profile_path = "/data/adb/tempo/profile/babylon.toml"
 
 [events]
-runtime_quantum_us = 50000
+# 50 ms 采样在静态页面里只是把守护唤醒 20 次/秒做一遍无事可做的决策；
+# 200 ms（5 次/秒）实测把静置空唤醒带来的 CPU 压到 0.38% 单核（目标 ≤0.4%），
+# 负载变化仍在一个刷新周期级别被发现，交互路径另有触摸/启动抬频兜底。
+runtime_quantum_us = 200000
 demand_step = 0.10
 screen_path = ""
 frame_stride = 2
@@ -72,6 +75,12 @@ temp_resume_c = 40.0
 # 仅 100% 上限使用“插电会话内保持”；80/90 使用回差自动复充。
 # 守护按 stop_at_percent == 100 推导，此字段仅用于兼容旧配置。
 latch_per_plug = false
+# 100% 涓流满充判定：电流（绝对值）连续低于 full_current_ma 达到
+# full_hold_seconds 秒，或驱动直接上报 status=Full，才停充并锁存。
+full_current_ma = 100
+full_hold_seconds = 9
+# 可选电压阈值（mV）；留空注释即不参与判定。
+# full_voltage_mv = 4300
 
 [thermal]
 guard_c = 45.0

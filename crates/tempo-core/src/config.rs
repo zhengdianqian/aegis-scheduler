@@ -153,6 +153,13 @@ pub struct ChargeConfig {
     pub temp_stop_c: f32,
     pub temp_resume_c: f32,
     pub latch_per_plug: bool,
+    /// 涓流满充电流阈值（mA，绝对值）。到 100% 不停充，电流连续低于该值
+    /// 达到 `full_hold_seconds` 才判定充满并锁存停充。
+    pub full_current_ma: u32,
+    /// 满充信号需要持续的秒数。守护只在涓流阶段按 3 秒一拍采样。
+    pub full_hold_seconds: u32,
+    /// 可选满充电压阈值（mV）。默认关闭，仅配置后参与判定。
+    pub full_voltage_mv: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -283,6 +290,9 @@ impl Default for ChargeConfig {
             temp_stop_c: 45.0,
             temp_resume_c: 40.0,
             latch_per_plug: false,
+            full_current_ma: 100,
+            full_hold_seconds: 9,
+            full_voltage_mv: None,
         }
     }
 }
@@ -329,8 +339,8 @@ impl Config {
         if self.daemon.profile_path.trim().is_empty() {
             bad.push("daemon.profile_path must not be empty".to_owned());
         }
-        if !(500..=50_000).contains(&self.events.runtime_quantum_us) {
-            bad.push("events.runtime_quantum_us must be 500..=50000".to_owned());
+        if !(500..=200_000).contains(&self.events.runtime_quantum_us) {
+            bad.push("events.runtime_quantum_us must be 500..=200000".to_owned());
         }
         if !(0.01..=0.20).contains(&self.events.demand_step) {
             bad.push("events.demand_step must be 0.01..=0.20".to_owned());
@@ -455,7 +465,17 @@ impl Config {
         if ch.temp_resume_c >= ch.temp_stop_c {
             bad.push("charge.temp_resume_c must be < charge.temp_stop_c".to_owned());
         }
-
+        if !(20..=1000).contains(&ch.full_current_ma) {
+            bad.push("charge.full_current_ma must be 20..=1000".to_owned());
+        }
+        if !(1..=60).contains(&ch.full_hold_seconds) {
+            bad.push("charge.full_hold_seconds must be 1..=60".to_owned());
+        }
+        if let Some(voltage) = ch.full_voltage_mv {
+            if !(3000..=5000).contains(&voltage) {
+                bad.push("charge.full_voltage_mv must be 3000..=5000".to_owned());
+            }
+        }
         if self.fas.apps.len() > 64 {
             bad.push("fas.apps must contain at most 64 entries".to_owned());
         }

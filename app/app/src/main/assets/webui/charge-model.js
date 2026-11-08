@@ -38,6 +38,17 @@
 
   var MAX_WINDOWS = 6;
 
+  /*
+   * 满充（涓流结束）判定默认值，对应原模块 C 源码的语义：
+   * 电流 |I| < 100 mA 连续 3 拍（3 秒/拍）≈ 9 秒，或电池 status 直接报 Full。
+   * 电压判据默认关闭，需要时由配置传入。
+   */
+  var TRICKLE_DEFAULTS = {
+    currentMa: 100,
+    holdSeconds: 9,
+    voltageMv: null
+  };
+
   function numberOrNull(value) {
     if (value == null || value === '') return null;
     var number = Number(value);
@@ -226,7 +237,7 @@
     };
   }
 
-  /* 100% 是“充满即停”的唯一入口，其余阈值都不保持。 */
+  /* 100% 是“涓流至满充后停充并保持”的唯一入口，其余阈值都不保持。 */
   function deriveLatch(stopAt) {
     return numberOrNull(stopAt) === 100;
   }
@@ -258,20 +269,30 @@
       resumeAt: numberOrNull(init.resumeAt),
       tempStop: numberOrNull(init.tempStop),
       tempResume: numberOrNull(init.tempResume),
-      latchPerPlug: typeof init.latchPerPlug === 'boolean' ? init.latchPerPlug : null
+      latchPerPlug: typeof init.latchPerPlug === 'boolean' ? init.latchPerPlug : null,
+      trickle: !!init.trickle,
+      trickleSince: numberOrNull(init.trickleSince),
+      fullCurrentMa: numberOrNull(init.fullCurrentMa),
+      fullHoldSeconds: numberOrNull(init.fullHoldSeconds),
+      fullVoltageMv: numberOrNull(init.fullVoltageMv)
     };
   }
 
   /*
    * 推进一次状态机。
    *
-   * 输入：now / percent / tempC / plugged / stopAt / resumeAt /
-   *       tempStop / tempResume / latchPerPlug / plan
+   * 输入：now / percent / tempC / plugged / stopAt / resumeAt / tempStop /
+   *       tempResume / latchPerPlug / currentMa / voltageMv / statusFull /
+   *       fullCurrentMa / fullHoldSeconds / fullVoltageMv / plan
    * 输出：是否允许充电、动作、停充原因（按优先级排序）与新的内部状态。
    *
-   * 停充条件取“或”：温度保护、100% 锁存、普通上限保持、预约时段外。
+   * 停充条件取“或”：温度保护、100% 满充锁存、普通上限保持、预约时段外。
    * 恢复条件取“与”：以上条件必须全部解除。
-   * 原因优先级：温度 > 100% 锁存 > 普通上限 > 预约。
+   * 原因优先级：温度 > 100% 满充锁存 > 普通上限 > 预约。
+   *
+   * 100% 策略：到达 100% 不停充，先进入涓流阶段；只有出现满充证据
+   * （status=Full，或电流持续低于阈值达到保持时长，或可选满充电压持续
+   * 达到保持时长）才锁存停充，直到重新插电。
    */
   function step(prev, input) {
     var state = createState(prev || {});
@@ -289,6 +310,18 @@
     var resumeAt = numberOrNull(data.resumeAt);
     var tempStop = numberOrNull(data.tempStop);
     var tempResume = numberOrNull(data.tempResume);
+    var currentMa = numberOrNull(data.currentMa);
+    var voltageMv = numberOrNull(data.voltageMv);
+    var statusFull = data.statusFull === true;
+    var fullCurrentMa = numberOrNull(data.fullCurrentMa);
+    if (fullCurrentMa == null) fullCurrentMa = TRICKLE_DEFAULTS.currentMa;
+    var fullHoldSeconds = numberOrNull(data.fullHoldSeconds);
+    if (fullHoldSeconds == null) fullHoldSeconds = TRICKLE_DEFAULTS.holdSeconds;
+    if (fullHoldSeconds < 1) fullHoldSeconds = 1;
+    var fullVoltageMv = numberOrNull(data.fullVoltageMv);
+    var nowMs = data.now instanceof Date
+      ? data.now.getTime()
+      : (typeof data.now === 'number' && isFinite(data.now) ? data.now : Date.now());
     var latchPerPlug = typeof data.latchPerPlug === 'boolean'
       ? data.latchPerPlug
       : deriveLatch(stopAt);
@@ -302,7 +335,10 @@
       state.resumeAt !== resumeAt ||
       state.tempStop !== tempStop ||
       state.tempResume !== tempResume ||
-      state.latchPerPlug !== latchPerPlug
+      state.latchPerPlug !== latchPerPlug ||
+      state.fullCurrentMa !== fullCurrentMa ||
+      state.fullHoldSeconds !== fullHoldSeconds ||
+      state.fullVoltageMv !== fullVoltageMv
     );
 
     if (firstRun) {
@@ -310,11 +346,13 @@
       state.tempBlocked = false;
       state.upperLatched = false;
       state.upperHold = false;
+      state.trickleSince = null;
     } else if (configChanged) {
       flags.configChanged = true;
       state.tempBlocked = false;
       state.upperLatched = false;
       state.upperHold = false;
+      state.trickleSince = null;
     }
 
     if (typeof state.lastPlugged === 'boolean' && state.lastPlugged !== plugged) {
@@ -323,17 +361,23 @@
         state.tempBlocked = false;
         state.upperLatched = false;
         state.upperHold = false;
+        state.trickleSince = null;
+        state.trickle = false;
       } else {
         flags.replugged = true;
         state.tempBlocked = false;
         state.upperLatched = false;
         state.upperHold = false;
+        state.trickleSince = null;
+        state.trickle = false;
       }
     }
 
     if (!plugged) {
       state.armed = true;
       state.stopped = false;
+      state.trickle = false;
+      state.trickleSince = null;
       state.lastPercent = percent;
       state.lastPlugged = false;
       state.stopAt = stopAt;
@@ -341,6 +385,9 @@
       state.tempStop = tempStop;
       state.tempResume = tempResume;
       state.latchPerPlug = latchPerPlug;
+      state.fullCurrentMa = fullCurrentMa;
+      state.fullHoldSeconds = fullHoldSeconds;
+      state.fullVoltageMv = fullVoltageMv;
 
       return {
         state: state,
@@ -350,7 +397,9 @@
         reasons: [],
         plan: planState(data.plan, data.now),
         flags: flags,
-        plugged: false
+        plugged: false,
+        trickle: false,
+        phase: 'unplugged'
       };
     }
 
@@ -363,26 +412,54 @@
       else if (tempResume != null && temp <= tempResume) state.tempBlocked = false;
     }
 
+    var planLive = planState(data.plan, data.now);
+
     if (latchPerPlug) {
       state.upperHold = false;
       if (percent != null && stopAt != null) {
         if (percent < stopAt) {
           state.armed = true;
-        } else if (state.armed && percent >= stopAt) {
-          state.upperLatched = true;
-          state.armed = false;
+          /* 锁存只在重新插电/重启/改配置时解除，电量回落到 100% 以下不解锁 */
+          state.trickleSince = null;
+        } else if (!state.upperLatched) {
+          /* 已到 100%：进入涓流，只有确认真正充满才锁存停充。 */
+          var lowCurrent = currentMa != null && Math.abs(currentMa) <= fullCurrentMa;
+          var highVoltage = fullVoltageMv != null && voltageMv != null && voltageMv >= fullVoltageMv;
+          var blockedByOther = state.tempBlocked || !planLive.allowed;
+          if (blockedByOther) {
+            /* 被温度/预约强制停充时电流会自然下降，不能当成满充证据 */
+            state.trickleSince = null;
+          } else if (statusFull) {
+            state.upperLatched = true;
+            state.armed = false;
+            state.trickleSince = null;
+          } else if (lowCurrent || highVoltage) {
+            if (state.trickleSince == null) state.trickleSince = nowMs;
+            if (nowMs - state.trickleSince >= fullHoldSeconds * 1000) {
+              state.upperLatched = true;
+              state.armed = false;
+              state.trickleSince = null;
+            }
+          } else {
+            /* 电流回升：重新计时，避免抖动累积误判 */
+            state.trickleSince = null;
+          }
         }
       }
     } else {
       state.upperLatched = false;
       state.armed = true;
+      state.trickleSince = null;
       if (percent != null && stopAt != null) {
         if (percent >= stopAt) state.upperHold = true;
         else if (resumeAt != null && percent <= resumeAt) state.upperHold = false;
       }
     }
 
-    var planLive = planState(data.plan, data.now);
+    state.trickle = latchPerPlug && !state.upperLatched &&
+      percent != null && stopAt != null && percent >= stopAt &&
+      !state.tempBlocked && planLive.allowed;
+
     var reasons = [];
     if (state.tempBlocked) reasons.push('temp_high');
     if (state.upperLatched) reasons.push('full_latch');
@@ -401,6 +478,9 @@
     state.tempStop = tempStop;
     state.tempResume = tempResume;
     state.latchPerPlug = latchPerPlug;
+    state.fullCurrentMa = fullCurrentMa;
+    state.fullHoldSeconds = fullHoldSeconds;
+    state.fullVoltageMv = fullVoltageMv;
 
     return {
       state: state,
@@ -412,7 +492,9 @@
       }),
       plan: planLive,
       flags: flags,
-      plugged: true
+      plugged: true,
+      trickle: state.trickle,
+      phase: allowCharge ? (state.trickle ? 'trickle' : 'charging') : 'stopped'
     };
   }
 
@@ -437,6 +519,7 @@
     WEEKDAY_LABELS: WEEKDAY_LABELS,
     REASON_LABELS: REASON_LABELS,
     MAX_WINDOWS: MAX_WINDOWS,
+    TRICKLE_DEFAULTS: TRICKLE_DEFAULTS,
     defaultPlan: defaultPlan,
     normalizePlan: normalizePlan,
     parseClock: parseClock,

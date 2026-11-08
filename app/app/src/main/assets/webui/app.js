@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '2.3';
+  var APP_VERSION = '2.4';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -149,9 +149,9 @@
     {
       id: 'charge',
       title: '充电上限',
-      desc: '设置停止充电的电量；100% 时按充满即停处理。',
+      desc: '设置停止充电的电量；100% 时先涓流，确认真正充满后自动停充并保持。',
       fields: [
-        { path: 'charge.stop_at_percent', label: '停充阈值', min: 50, max: 100, step: 1, integer: true, unit: '%', presets: [80, 90, 100], tip: '电量达到该值后停止充电；100% 即充满即停。' },
+        { path: 'charge.stop_at_percent', label: '停充阈值', min: 50, max: 100, step: 1, integer: true, unit: '%', presets: [80, 90, 100], tip: '电量达到该值后停止充电；100% 时先充到 100% 再涓流，真正充满后停充。' },
         { path: 'charge.resume_at_percent', label: '恢复阈值', min: 20, max: 99, step: 1, integer: true, unit: '%', tip: '普通上限时，电量降到该值以下才继续充电；100% 时改为重新插电恢复。' }
       ]
     },
@@ -766,7 +766,7 @@
     return numberOrNull(model && model.charge && model.charge.stop_at_percent) === 100;
   }
 
-  /* 100% 是充满即停的唯一入口，其余阈值一律不保持。 */
+  /* 100% 是涓流至满充后停充并保持的唯一入口，其余阈值一律不保持。 */
   function deriveChargeLatch(model) {
     if (!model || !model.charge) return;
     model.charge.latch_per_plug = chargeLatchMode(model);
@@ -783,15 +783,23 @@
 
     var snapshot = powerSnapshot();
     var charge = state.cfg.draft.charge || {};
+    var battery = (snapshot && snapshot.battery) || {};
+    var currentUa = numberOrNull(battery.current_ua);
     var input = {
       now: new Date(),
-      percent: snapshot ? numberOrNull((snapshot.battery || {}).percent) : null,
-      tempC: snapshot ? numberOrNull((snapshot.battery || {}).temp_c) : null,
+      percent: numberOrNull(battery.percent),
+      tempC: numberOrNull(battery.temp_c),
+      currentMa: currentUa == null ? null : currentUa / 1000,
+      voltageMv: numberOrNull(battery.voltage_mv),
+      statusFull: String(battery.status || '').toLowerCase() === 'full',
       plugged: snapshot ? ChargeModel.inferPlugged(snapshot) : null,
       stopAt: numberOrNull(charge.stop_at_percent),
       resumeAt: numberOrNull(charge.resume_at_percent),
       tempStop: numberOrNull(charge.temp_stop_c),
       tempResume: numberOrNull(charge.temp_resume_c),
+      fullCurrentMa: numberOrNull(charge.full_current_ma),
+      fullHoldSeconds: numberOrNull(charge.full_hold_seconds),
+      fullVoltageMv: numberOrNull(charge.full_voltage_mv),
       latchPerPlug: chargeLatchMode(state.cfg.draft),
       plan: state.plan.model
     };
@@ -862,18 +870,24 @@
     var charging = !!snapshot.charging;
     var plugged = ChargeModel.inferPlugged(snapshot);
     var reasonText = (decision.reasons || []).map(function (reason) { return reason.label; }).join(' · ');
+    var trickling = !!decision.trickle;
 
     var paused = !charging && !decision.allowCharge && plugged !== false && rawStatus !== 'discharging';
 
     var headline;
     var detail;
     if (charging) {
-      headline = percent != null && percent >= 100 ? '已充满' : '正在充电';
-      detail = decision.allowCharge ? '电量与温度均在设定范围内' : '条件已满足，停充即将生效';
+      if (trickling) {
+        headline = '涓流充电中';
+        detail = '已充到 100%，继续涓流至真正充满后自动停充';
+      } else {
+        headline = percent != null && percent >= 100 ? '已充满' : '正在充电';
+        detail = decision.allowCharge ? '电量与温度均在设定范围内' : '条件已满足，停充即将生效';
+      }
     } else if (paused) {
       headline = '充电已暂停';
       if (decision.primary === 'full_latch') {
-        detail = '已达到充电上限，保持停充；重新插电恢复';
+        detail = '已充满并停充，保持到重新插电';
       } else {
         detail = reasonText || '已达到停充条件';
       }
@@ -887,6 +901,7 @@
     var remaining = percent != null && stop != null ? Math.max(0, stop - percent) : null;
     var remainingText;
     if (remaining == null) remainingText = '--';
+    else if (latchMode && trickling) remainingText = '涓流中';
     else if (latchMode && percent >= stop) remainingText = '已充满';
     else if (remaining <= 0) remainingText = '已到上限';
     else remainingText = Math.round(remaining) + '%';
@@ -914,7 +929,9 @@
     }
 
     var statusChip = charging
-      ? '<span class="chip chip--live">充电中</span>'
+      ? (trickling
+        ? '<span class="chip chip--live">涓流充电中</span>'
+        : '<span class="chip chip--live">充电中</span>')
       : paused
         ? '<span class="chip chip--warn">本模块已停充</span>'
         : '<span class="chip chip--idle">未停充</span>';
@@ -1012,7 +1029,7 @@
   }
 
   function renderChargePolicyHint() {
-    return '<p class="cfg-policy">选择 100% 时，充满后自动停止并保持，需重新插电才恢复充电；选择较低上限时，达到上限后停充，电量回落到恢复阈值后自动继续充电。</p>';
+    return '<p class="cfg-policy">选择 100% 时，先充到 100%，随后继续涓流，确认真正充满后自动停止并保持，需要重新插电才恢复充电；选择较低上限时，达到上限后停充，电量回落到恢复阈值后自动继续充电。</p>';
   }
 
   function renderPowerPage() {
