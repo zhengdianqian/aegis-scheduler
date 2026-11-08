@@ -2,22 +2,30 @@
 // Copyright (c) 2026 默默的阿文
 // Aegis is an independent implementation. No third-party module source is included.
 
-//! Controlled cpufreq writer.
+//! Tiered cpufreq writer (v3).
 //!
-//! The daemon publishes a per-cluster **floor** through `scaling_min_freq` and
-//! a soft **ceiling** through `scaling_max_freq`. The floor is a target the
-//! governor may sit on, never a hard lock. The ceiling is `floor +
-//! span * ceiling_headroom`, so the hardware maximum stays available whenever
-//! the measured demand earns it, while a vendor boost or an input hint can no
-//! longer slam a cluster to its top tier on a static screen. Before every write
-//! the live ceiling is compared with the target; a lower live ceiling (for
-//! example a vendor thermal limit) is respected instead of fought.
+//! v2 pinned `scaling_min_freq` with a bind-mount and drove only the ceiling.
+//! That is what made the device feel like two schedulers fighting: static pages
+//! sat on the hardware minimum, one touch released everything, and the core
+//! landed on the hardware maximum.
+//!
+//! v3 writes both nodes from the tier ladder:
+//!   * `scaling_min_freq` = the ladder target (a real intermediate step);
+//!   * `scaling_max_freq` = a cap a few tiers above it, and never below the
+//!     safety band, so the governor still has headroom;
+//!   * launch / burst / frame pressure open the cap to the hardware maximum,
+//!     which keeps cold starts and heavy frames at official speed.
+//!
+//! No bind-mount is used for normal operation. A legacy mask left by v2 is
+//! unmounted once at startup; a write rejected by a vendor QoS floor is
+//! respected and retried only after a back-off instead of being fought.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
-use tempo_core::controller::{Decision, DecisionReason};
+use tempo_core::controller::Decision;
 use tempo_core::DeviceProfile;
 
 pub const CPUFREQ_ROOT: &str = "/sys/devices/system/cpu/cpufreq";
@@ -30,64 +38,41 @@ struct Policy {
     pristine_max: u32,
     original_governor: String,
     /// Effective hardware range: `hw_max` is what the platform actually
-    /// accepts after a repair write, not a theoretical `cpuinfo` value.
+    /// accepts, not a theoretical `cpuinfo` value.
     hw_min: u32,
     hw_max: u32,
-    /// Hardware step list, ascending, used to snap a floor onto a real step.
+    /// Hardware step list, ascending, used to snap a target onto a real step.
     freqs: Vec<u32>,
-    /// Span of the ceiling above the floor, as a fraction of the hardware span.
-    cap_headroom: f32,
     /// Last floor target applied. Used by the idle reconcile pass.
     last_target: u32,
     /// Last ceiling this daemon wrote (or the pristine ceiling before any write).
-    /// `soft_cap` only opens a ceiling it owns; a lower vendor clamp is respected.
     last_cap: u32,
-    /// The last applied decision was `Quiet`, so the ceiling is intentionally
-    /// unlocked to the hardware maximum.
-    unlocked: bool,
     /// Last time a ceiling write was issued for this cluster.
     last_cap_write: Option<Instant>,
     /// Last time a floor write was issued for this cluster.
     last_write: Option<Instant>,
-    /// When a quiet downshift first became pending. A vendor boost hint can
-    /// raise `scaling_min_freq` at any moment; we only pull it back after the
-    /// target has stayed low for a short while, instead of fighting every
-    /// hint with a cpufreq notifier-heavy write.
-    quiet_pending_since: Option<Instant>,
-    /// Last time the quiet floor was compared with the live value. A vendor
-    /// perf service may raise `scaling_min_freq` without telling anyone, so
-    /// the quiet state reconciles the floor occasionally instead of never.
+    /// Last time the quiet floor was compared with the live value.
     last_reconcile: Option<Instant>,
     /// When a floor write was silently rejected by a vendor QoS limit
-    /// (`scaling_min_freq` read back above the target). Further quiet retries
-    /// wait until this instant so the daemon does not fight the vendor.
+    /// (`scaling_min_freq` read back above the target). Further retries wait
+    /// until this instant so the daemon does not fight the vendor.
     retry_after: Option<Instant>,
-    /// Last ceiling value this daemon requested and when. A vendor perf service
-    /// may raise the live ceiling right after our write; repeating the same
-    /// request turns into a notifier-bound write loop. Repeats within
-    /// `CAP_RETRY` that do not move by more than the deadband are skipped.
+    /// Last ceiling value this daemon requested and when.
     last_cap_request: Option<(u32, Instant)>,
 }
 
-/// A quiet downshift is applied only after the low target persists this long.
-const QUIET_SETTLE: Duration = Duration::from_millis(300);
-/// Minimum spacing between floor writes, so two commits in one event cannot
-/// write the same cluster twice.
+/// Minimum spacing between write pairs for the same cluster, so two commits in
+/// one event cannot write the same node twice.
 const WRITE_SPACING: Duration = Duration::from_millis(30);
-/// How often the quiet state re-checks a floor that a vendor writer may have
-/// raised. Reads are cheap (`scaling_min_freq` is a plain sysfs node), writes
-/// happen only when the live floor actually differs from the target.
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
+/// How often the idle state re-checks nodes a vendor writer may have moved.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// Ceiling writes smaller than this fraction of the hardware span are skipped.
-/// Vendor floor wobble used to rewrite `scaling_max_freq` about once per second;
-/// each write runs the whole cpufreq notifier chain and costs ~10 ms of system
-/// time. A 4 % deadband keeps the ceiling honest without the churn.
+/// Each write runs the whole cpufreq notifier chain.
 const CAP_DEADBAND: f32 = 0.04;
 /// A ceiling request that does not move by at least the deadband is not
-/// repeated within this window. Without it a vendor boost can re-raise
-/// `scaling_max_freq` after every write and the daemon answers once a second.
+/// repeated within this window.
 const CAP_RETRY: Duration = Duration::from_secs(10);
-/// After a floor write that a vendor QoS limit rejected, stop retrying for a
+/// After a floor write rejected by a vendor QoS limit, stop retrying for a
 /// while. Fighting a persistent QoS request only burns CPU and log lines.
 const BLOCKED_RETRY: Duration = Duration::from_secs(30);
 
@@ -97,17 +82,19 @@ pub struct CpufreqWriter {
     cap_writes: u64,
     floor_writes: u64,
     rejected_floor: u64,
-    /// The module bind-mounts a mask over every `scaling_min_freq`, so the
-    /// kernel floor is permanently the hardware minimum. Writing the floor
-    /// would only edit the mask file; scheduling is done through the ceiling.
-    pin_min: bool,
+    /// Fraction of the hardware span that must always stay available as an
+    /// upper cap. The controller already emits a cap; this is a second,
+    /// independent floor of protection against a bad decision.
+    safety_ratio: f32,
+    /// Read-only guard. No sysfs write happens before this instant, so a slow
+    /// boot cannot ever be made slower by the module.
+    guard_until: Option<Instant>,
     pub last_error: Option<String>,
 }
 
 impl CpufreqWriter {
-    /// Binds one policy directory per cluster. Missing or unreadable policy
-    /// nodes are a capability failure: the caller must not schedule.
-    pub fn discover(profile: &DeviceProfile, ceiling_headroom: f32) -> Result<Self, String> {
+    pub fn discover(profile: &DeviceProfile, safety_ratio: f32) -> Result<Self, String> {
+        unmount_legacy_floors();
         let mut policies = Vec::with_capacity(profile.clusters.len());
         for (cluster, entry) in profile.clusters.iter().enumerate() {
             let cpu = *entry
@@ -135,11 +122,7 @@ impl CpufreqWriter {
             freqs.sort_unstable();
             freqs.dedup();
 
-            // The theoretical hardware ceiling is the reference for the cap.
-            // A vendor thermal clamp is respected per write by clamping to the
-            // live ceiling right before writing.
             let hw_max = hw_ceiling.max(live_max);
-            // Keep the floor below the effective ceiling at all times.
             let pristine_min = hw_min.min(hw_max);
             policies.push(Policy {
                 cluster,
@@ -150,13 +133,10 @@ impl CpufreqWriter {
                 hw_min: pristine_min,
                 hw_max,
                 freqs,
-                cap_headroom: ceiling_headroom,
                 last_target: 0,
                 last_cap: hw_max,
-                unlocked: false,
                 last_cap_write: None,
                 last_write: None,
-                quiet_pending_since: None,
                 last_reconcile: None,
                 retry_after: None,
                 last_cap_request: None,
@@ -168,18 +148,42 @@ impl CpufreqWriter {
             cap_writes: 0,
             floor_writes: 0,
             rejected_floor: 0,
-            pin_min: masks_floor(),
+            safety_ratio: safety_ratio.clamp(0.20, 0.70),
+            guard_until: None,
             last_error: None,
         })
     }
 
-    /// Re-derives the soft ceiling from the last floor target without waiting
-    /// for a scheduling event. Vendor perf services move floors while the
-    /// screen is static; this keeps the cap honest at a slow cadence.
+    /// Keep every sysfs node untouched for `window`. Called once at startup so
+    /// the module can never slow down the boot or the first unlock.
+    pub fn arm_guard(&mut self, window: Duration) {
+        self.guard_until = Some(Instant::now() + window);
+    }
+
+    fn guarded(&self) -> bool {
+        self.guard_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// True once the startup guard has expired but nothing has been written
+    /// yet; the event loop uses this to push the first ladder state.
+    pub fn needs_initial_apply(&self) -> bool {
+        self.applied == 0 && !self.guarded()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.policies.is_empty()
+    }
+
+    /// The read-only startup guard is still running: no cpufreq node has been
+    /// touched by this daemon yet.
+    pub fn guard_active(&self) -> bool {
+        self.guarded()
+    }
+
+    /// Re-derives the cap from the last target without waiting for a scheduling
+    /// event. Vendor perf services move nodes while the screen is static.
     pub fn reconcile(&mut self) -> Result<(), String> {
-        // mask 常驻时不碰任何 cpufreq 节点：静态由 mask 保底，动态交给
-        // governor，避免软上限把启动窗口压死。
-        if self.pin_min {
+        if self.guarded() {
             return Ok(());
         }
         let now = Instant::now();
@@ -192,25 +196,20 @@ impl CpufreqWriter {
             if live_max <= policy.hw_min {
                 continue;
             }
+            if policy
+                .last_reconcile
+                .is_some_and(|last| now.duration_since(last) < RECONCILE_INTERVAL)
+            {
+                continue;
+            }
+            policy.last_reconcile = Some(now);
             let current_min =
                 read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(policy.hw_min);
-            let cap = soft_cap(
-                policy,
-                policy.last_target.min(live_max),
-                live_max,
-                current_min,
-                policy.unlocked,
-            );
-            if !cap_needs_write(policy, live_max, cap, policy.last_target) {
+            let cap = cap_for(policy, policy.last_target, live_max, self.safety_ratio);
+            if !cap_needs_write(policy, live_max, cap, policy.last_target)
+                || cap_repeat_suppressed(policy, cap, policy.last_target, live_max, now)
+            {
                 continue;
-            }
-            if cap_repeat_suppressed(policy, cap, policy.last_target, live_max, now) {
-                continue;
-            }
-            if let Some(last) = policy.last_cap_write {
-                if now.duration_since(last) < WRITE_SPACING {
-                    continue;
-                }
             }
             if let Err(problem) = write_khz(&policy.dir.join("scaling_max_freq"), cap) {
                 failure.get_or_insert(problem);
@@ -221,6 +220,15 @@ impl CpufreqWriter {
             policy.last_cap_request = Some((cap, now));
             self.cap_writes += 1;
             self.applied += 1;
+            // A vendor floor may also drift above our target; pull it back only
+            // when it is not a rejected QoS request.
+            if current_min > policy.last_target
+                && !policy.retry_after.is_some_and(|retry| now < retry)
+            {
+                if write_khz(&policy.dir.join("scaling_min_freq"), policy.last_target).is_ok() {
+                    self.floor_writes += 1;
+                }
+            }
         }
         self.last_error = failure.clone();
         match failure {
@@ -229,26 +237,11 @@ impl CpufreqWriter {
         }
     }
 
-    /// Applies a live ceiling headroom change from a configuration reload.
-    pub fn set_ceiling_headroom(&mut self, ceiling_headroom: f32) {
-        for policy in &mut self.policies {
-            policy.cap_headroom = ceiling_headroom;
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.policies.is_empty()
-    }
-
-    /// Applies each decision as a **floor** on `scaling_min_freq` and a soft
-    /// ceiling on `scaling_max_freq`. A live ceiling below the requested value
+    /// Applies each decision as a ladder **target** on `scaling_min_freq` and a
+    /// matching **cap** on `scaling_max_freq`. A live ceiling below the request
     /// (usually a vendor thermal clamp) is respected, never fought.
     pub fn apply(&mut self, decisions: &[Decision]) -> Result<(), String> {
-        // mask 常驻时 floor 已被内核钉在硬件最低，静态省电由 mask 保证。
-        // 此时若再写软上限，启动/切换会被 target+headroom 卡住（实测冷启
-        // 明显变慢并出现白屏）。上限交还 governor，让需求侧自由升到硬件
-        // max，daemon 不再介入。
-        if self.pin_min {
+        if self.guarded() {
             return Ok(());
         }
         let mut failure: Option<String> = None;
@@ -261,108 +254,74 @@ impl CpufreqWriter {
                 continue;
             };
             let now = Instant::now();
-            let quiet = matches!(
-                decision.reason,
-                DecisionReason::Quiet | DecisionReason::ScreenOff
-            );
-            let unlock = matches!(decision.reason, DecisionReason::Quiet);
-            // The quiet state is reconciled about once every few seconds, so a
-            // vendor perf service that raised the floor or the ceiling is pulled
-            // back without fighting it on every sample. A rejected floor write
-            // must not block the ceiling from being re-derived: the two nodes
-            // are reconciled independently.
-            if quiet && !decision.changed {
-                if policy
-                    .last_reconcile
-                    .is_some_and(|last| now.duration_since(last) < RECONCILE_INTERVAL)
-                {
-                    continue;
-                }
-                policy.last_reconcile = Some(now);
-            }
             let live_max = read_u32(&policy.dir.join("scaling_max_freq")).unwrap_or(policy.hw_max);
             if live_max <= policy.hw_min {
                 // Locked by a vendor range; there is nothing left to schedule.
                 continue;
             }
+
             let mut target = decision.ceiling_khz.clamp(policy.hw_min, policy.hw_max);
             if let Some(step) = snap_down(&policy.freqs, target) {
                 target = step.max(policy.hw_min);
             }
-            // Never let the floor exceed the live ceiling.
             target = target.min(live_max);
 
-            let current_min = if self.pin_min {
-                policy.hw_min
-            } else {
-                read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(policy.hw_min)
-            };
-            policy.last_target = target;
-            policy.unlocked = unlock;
-            // The soft ceiling starts above the live floor, otherwise the kernel
-            // locks the cluster (min == max) and it can never ramp again.
-            let cap = soft_cap(policy, target, live_max, current_min, unlock);
+            let cap = cap_for(policy, target, live_max, self.safety_ratio)
+                .max(target)
+                .min(policy.hw_max);
 
-            // A ceiling the vendor clamped below our target is not ours to raise.
-            if cap_needs_write(policy, live_max, cap, target)
-                && !cap_repeat_suppressed(policy, cap, target, live_max, now)
+            // A ceiling the vendor clamped below our target is not ours to
+            // raise. Only a cap this daemon owns is opened again.
+            let vendor_clamped = live_max < cap && live_max < policy.last_cap;
+            let write_cap = if vendor_clamped { live_max } else { cap };
+
+            policy.last_target = target;
+            if write_cap != live_max
+                && cap_needs_write(policy, live_max, write_cap, target)
+                && !cap_repeat_suppressed(policy, write_cap, target, live_max, now)
+                && !policy
+                    .last_cap_write
+                    .is_some_and(|last| now.duration_since(last) < WRITE_SPACING)
             {
-                if let Some(last) = policy.last_cap_write {
-                    if now.duration_since(last) < WRITE_SPACING {
-                        continue;
-                    }
-                }
-                if let Err(problem) = write_khz(&policy.dir.join("scaling_max_freq"), cap) {
+                if let Err(problem) = write_khz(&policy.dir.join("scaling_max_freq"), write_cap) {
                     failure.get_or_insert(problem);
                     continue;
                 }
-                policy.last_cap = cap;
+                policy.last_cap = write_cap;
                 policy.last_cap_write = Some(now);
-                policy.last_cap_request = Some((cap, now));
+                policy.last_cap_request = Some((write_cap, now));
                 self.cap_writes += 1;
                 self.applied += 1;
-                tracing::debug!(
-                    cluster = policy.cluster,
-                    target,
-                    cap,
-                    live_max,
-                    unlock,
-                    "floor and ceiling applied"
-                );
             }
 
-            if !self.pin_min && current_min != target && !policy.retry_after.is_some_and(|retry| now < retry) {
-                if quiet && target < current_min {
-                    let since = *policy.quiet_pending_since.get_or_insert(now);
-                    if now.duration_since(since) < QUIET_SETTLE {
-                        continue;
-                    }
-                } else {
-                    policy.quiet_pending_since = None;
-                }
-                if let Some(last) = policy.last_write {
-                    if now.duration_since(last) < WRITE_SPACING {
-                        continue;
-                    }
-                }
-                if let Err(problem) = write_khz(&policy.dir.join("scaling_min_freq"), target) {
-                    failure.get_or_insert(problem);
-                    continue;
-                }
-                self.floor_writes += 1;
-                let readback = read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(target);
-                if readback > target {
-                    // A vendor QoS request (perfservice's screen-on floor) rejected
-                    // the write. Back off instead of fighting it.
-                    policy.retry_after = Some(now + BLOCKED_RETRY);
-                    self.rejected_floor += 1;
-                } else {
-                    policy.retry_after = None;
-                }
-                policy.last_write = Some(now);
-                policy.quiet_pending_since = None;
-                self.applied += 1;
+            let current_min =
+                read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(policy.hw_min);
+            if current_min == target || policy.retry_after.is_some_and(|retry| now < retry) {
+                continue;
             }
+            if policy
+                .last_write
+                .is_some_and(|last| now.duration_since(last) < WRITE_SPACING)
+            {
+                continue;
+            }
+            if let Err(problem) = write_khz(&policy.dir.join("scaling_min_freq"), target) {
+                failure.get_or_insert(problem);
+                continue;
+            }
+            self.floor_writes += 1;
+            let readback = read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(target);
+            if readback > target {
+                // A vendor QoS request rejected the write. Back off instead of
+                // fighting it; the tier ladder continues from the live floor.
+                policy.retry_after = Some(now + BLOCKED_RETRY);
+                self.rejected_floor += 1;
+            } else {
+                policy.retry_after = None;
+            }
+            policy.last_write = Some(now);
+            self.applied += 1;
+            tracing::debug!(cluster = policy.cluster, target, write_cap, live_max, "tier applied");
         }
         self.last_error = failure.clone();
         match failure {
@@ -386,20 +345,25 @@ impl CpufreqWriter {
     pub fn restore(&mut self) -> Result<(), String> {
         let mut error: Option<String> = None;
         for policy in &mut self.policies {
-            if let Err(problem) = write_khz(&policy.dir.join("scaling_max_freq"), policy.pristine_max)
+            if let Err(problem) =
+                write_khz(&policy.dir.join("scaling_max_freq"), policy.pristine_max)
             {
                 error.get_or_insert(problem);
             }
-            if let Err(problem) = write_khz(&policy.dir.join("scaling_min_freq"), policy.pristine_min)
+            if let Err(problem) =
+                write_khz(&policy.dir.join("scaling_min_freq"), policy.pristine_min)
             {
                 error.get_or_insert(problem);
             }
             if !policy.original_governor.is_empty() {
-                if let Err(problem) = write_text(&policy.dir.join("scaling_governor"), &policy.original_governor) {
+                if let Err(problem) =
+                    write_text(&policy.dir.join("scaling_governor"), &policy.original_governor)
+                {
                     error.get_or_insert(problem);
                 }
             }
         }
+        self.guard_until = None;
         self.applied = 0;
         match error {
             Some(problem) => Err(problem),
@@ -423,8 +387,6 @@ impl CpufreqWriter {
         self.rejected_floor
     }
 
-    /// Original values as JSON, persisted so an external tool can restore the
-    /// policies even after a hard kill of the daemon.
     pub fn backup_json(&self) -> String {
         let entries: Vec<_> = self
             .policies
@@ -486,44 +448,43 @@ pub fn read_u32(path: &Path) -> Option<u32> {
         .ok()
 }
 
-/// True when the module's bind-mount mask is active on any policy floor. In
-/// that state the kernel floor is the hardware minimum and vendor writers
-/// modify the mask file only, so the daemon must not spend writes on it.
-fn masks_floor() -> bool {
-    fs::read_to_string("/proc/mounts")
-        .map(|table| table.lines().any(|line| line.contains("scaling_min_freq")))
-        .unwrap_or(false)
+/// v2 installed a bind-mount mask over `scaling_min_freq`. v3 does not use it,
+/// so drop any leftover mount once at startup; otherwise every floor write
+/// would only edit the mask file and the kernel floor would stay pinned.
+fn unmount_legacy_floors() {
+    let Ok(table) = fs::read_to_string("/proc/mounts") else {
+        return;
+    };
+    for line in table.lines() {
+        let Some(node) = line.split_whitespace().nth(1) else {
+            continue;
+        };
+        if node.ends_with("/scaling_min_freq") && node.starts_with(CPUFREQ_ROOT) {
+            let _ = Command::new("umount").arg(node).output();
+            tracing::info!(node, "unmounted legacy v2 floor mask");
+        }
+    }
 }
 
 fn write_khz(path: &Path, value: u32) -> Result<(), String> {
     write_text(path, &value.to_string())
 }
 
-/// Soft ceiling for a cluster: enough room above the floor for a frame to
-/// ramp, but never the whole hardware span.
-fn soft_cap(policy: &Policy, target: u32, live_max: u32, current_min: u32, unlock: bool) -> u32 {
+/// Upper cap for a cluster: the controller's ladder cap, clamped so at least
+/// `safety_ratio` of the span always stays available, and never below the
+/// target. A vendor clamp below the request is respected by the caller.
+fn cap_for(policy: &Policy, target: u32, live_max: u32, safety_ratio: f32) -> u32 {
     let span = policy.hw_max.saturating_sub(policy.hw_min);
-    if unlock {
-        // 静默期不压软上限：空载时 governor 自己停在最低档，稀疏帧到来时
-        // 仍能按需升频。只放开本守护写过的上限，厂商更低的 clamp 保持不动。
-        if live_max == policy.last_cap || live_max >= policy.hw_max {
-            return policy.hw_max;
-        }
-        return live_max.clamp(target.min(policy.hw_max), policy.hw_max);
-    }
-    let ceiling_limit = if live_max <= current_min {
+    let safety = policy.hw_min.saturating_add((span as f32 * safety_ratio) as u32);
+    let ceiling_limit = if live_max <= policy.hw_min {
         policy.hw_max
     } else {
         live_max
     };
-    let headroom = (span as f32 * policy.cap_headroom) as u32;
-    // `target + headroom`（而不是 `current_min + headroom`）：厂商地板来回
-    // 抖动时上限保持稳定，避免每 3 秒重写一次 scaling_max_freq。
     target
-        .saturating_add(headroom)
-        .max(current_min)
-        .clamp(policy.hw_min, ceiling_limit)
-        .max(target.min(ceiling_limit))
+        .max(safety)
+        .min(policy.hw_max)
+        .clamp(target, ceiling_limit.max(target))
 }
 
 /// Whether the live ceiling is far enough from the computed one to be worth a
@@ -541,11 +502,13 @@ fn cap_needs_write(policy: &Policy, live_max: u32, cap: u32, target: u32) -> boo
     cap.abs_diff(live_max) > deadband
 }
 
-/// Whether the same ceiling request was already issued recently enough that
-/// repeating it would only run the cpufreq notifier chain again. A live ceiling
-/// below the floor target is always rewritten: that one is a correctness fix,
-/// not a fight over a vendor boost.
-fn cap_repeat_suppressed(policy: &Policy, cap: u32, target: u32, live_max: u32, now: Instant) -> bool {
+fn cap_repeat_suppressed(
+    policy: &Policy,
+    cap: u32,
+    target: u32,
+    live_max: u32,
+    now: Instant,
+) -> bool {
     if live_max < target {
         return false;
     }

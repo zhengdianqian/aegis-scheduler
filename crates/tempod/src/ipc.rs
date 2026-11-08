@@ -35,11 +35,6 @@ pub struct RuntimeStatus {
     pub touch_sources: usize,
     pub touch_events: u64,
     pub launch_lifts: u64,
-    pub mask_tracked: bool,
-    pub mask_open: bool,
-    pub mask_windows: u64,
-    pub mask_unmask_us: u64,
-    pub mask_remask_us: u64,
     pub fas_available: bool,
     pub fas_active: bool,
     pub charge_node: Option<String>,
@@ -53,6 +48,10 @@ pub struct RuntimeStatus {
     pub charge_current_ma: Option<i32>,
     pub thermal_available: bool,
     pub write_enabled: bool,
+    pub guard_active: bool,
+    pub scene: String,
+    pub usage: Vec<f32>,
+    pub usage_sampled_us: u64,
     pub writes: u64,
     pub cap_writes: u64,
     pub floor_writes: u64,
@@ -103,6 +102,13 @@ pub fn status_json(
         .iter()
         .enumerate()
         .map(|(index, cluster)| {
+            let decision = runtime.decisions.get(index);
+            let tiers = tempo_core::controller::build_ladder(
+                &cluster.freq_khz,
+                &cluster.min_khz,
+                &cluster.max_khz,
+                config.control.tier_table_max,
+            );
             json!({
                 "cpus": cluster.cpus,
                 "role": cluster.role,
@@ -111,6 +117,15 @@ pub fn status_json(
                 "capacity": cluster.capacity,
                 "busy": runtime.busy.get(index).copied().unwrap_or(0.0),
                 "foreground": runtime.foreground.get(index).copied().unwrap_or(0.0),
+                "usage": runtime.usage.get(index).copied().unwrap_or(0.0),
+                "usage_sampled": true,
+                "tier": decision.map(|value| value.tier).unwrap_or(0),
+                "tier_count": decision
+                    .map(|value| value.tier_count)
+                    .unwrap_or(tiers.len() as u32),
+                "target_khz": decision.map(|value| value.ceiling_khz).unwrap_or(cluster.min_khz),
+                "cap_khz": decision.map(|value| value.cap_khz).unwrap_or(cluster.max_khz),
+                "tiers": tiers,
             })
         })
         .collect();
@@ -124,13 +139,11 @@ pub fn status_json(
         "stage": if writing { "active" } else { "observe" },
         "mode": if writing { "adaptive" } else { "observe-only" },
         "scheduler_writes": writing,
-        "mask": {
-            "tracked": runtime.mask_tracked,
-            "released": runtime.mask_open,
-            "windows": runtime.mask_windows,
-            "unmask_us": runtime.mask_unmask_us,
-            "remask_us": runtime.mask_remask_us,
+        "guard": {
+            "active": runtime.guard_active,
         },
+        "scene": runtime.scene,
+        "usage_sampled_us": runtime.usage_sampled_us,
         "schema": config.schema,
         "platform": profile.platform,
         "sdk": profile.sdk,

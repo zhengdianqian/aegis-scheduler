@@ -1,7 +1,7 @@
 # Tempo UI 接口契约（WebUI / APP 共用）
 
-- 版本：v1.0
-- 日期：2026-11-06
+- 版本：v3.0
+- 日期：2026-11-09
 - 适用：`webui/`、`app/`（`com.aegis.scheduler`）
 - 唯一字段真值来源：`crates/tempo-core/src/config.rs`、`crates/tempod/src/ipc.rs`
 - 本文件只描述 UI 侧怎么读、怎么写、字段怎么命名；不修改核心与守护。
@@ -27,27 +27,33 @@ CFG_BAK  /data/adb/tempo/config.toml.bak
 PROFILE  /data/adb/tempo/device.toml
 SOCK     /data/adb/tempo/run/control.sock
 LOGDIR   /data/adb/tempo/log
-PROP     /data/adb/modules/tempo_sched/module.prop
+PROP     /data/adb/modules/aegis_scheduler/module.prop
 ```
+
+> v3.0 模块目录为 `aegis_scheduler`；客户端同时保留旧目录 `tempo_sched` 的探测以兼容回滚。
 
 `tempoctl` 统一调用形式（客户端不依赖 PATH）：
 
 ```sh
-tempoctl --config /data/adb/tempo/config.toml --profile /data/adb/tempo/device.toml status --socket /data/adb/tempo/run/control.sock
+tempoctl --config /data/adb/tempo/config.toml status --socket /data/adb/tempo/run/control.sock
 ```
 
-> 客户端应优先使用模块安装目录下的绝对路径（`/data/adb/modules/tempo_sched/...`），
-> 找不到时回退 `command -v tempoctl`。两条路径都由客户端探测，不写死。
+> 不强制传 `--profile`：v3.0 使用 `/data/adb/tempo/profile/device.toml`，旧版使用
+> `/data/adb/tempo/profile/babylon.toml`，统一由 `config.toml` 的 `daemon.profile_path` 决定，
+> 客户端不再写死设备代号。
+>
+> 客户端应优先使用模块安装目录下的绝对路径（`/data/adb/modules/aegis_scheduler/...`），
+> 找不到时回退旧目录 `/data/adb/modules/tempo_sched/...`，最后回退 `command -v tempoctl`。两条路径都由客户端探测，不写死。
 
 ---
 
 ## 2. 命令能力矩阵
 
-### 2.1 当前已实现（P2 观察模式，可直接使用）
+### 2.1 当前已实现（可直接使用）
 
 | 命令 | 请求 | 响应 | 用途 |
 |---|---|---|---|
-| `ping` | `{"cmd":"ping"}` | `{"ok":true,"service":"tempod","version":"x.y.z"}` | 存活探测 |
+| `ping` | `{"cmd":"ping"}` | `{"ok":true,"service":"Aegis","version":"x.y.z"}` | 存活探测 |
 | `status` | `{"cmd":"status"}` | 见 §3 | 总览 / 状态页 |
 | `profile.get` | `{"cmd":"profile.get"}` | `{"ok":true,"profile":{...}}` | 簇拓扑、频率表 |
 | `config.get` | `{"cmd":"config.get"}` | `{"ok":true,"toml":"..."}` | 参数页读取 |
@@ -66,8 +72,9 @@ tempoctl --config /data/adb/tempo/config.toml --profile /data/adb/tempo/device.t
 | `log.tail` | `{"ok":true,"lines":[{"ts":..,"level":"warn","msg":".."}]}` | 直接 `tail` 日志文件 |
 | `power.get` | 充电状态 / 温度 / 热上限 | 显示“充电守护未启用” |
 
-客户端探测能力：仅当 `status.capabilities` 数组包含 `"config_apply"` 时优先用
-`config.apply`；当前 `status` 没有该字段，因此一律走文件写入流程。
+客户端探测能力：v3.0 `status.capabilities` 为对象（如 `{"config_apply":false}`），
+旧版本可能为数组；客户端两种形态都接受，仅当包含/开启 `config_apply` 时优先用
+`config.apply`，否则一律走文件写入流程。
 这一步是为了后续升级不需要改 UI。
 
 ---
@@ -77,11 +84,11 @@ tempoctl --config /data/adb/tempo/config.toml --profile /data/adb/tempo/device.t
 ```json
 {
   "ok": true,
-  "service": "tempod",
-  "version": "0.1.0",
-  "stage": "P2-observe-only",
-  "mode": "observe-only",
-  "scheduler_writes": false,
+  "service": "Aegis",
+  "version": "3.0.0",
+  "stage": "active",
+  "mode": "adaptive",
+  "scheduler_writes": true,
   "schema": 1,
   "platform": "kalama",
   "sdk": 36,
@@ -97,6 +104,7 @@ tempoctl --config /data/adb/tempo/config.toml --profile /data/adb/tempo/device.t
       "foreground": 0.0
     }
   ],
+  "actual_freq_khz": [1800000, 2400000, 2800000],
   "uptime_ms": 123456,
   "probe": {
     "state": "starting|ready|disabled",
@@ -121,22 +129,27 @@ tempoctl --config /data/adb/tempo/config.toml --profile /data/adb/tempo/device.t
 约定：
 
 - `clusters` 顺序 = 簇下标（`cluster` 字段就是该下标）。
+- `clusters` 长度由设备实际拓扑决定，2/3/4 簇均合法；客户端按数组长度动态渲染，禁止写死三簇。
+- `cluster_count` 应等于 `clusters.length`；`clusters` 缺失或为空时总览显示空态，不伪造簇。
 - `role` ∈ `efficiency | balanced | prime`。
 - `reason` ∈ `quiet | screen_off | touch_lift | frame_burst | foreground | load | thermal | unchanged`。
 - `busy` / `foreground` 为 0..1。
 - `decisions` 可能为空（守护尚未做出决策）；为空时 UI 以 `min_khz` 作为兜底显示。
 - `probe.error` 非空 → 总览显示能力告警（调度不可用/观察模式）。
 - 事件率 = `events / (uptime_ms/1000)`（次/秒）；UI 只在刷新时计算，不做定时轮询。
-- **当前实际频率不在 status 中**，客户端在用户触发刷新时读取：
-  `/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq`（单位 kHz）。
-  读不到就显示 `--`，不伪造。
+- `actual_freq_khz` 为新增字段：与 `clusters` 等长、单位 kHz；存在且长度匹配时客户端优先使用。
+  缺失或长度不匹配时，刷新时回退读取 `/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq`。
+  两者都读不到就显示 `--`，不伪造。
+- 每簇占用率不由 `status` 提供：客户端在进入总览或用户点击刷新时，用固定 500ms 窗口读取两次
+  `/proc/stat`，按簇内各 CPU 的 idle 差值聚合计算，并标注“近 0.5s 采样”；失败显示 `--`。
+  该采样只在刷新时执行一次，不做定时轮询，不使用随机数或演示数据。
 
 ### 3.1 模块信息（非 status）
 
 | 数据 | 读取 |
 |---|---|
-| 模块版本 / 作者 / 描述 | `cat /data/adb/modules/tempo_sched/module.prop`（`id/tempo_sched`） |
-| 模块是否停用 | `[ -f /data/adb/modules/tempo_sched/disable ]` |
+| 模块版本 / 作者 / 描述 | `cat /data/adb/modules/aegis_scheduler/module.prop`（`id/aegis_scheduler`） |
+| 模块是否停用 | `[ -f /data/adb/modules/aegis_scheduler/disable ]` |
 | 守护版本 | `status.version` |
 
 `module.prop` 存在时 UI 显示“已安装”；否则显示“未检测到模块（独立运行）”。
@@ -301,11 +314,11 @@ UI 提供“恢复上一份配置”：`cp -f CFG_BAK CFG` + 回读。仅在 `CF
 | C2 | `config.apply` 未实现 | 写入只能落盘，无法确认热更新 | UI 标注“已保存，生效状态未知” |
 | C3 | `log.tail` 未实现 | 依赖日志文件命名 | 读最新文件，缺失时降级 |
 | C4 | 充电/热运行时状态缺失（`tempowerd` 未实现） | 充电页只能编辑阈值，不能展示实时状态 | 显示“充电守护未启用” |
-| C5 | 实际频率不在 `status` | 总览频率靠客户端读 sysfs | 刷新时读 `scaling_cur_freq`，失败显示 `--` |
+| C5 | 实际频率来源 | 旧版 `status` 无此字段 | v3.0 新增 `actual_freq_khz`，优先使用；缺失时回退 `scaling_cur_freq` |
 | C6 | `tempod` 是否已接 inotify 热更新 | 保存后是否立即生效未知 | 文案不断言，等 C2/C7 |
 | C7 | 建议 `status` 增加 `config_generation`、`restart_required`、`capabilities` | 可精确判断生效 | 客户端已预留字段解析 |
 | C8 | 模块打包需把 `webui/dist` 放到 `webroot/` | WebUI 入口 | 由打包任务接入，路径见 §9 |
-| C9 | APP 正式签名密钥 | 分发 | 先 debug 签名验证，正式密钥由项目所有者提供 |
+| C9 | APP 正式签名密钥 | 分发 | v3.0 已配置正式签名，构建脚本校验 `CN=Aegis` |
 | C10 | Magisk 无 WebUI 注入 | WebUI 仅 KernelSU 可用 | APP 为通用入口 |
 
 ---
@@ -321,7 +334,7 @@ UI 提供“恢复上一份配置”：`cp -f CFG_BAK CFG` + 回读。仅在 `CF
 
 | 页 | 内容 | 数据源 |
 |---|---|---|
-| 总览 | 运行状态卡（版本/平台/静默/运行时长）、按运行时实际簇数动态渲染的频率卡（角色、当前频率、上限、负载/前台）、厂商调度屏蔽的中性提示、刷新按钮 | `status` + `scaling_cur_freq` + `module.prop` |
+| 总览 | 运行状态卡（版本/平台/静默/运行时长）、按运行时实际簇数动态渲染的频率卡（角色、当前频率、上限、近 0.5s 采样占用、前台）、厂商调度屏蔽的中性提示、刷新按钮 | `status`（含 `clusters` / `actual_freq_khz`）+ `/proc/stat` + `module.prop` |
 | 参数 | 四组：静默与压缩、触摸与帧、换档与角色上限、事件采样；滑杆/数字框、即时校验、恢复默认（分组）、保存栏、回滚上一份 | `config.get` → TOML→JSON |
 | FAS | 总开关（默认关）、逐应用开关（名称/包名/图标/搜索）、未选应用即不工作的说明 | `pm list packages` + `config.get`（`[fas]`） |
 | 充电 | 实时状态卡（电量、是否充电、是否被本模块停充、距上限、预约时段、电池温度）、充电上限与恢复阈值（选择 100% 时先涓流，真正充满后停充并保持，需重新插电恢复）、停充/恢复温度、预约时段编辑 | `config.get` + `power.get` + `charge_plan.json` |
@@ -342,7 +355,8 @@ UI 提供“恢复上一份配置”：`cp -f CFG_BAK CFG` + 回读。仅在 `CF
 | 充电 | 阈值/温度/预约 | 同上 |
 | 日志 | 尾部日志 + 级别过滤 + 复制分享 | 增加“分享日志” |
 
-APP 不内嵌 WebView；所有数据通过 libsu 调用同一命令，解析同一 JSON DTO。
+APP 为 Kotlin + WebView 套壳，内嵌与 WebUI 完全相同的 `assets/webui` 静态包；
+所有数据仍通过 libsu 执行同一命令、解析同一 JSON 模型。
 
 ---
 

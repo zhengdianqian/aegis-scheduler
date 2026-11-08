@@ -50,6 +50,7 @@ pub struct Config {
     pub charge: ChargeConfig,
     pub thermal: ThermalConfig,
     pub fas: FasConfig,
+    pub scene: SceneConfig,
     pub ui: UiConfig,
 }
 
@@ -125,6 +126,48 @@ pub struct ControlConfig {
     /// target, never a hard lock: the governor may always use this much span.
     pub parked_headroom: f32,
     pub role_cap: RoleCaps,
+
+    // ---- v3 tiered ladder ------------------------------------------------
+    /// Entries in the per-cluster ladder (clamped to 6..=10).
+    pub tier_table_max: usize,
+    /// How long a load-driven upward move must be sustained before a step.
+    pub up_confirm_ms: u64,
+    /// Minimum spacing between two downward steps (one tier each).
+    pub down_step_ms: u64,
+    /// Maximum tiers a load/event step may climb at once.
+    pub max_up_step: u32,
+    /// Touch adds this many tiers (never the prime cluster).
+    pub touch_lift_tiers: u32,
+    /// Warm-start tier as a fraction of the ladder. Deliberately below 1.0.
+    pub launch_tier_ratio: f32,
+    /// Upper cap for the prime cluster under normal load.
+    pub prime_cap_ratio: f32,
+    /// Upper cap while an input method owns the foreground.
+    pub ime_cap_ratio: f32,
+    /// The writer never caps a cluster below this fraction of its ladder.
+    pub safety_ceiling_ratio: f32,
+    /// Tiers of headroom between the operating target and the max cap.
+    pub lookahead_tiers: u32,
+    /// Read-only guard after daemon start; no sysfs writes inside this window.
+    pub startup_guard_ms: u64,
+    /// Frame pressure is held this long after the last over-budget frame.
+    pub pressure_hold_ms: u64,
+    /// EMA time constant of the demand filters.
+    pub demand_smooth_ms: u64,
+}
+
+/// Per-scene floor calibration. Reading and video floors are tier indices into
+/// the per-cluster ladder; the controller raises a floor automatically if an
+/// over-budget frame is seen (the automatic form of "walk down to zero drops").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SceneConfig {
+    pub reading_floor_tier: usize,
+    pub video_floor_tier: usize,
+    pub default_floor_tier: usize,
+    pub reading_packages: Vec<String>,
+    pub video_packages: Vec<String>,
+    pub ime_packages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,6 +228,7 @@ impl Default for Config {
             charge: ChargeConfig::default(),
             thermal: ThermalConfig::default(),
             fas: FasConfig::default(),
+            scene: SceneConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -258,6 +302,58 @@ impl Default for ControlConfig {
             step_hysteresis: 0.03,
             parked_headroom: 0.08,
             role_cap: RoleCaps::default(),
+            tier_table_max: 8,
+            up_confirm_ms: 120,
+            down_step_ms: 45,
+            max_up_step: 2,
+            touch_lift_tiers: 1,
+            launch_tier_ratio: 0.62,
+            prime_cap_ratio: 0.70,
+            ime_cap_ratio: 0.45,
+            safety_ceiling_ratio: 0.35,
+            lookahead_tiers: 3,
+            startup_guard_ms: 20_000,
+            pressure_hold_ms: 1_000,
+            demand_smooth_ms: 200,
+        }
+    }
+}
+
+impl Default for SceneConfig {
+    fn default() -> Self {
+        Self {
+            reading_floor_tier: 0,
+            // Video decode is mostly off-CPU. Start at the hardware minimum and
+            // let an over-budget frame raise the adaptive floor; this is the
+            // automatic equivalent of the 180 s zero-drop calibration.
+            video_floor_tier: 0,
+            default_floor_tier: 0,
+            reading_packages: vec![
+                "com.dragon.read".to_owned(),
+                "com.tencent.weread".to_owned(),
+                "com.qidian.QDReader".to_owned(),
+                "com.ireader".to_owned(),
+                "com.duokan.reader".to_owned(),
+            ],
+            video_packages: vec![
+                "tv.danmaku.bili".to_owned(),
+                "com.ss.android.ugc.aweme".to_owned(),
+                "com.ss.android.ugc.aweme.lite".to_owned(),
+                "com.phoenix.read".to_owned(),
+                "com.qiyi.video".to_owned(),
+                "com.tencent.qqlive".to_owned(),
+                "com.youku.phone".to_owned(),
+                "com.hunantv.imgo.activity".to_owned(),
+                "com.google.android.youtube".to_owned(),
+            ],
+            ime_packages: vec![
+                "com.sohu.inputmethod.sogou".to_owned(),
+                "com.baidu.input".to_owned(),
+                "com.iflytek.inputmethod".to_owned(),
+                "com.google.android.inputmethod.latin".to_owned(),
+                "com.miui.inputmethod".to_owned(),
+                "com.tencent.wetype".to_owned(),
+            ],
         }
     }
 }
@@ -446,6 +542,71 @@ impl Config {
         ] {
             if !(0.20..=1.0).contains(&value) {
                 bad.push(format!("control.role_cap.{name} must be 0.20..=1.0"));
+            }
+        }
+
+        if !(6..=10).contains(&c.tier_table_max) {
+            bad.push("control.tier_table_max must be 6..=10".to_owned());
+        }
+        if !(40..=400).contains(&c.up_confirm_ms) {
+            bad.push("control.up_confirm_ms must be 40..=400".to_owned());
+        }
+        if !(15..=200).contains(&c.down_step_ms) {
+            bad.push("control.down_step_ms must be 15..=200".to_owned());
+        }
+        if !(1..=4).contains(&c.max_up_step) {
+            bad.push("control.max_up_step must be 1..=4".to_owned());
+        }
+        if !(1..=3).contains(&c.touch_lift_tiers) {
+            bad.push("control.touch_lift_tiers must be 1..=3".to_owned());
+        }
+        if !(0.30..=0.90).contains(&c.launch_tier_ratio) {
+            bad.push("control.launch_tier_ratio must be 0.30..=0.90".to_owned());
+        }
+        if !(0.30..=0.90).contains(&c.prime_cap_ratio) {
+            bad.push("control.prime_cap_ratio must be 0.30..=0.90".to_owned());
+        }
+        if !(0.25..=0.80).contains(&c.ime_cap_ratio) {
+            bad.push("control.ime_cap_ratio must be 0.25..=0.80".to_owned());
+        }
+        if !(0.20..=0.70).contains(&c.safety_ceiling_ratio) {
+            bad.push("control.safety_ceiling_ratio must be 0.20..=0.70".to_owned());
+        }
+        if !(1..=5).contains(&c.lookahead_tiers) {
+            bad.push("control.lookahead_tiers must be 1..=5".to_owned());
+        }
+        if !(5_000..=120_000).contains(&c.startup_guard_ms) {
+            bad.push("control.startup_guard_ms must be 5000..=120000".to_owned());
+        }
+        if !(300..=5_000).contains(&c.pressure_hold_ms) {
+            bad.push("control.pressure_hold_ms must be 300..=5000".to_owned());
+        }
+        if !(50..=1_000).contains(&c.demand_smooth_ms) {
+            bad.push("control.demand_smooth_ms must be 50..=1000".to_owned());
+        }
+
+        for (name, value) in [
+            ("reading_floor_tier", self.scene.reading_floor_tier),
+            ("video_floor_tier", self.scene.video_floor_tier),
+            ("default_floor_tier", self.scene.default_floor_tier),
+        ] {
+            if value > 5 {
+                bad.push(format!("scene.{name} must be <= 5"));
+            }
+        }
+        for (name, list) in [
+            ("reading_packages", &self.scene.reading_packages),
+            ("video_packages", &self.scene.video_packages),
+            ("ime_packages", &self.scene.ime_packages),
+        ] {
+            if list.len() > 64 {
+                bad.push(format!("scene.{name} must contain at most 64 entries"));
+            }
+            for app in list {
+                let trimmed = app.trim();
+                if trimmed.is_empty() || trimmed.len() > 128 || trimmed.split_whitespace().count() != 1 {
+                    bad.push(format!("scene.{name} entry {app:?} is not a valid package name"));
+                }
             }
         }
 

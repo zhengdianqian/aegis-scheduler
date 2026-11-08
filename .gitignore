@@ -38,6 +38,7 @@ output/
 release/
 
 # ---- 签名与凭据（绝不入库）----
+app/keystore/
 *.jks
 *.keystore
 *.p12

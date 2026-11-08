@@ -1,13 +1,24 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+﻿// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 默默的阿文
 // Aegis is an independent implementation. No third-party module source is included.
 
-//! Single-mode adaptive controller with an event-driven Quiet Path.
+//! Tiered adaptive controller (v3).
 //!
-//! The controller is a pure state machine: every method receives an explicit
-//! monotonic timestamp and returns decisions. It never reads sysfs and never
-//! installs repeating timers. `next_deadline` exposes only one-shot windows;
-//! when it returns `None` the caller may block indefinitely.
+//! Every cluster is reduced to a 6..10 entry frequency ladder derived from
+//! `scaling_available_frequencies`. The controller walks that ladder instead of
+//! switching between "hardware minimum" and "hardware maximum":
+//!
+//! * upward moves need a short confirmation window (load driven) or are event
+//!   driven (touch / launch / over-budget frame);
+//! * downward moves are rate limited to one tier per `down_step_ms`;
+//! * a one tier hysteresis keeps the ladder from flapping;
+//! * the scene floor (reading / video) anchors the operating point, so a video
+//!   does not run at the hardware minimum just because its CPU demand is low;
+//! * the writer receives a matching upper cap a few tiers above the target so a
+//!   vendor boost cannot slam the cluster to its top step while demand is low.
+//!
+//! The controller is a pure state machine: explicit monotonic timestamps in,
+//! decisions out. It never reads sysfs and installs no repeating timers.
 
 use serde::Serialize;
 
@@ -30,10 +41,37 @@ pub enum DecisionReason {
     Unchanged,
 }
 
+/// Workload class inferred from the foreground package name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scene {
+    Default,
+    Reading,
+    Video,
+    Ime,
+}
+
+impl Scene {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Reading => "reading",
+            Self::Video => "video",
+            Self::Ime => "ime",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Decision {
     pub cluster: usize,
+    /// Operating floor (a tier frequency). Kept under the historical name so
+    /// older WebUI builds keep rendering; v3 labels it as "目标".
     pub ceiling_khz: u32,
+    /// Upper cap for `scaling_max_freq`; `ceiling_khz <= cap_khz <= hw max`.
+    pub cap_khz: u32,
+    pub tier: u32,
+    pub tier_count: u32,
     pub reason: DecisionReason,
     pub changed: bool,
 }
@@ -64,21 +102,10 @@ pub enum DeadlineKind {
     BurstEnd,
     QuietEntry,
     FloorExit,
-    /// Next stage of a staged lift (or the next decay step).
+    /// Next confirmation / upward step.
     Ramp,
     /// Next downward step while the controller walks back to the target.
     Decay,
-}
-
-/// A staged lift: the ceiling climbs from 1/N to N/N of `peak` in `N` steps
-/// spaced `step_ms` apart. Time is derived from the monotonic timestamp, so no
-/// extra state is needed beyond the window start.
-#[derive(Debug, Clone, Copy)]
-struct Ramp {
-    start_us: u64,
-    peak: f32,
-    stages: u32,
-    step_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,83 +115,80 @@ pub struct Deadline {
 }
 
 #[derive(Debug, Clone)]
-struct ClusterRuntime {
-    ceiling_khz: u32,
-    last_change_us: u64,
-    busy: f32,
-    foreground_busy: f32,
+struct ClusterState {
+    tier: usize,
+    cap_tier: usize,
+    busy_ema: f32,
+    fg_ema: f32,
+    up_since_us: Option<u64>,
+    last_step_us: u64,
+}
+
+impl ClusterState {
+    fn new() -> Self {
+        Self {
+            tier: 0,
+            cap_tier: usize::MAX,
+            busy_ema: 0.0,
+            fg_ema: 0.0,
+            up_since_us: None,
+            last_step_us: 0,
+        }
+    }
 }
 
 pub struct Controller {
     profile: DeviceProfile,
     config: Config,
-    clusters: Vec<ClusterRuntime>,
+    /// Frequency ladder per cluster, ascending, 6..10 entries.
+    tiers: Vec<Vec<u32>>,
+    clusters: Vec<ClusterState>,
     screen_on: bool,
-    screen_since_us: u64,
-    last_touch_us: Option<u64>,
-    last_frame_us: Option<u64>,
-    last_demand_us: Option<u64>,
-    low_demand_since_us: Option<u64>,
-    /// Latched "foreground has no effective work" state. Entered on a
-    /// sustained low instantaneous ratio, left only on a sustained fast-filtered
-    /// rise or on an input/frame/foreground event. This separates static-page
-    /// micro-motion from a real burst.
-    floor_low: bool,
-    /// First sample of the current above-exit streak while `floor_low` is set.
-    floor_exit_since_us: Option<u64>,
-    /// Fast foreground filter (per cluster). Used only to confirm a floor exit,
-    /// so a single noisy sample cannot yank the device out of the floor path.
-    fg_fast: Vec<f32>,
-    fg_filter_ts_us: Option<u64>,
-    lift_until_us: Option<u64>,
-    lift_all_roles: bool,
-    lift_ramp: Option<Ramp>,
-    burst_until_us: Option<u64>,
-    burst_ramp: Option<Ramp>,
-    /// When the next downward step may happen. Downward moves are rate-limited
-    /// so a lift is released stage by stage instead of slamming back to min.
-    decay_at_us: Option<u64>,
     quiet: bool,
-    demands_seen: bool,
+    last_touch_us: u64,
+    low_demand_since_us: Option<u64>,
+    lift_until_us: Option<u64>,
+    launch_until_us: Option<u64>,
+    burst_until_us: Option<u64>,
+    pressure_until_us: Option<u64>,
+    last_over_budget_us: u64,
+    over_budget_hits: u32,
+    last_demand_us: u64,
     thermal_cap: Option<f32>,
+    scene: Scene,
+    /// Raised when a video/reading scene still produces over-budget frames; it
+    /// is the automatic form of the "walk down until zero drops" calibration.
+    adaptive_floor: usize,
 }
 
 impl Controller {
     pub fn new(profile: DeviceProfile, config: Config) -> Self {
-        let clusters = profile
+        let tiers = profile
             .clusters
             .iter()
-            .map(|c| ClusterRuntime {
-                ceiling_khz: c.max_khz,
-                last_change_us: 0,
-                busy: 0.0,
-                foreground_busy: 0.0,
-            })
+            .map(|cluster| build_ladder(&cluster.freq_khz, &cluster.min_khz, &cluster.max_khz,
+                                          config.control.tier_table_max))
             .collect();
-        let fg_fast = vec![0.0; profile.clusters.len()];
+        let clusters = profile.clusters.iter().map(|_| ClusterState::new()).collect();
         Self {
             profile,
             config,
+            tiers,
             clusters,
-            fg_fast,
-            fg_filter_ts_us: None,
-            floor_low: false,
-            floor_exit_since_us: None,
-            screen_on: false,
-            screen_since_us: 0,
-            last_touch_us: None,
-            last_frame_us: None,
-            last_demand_us: None,
+            screen_on: true,
+            quiet: false,
+            last_touch_us: 0,
             low_demand_since_us: None,
             lift_until_us: None,
-            lift_all_roles: false,
-            lift_ramp: None,
+            launch_until_us: None,
             burst_until_us: None,
-            burst_ramp: None,
-            decay_at_us: None,
-            quiet: false,
-            demands_seen: false,
+            pressure_until_us: None,
+            last_over_budget_us: 0,
+            over_budget_hits: 0,
+            last_demand_us: 0,
             thermal_cap: None,
+            scene: Scene::Default,
+            adaptive_floor: 0,
         }
     }
 
@@ -181,7 +205,26 @@ impl Controller {
     }
 
     pub fn ceiling_khz(&self, index: usize) -> u32 {
-        self.clusters[index].ceiling_khz
+        let cluster = &self.clusters[index];
+        self.tiers[index][cluster.tier.min(self.tiers[index].len() - 1)]
+    }
+
+    pub fn cap_khz(&self, index: usize) -> u32 {
+        let cluster = &self.clusters[index];
+        let cap = cluster.cap_tier.min(self.tiers[index].len() - 1);
+        self.tiers[index][cap]
+    }
+
+    pub fn tier(&self, index: usize) -> usize {
+        self.clusters[index].tier
+    }
+
+    pub fn tier_count(&self, index: usize) -> usize {
+        self.tiers[index].len()
+    }
+
+    pub fn tier_table(&self, index: usize) -> &[u32] {
+        &self.tiers[index]
     }
 
     pub fn is_quiet(&self) -> bool {
@@ -192,61 +235,46 @@ impl Controller {
         self.screen_on
     }
 
-    /// Screen on/off. Screen off floors every cluster immediately and leaves no
-    /// pending deadline; screen on opens a single one-shot lift window.
+    pub fn scene(&self) -> Scene {
+        self.scene
+    }
+
     pub fn on_screen(&mut self, ts_us: u64, on: bool) -> Vec<Decision> {
         self.screen_on = on;
-        self.screen_since_us = ts_us;
-        self.last_touch_us = None;
-        self.last_frame_us = None;
-        self.last_demand_us = None;
-        self.low_demand_since_us = None;
-        self.lift_until_us = None;
-        self.lift_ramp = None;
-        self.burst_until_us = None;
-        self.burst_ramp = None;
-        self.decay_at_us = None;
-        self.demands_seen = false;
-        self.reset_floor();
-
         if on {
+            // A screen-on is a warm start: open the cap and hold a mid tier for
+            // the launch window so the lock screen and the first frame do not
+            // run at the hardware minimum.
+            self.launch_until_us = Some(ts_us + self.config.control.launch_lift_ms * US_PER_MS);
             self.quiet = false;
-            self.lift_all_roles = true;
-            self.lift_until_us =
-                Some(ts_us.saturating_add(self.config.control.touch_lift_ms * US_PER_MS));
-            self.lift_ramp = Some(self.new_ramp(ts_us, self.config.control.touch_lift_level));
-            self.evaluate(ts_us, DecisionReason::Foreground)
+            self.low_demand_since_us = None;
+            self.evaluate(ts_us, DecisionReason::Launch)
         } else {
-            self.quiet = true;
+            self.quiet = false;
+            self.low_demand_since_us = None;
+            self.lift_until_us = None;
+            self.launch_until_us = None;
+            self.burst_until_us = None;
+            self.pressure_until_us = None;
+            self.over_budget_hits = 0;
+            for cluster in self.clusters.iter_mut() {
+                cluster.up_since_us = None;
+            }
             self.evaluate(ts_us, DecisionReason::ScreenOff)
         }
     }
 
-    /// A new touch contact (down or move). Refreshes the one-shot lift window.
     pub fn on_touch(&mut self, ts_us: u64) -> Vec<Decision> {
         if !self.screen_on {
             return Vec::new();
         }
-        // A new contact restarts the ramp; a move inside the same contact
-        // continues it, so a swipe does not fall back to the first stage every
-        // few milliseconds.
-        let fresh = self
-            .lift_until_us
-            .map(|until| ts_us >= until)
-            .unwrap_or(true);
-        self.last_touch_us = Some(ts_us);
+        self.last_touch_us = ts_us;
         self.quiet = false;
-        // A contact lifts the interactive clusters immediately, but it does not
-        // by itself prove real load: the floor latch stays set until fresh
-        // demand samples (or a frame overrun) confirm a burst. This keeps the
-        // prime cluster at min for a lone tap and avoids an over-reaction.
-        self.floor_exit_since_us = None;
-        self.lift_all_roles = false;
-        if fresh {
-            self.lift_ramp = Some(self.new_ramp(ts_us, self.config.control.touch_lift_level));
+        self.low_demand_since_us = None;
+        for cluster in self.clusters.iter_mut() {
+            cluster.up_since_us = None;
         }
-        self.lift_until_us =
-            Some(ts_us.saturating_add(self.config.control.touch_lift_ms * US_PER_MS));
+        self.lift_until_us = Some(ts_us + self.config.control.touch_lift_ms * US_PER_MS);
         self.evaluate(ts_us, DecisionReason::TouchLift)
     }
 
@@ -254,283 +282,162 @@ impl Controller {
         if !self.screen_on {
             return Vec::new();
         }
-        self.last_touch_us = Some(ts_us);
+        self.last_touch_us = ts_us;
         self.evaluate(ts_us, DecisionReason::Load)
     }
 
-    /// A frame produced by the foreground application. Only over-budget frames
-    /// affect decisions; on-time frames are informational.
     pub fn on_frame(&mut self, sample: FrameSample) -> Vec<Decision> {
-        if !self.screen_on || !sample.foreground {
+        if !self.screen_on {
             return Vec::new();
         }
-        self.last_frame_us = Some(sample.ts_us);
-        let limit = sample.budget_ms + self.config.control.frame_slack_ms;
-        if sample.render_ms > limit {
-            self.quiet = false;
-            self.low_demand_since_us = None;
-            self.floor_low = false;
-            self.floor_exit_since_us = None;
-            let fresh_burst = self
-                .burst_until_us
-                .map(|until| sample.ts_us >= until)
-                .unwrap_or(true);
-            if fresh_burst {
-                self.burst_ramp =
-                    Some(self.new_ramp(sample.ts_us, self.config.control.frame_burst_level));
-            }
-            self.burst_until_us = Some(
-                sample
-                    .ts_us
-                    .saturating_add(self.config.control.frame_burst_ms * US_PER_MS),
-            );
-            self.evaluate(sample.ts_us, DecisionReason::FrameBurst)
-        } else {
-            Vec::new()
+        let over = sample.render_ms > sample.budget_ms + self.config.control.frame_slack_ms;
+        if !over || !sample.foreground {
+            return Vec::new();
         }
+
+        let recent = sample.ts_us.saturating_sub(self.last_over_budget_us) <= US_PER_MS;
+        self.over_budget_hits = if recent { self.over_budget_hits.saturating_add(1) } else { 1 };
+        self.last_over_budget_us = sample.ts_us;
+        if self.over_budget_hits >= 3 {
+            self.pressure_until_us =
+                Some(sample.ts_us + self.config.control.pressure_hold_ms * US_PER_MS);
+        }
+
+        self.quiet = false;
+        self.low_demand_since_us = None;
+        for cluster in self.clusters.iter_mut() {
+            cluster.up_since_us = None;
+        }
+        self.burst_until_us = Some(sample.ts_us + self.config.control.frame_burst_ms * US_PER_MS);
+
+        // Video and reading are calibrated at their floor. One dropped frame is
+        // the signal that the floor is too low for this stream, so raise it one
+        // tier for the rest of the session (capped, reversible on restart).
+        if matches!(self.scene, Scene::Video | Scene::Reading) {
+            let ceiling = self
+                .tiers
+                .iter()
+                .map(Vec::len)
+                .min()
+                .unwrap_or(1)
+                .saturating_sub(1);
+            let max_floor = (ceiling / 3).max(1);
+            self.adaptive_floor = self.adaptive_floor.saturating_add(1).min(max_floor);
+        }
+
+        self.evaluate(sample.ts_us, DecisionReason::FrameBurst)
     }
 
-    /// Foreground application changed. Old demand is discarded; a one-shot
-    /// warm-start lift covers the transition.
     pub fn on_foreground_changed(&mut self, ts_us: u64) -> Vec<Decision> {
         if !self.screen_on {
             return Vec::new();
         }
-        self.quiet = false;
-        self.demands_seen = false;
-        self.low_demand_since_us = None;
-        self.last_frame_us = None;
-        self.decay_at_us = None;
-        self.burst_until_us = None;
-        self.burst_ramp = None;
-        self.reset_floor();
-        for cluster in &mut self.clusters {
-            cluster.busy = 0.0;
-            cluster.foreground_busy = 0.0;
+        for cluster in self.clusters.iter_mut() {
+            cluster.up_since_us = None;
         }
-        self.lift_all_roles = true;
-        self.lift_until_us =
-            Some(ts_us.saturating_add(self.config.control.touch_lift_ms * US_PER_MS));
-        self.lift_ramp = Some(self.new_ramp(ts_us, self.config.control.touch_lift_level));
+        self.launch_until_us = Some(ts_us + self.config.control.launch_lift_ms * US_PER_MS);
+        self.quiet = false;
+        self.low_demand_since_us = None;
         self.evaluate(ts_us, DecisionReason::Foreground)
     }
 
-    /// An application process became active after an idle period. Unlike a
-    /// touch, this is the real cold/warm start edge: the app's first frames and
-    /// dex/IO work land inside this window. Lift every cluster (prime included)
-    /// to the launch level for a few hundred milliseconds, then decay normally.
     pub fn on_app_launch(&mut self, ts_us: u64) -> Vec<Decision> {
         if !self.screen_on {
             return Vec::new();
         }
-        self.quiet = false;
-        self.demands_seen = false;
-        self.low_demand_since_us = None;
-        self.last_frame_us = None;
-        self.decay_at_us = None;
-        self.burst_until_us = None;
-        self.burst_ramp = None;
-        self.reset_floor();
-        for cluster in &mut self.clusters {
-            cluster.busy = 0.0;
-            cluster.foreground_busy = 0.0;
+        for cluster in self.clusters.iter_mut() {
+            cluster.up_since_us = None;
         }
-        self.lift_all_roles = true;
-        self.lift_until_us =
-            Some(ts_us.saturating_add(self.config.control.launch_lift_ms * US_PER_MS));
-        self.lift_ramp = Some(Ramp {
-            start_us: ts_us,
-            peak: self.config.control.launch_lift_level,
-            // Launch states cannot wait for a staged ramp: the first frames
-            // arrive inside the first 16-60 ms.
-            stages: 1,
-            step_ms: 1,
-        });
+        self.launch_until_us = Some(ts_us + self.config.control.launch_lift_ms * US_PER_MS);
+        self.quiet = false;
+        self.low_demand_since_us = None;
         self.evaluate(ts_us, DecisionReason::Launch)
     }
 
-    /// Demand sample produced by the runtime probe. Low foreground demand lets
-    /// the controller enter the Quiet Path even when background work continues.
+    pub fn on_scene(&mut self, ts_us: u64, scene: Scene) -> Vec<Decision> {
+        if scene == self.scene {
+            return Vec::new();
+        }
+        self.scene = scene;
+        self.adaptive_floor = 0;
+        self.low_demand_since_us = None;
+        for cluster in self.clusters.iter_mut() {
+            cluster.up_since_us = None;
+        }
+        self.evaluate(ts_us, DecisionReason::Load)
+    }
+
     pub fn on_demand(&mut self, sample: DemandSample) -> Vec<Decision> {
+        if !self.screen_on {
+            return Vec::new();
+        }
         let ts = sample.ts_us;
-        self.last_demand_us = Some(ts);
+        let dt_us = ts.saturating_sub(self.last_demand_us);
+        let tau_ms = self.config.control.demand_smooth_ms.max(20);
+        let alpha = if self.last_demand_us == 0 || dt_us == 0 {
+            1.0
+        } else {
+            (1.0 - (-(dt_us as f32) / (tau_ms as f32 * US_PER_MS as f32)).exp()).clamp(0.08, 1.0)
+        };
+        self.last_demand_us = ts;
+
+        let mut instant_fg = 0.0f32;
         for (index, cluster) in self.clusters.iter_mut().enumerate() {
-            cluster.busy = sample
-                .cluster_busy
-                .get(index)
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
-            cluster.foreground_busy = sample
+            let busy = sample.cluster_busy.get(index).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let fg = sample
                 .foreground_busy
                 .get(index)
                 .copied()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
+            if alpha >= 1.0 {
+                cluster.busy_ema = busy;
+                cluster.fg_ema = fg;
+            } else {
+                cluster.busy_ema += (busy - cluster.busy_ema) * alpha;
+                cluster.fg_ema += (fg - cluster.fg_ema) * alpha;
+            }
+            instant_fg = instant_fg.max(fg);
         }
-        self.demands_seen = true;
-        self.update_floor_state(ts);
+
+        // Quiet path: no touch, no window and a settled low foreground demand.
+        if self.quiet {
+            if instant_fg >= self.config.control.floor_exit_ratio {
+                self.quiet = false;
+                self.low_demand_since_us = None;
+            }
+        } else if instant_fg <= self.config.control.floor_enter_ratio {
+            match self.low_demand_since_us {
+                None => self.low_demand_since_us = Some(ts),
+                Some(since) => {
+                    if ts.saturating_sub(since) >= self.config.control.floor_settle_ms * US_PER_MS
+                        && ts >= self.last_touch_us + self.config.events.quiet_decay_ms * US_PER_MS
+                        && self.lift_until_us.is_none_or(|until| ts >= until)
+                        && self.burst_until_us.is_none_or(|until| ts >= until)
+                        && self.launch_until_us.is_none_or(|until| ts >= until)
+                        && !self.pressure_active(ts)
+                    {
+                        self.quiet = true;
+                    }
+                }
+            }
+        } else {
+            self.low_demand_since_us = None;
+        }
 
         self.evaluate(ts, DecisionReason::Load)
     }
 
-    /// Updates the foreground floor latch. Entry uses the instantaneous ratio
-    /// (fast response on a quiet page); exit requires the fast-filtered ratio
-    /// to stay above `floor_exit_ratio` for `floor_exit_ms`, so a single noisy
-    /// sample or a rendering blip cannot pull the device out of the floor.
-    fn update_floor_state(&mut self, ts_us: u64) {
-        let enter = self.config.control.floor_enter_ratio;
-        let exit = self.config.control.floor_exit_ratio;
-        let settle = self.config.control.floor_settle_ms * US_PER_MS;
-        let exit_hold = self.config.control.floor_exit_ms * US_PER_MS;
-
-        // The probe publishes on change, not on a clock, so the filter uses the
-        // actual sample gap: a long gap decays the old value completely.
-        let dt = self
-            .fg_filter_ts_us
-            .map(|previous| ts_us.saturating_sub(previous))
-            .unwrap_or(0);
-        self.fg_filter_ts_us = Some(ts_us);
-        let tau = self.config.control.fg_fast_ms.max(1) * US_PER_MS;
-        let alpha = if dt == 0 {
-            1.0
-        } else {
-            (1.0 - (-(dt as f32) / tau as f32).exp()).clamp(0.0, 1.0)
-        };
-        for index in 0..self.clusters.len() {
-            let value = self.clusters[index].foreground_busy;
-            let filtered = self.fg_fast.get(index).copied().unwrap_or(0.0);
-            if let Some(slot) = self.fg_fast.get_mut(index) {
-                *slot = filtered + alpha * (value - filtered);
-            }
-        }
-
-        let max_instant = self
-            .clusters
-            .iter()
-            .map(|cluster| cluster.foreground_busy)
-            .fold(0.0_f32, f32::max);
-        let max_fast = self.fg_fast.iter().copied().fold(0.0_f32, f32::max);
-
-        if self.floor_low {
-            if max_fast >= exit {
-                let since = *self.floor_exit_since_us.get_or_insert(ts_us);
-                if ts_us >= since.saturating_add(exit_hold) {
-                    self.floor_low = false;
-                    self.floor_exit_since_us = None;
-                    self.low_demand_since_us = None;
-                    self.quiet = false;
-                }
-            } else {
-                self.floor_exit_since_us = None;
-            }
-        } else if max_instant <= enter {
-            if self.low_demand_since_us.is_none() {
-                self.low_demand_since_us = Some(ts_us);
-            }
-            if self
-                .low_demand_since_us
-                .is_some_and(|start| ts_us >= start.saturating_add(settle))
-            {
-                self.floor_low = true;
-            }
-        } else {
-            self.low_demand_since_us = None;
-            if self.quiet {
-                self.quiet = false;
-            }
-        }
-    }
-
-    /// Clears every floor-related filter and latch. Used on screen and
-    /// foreground transitions, where past demand is meaningless.
-    fn reset_floor(&mut self) {
-        self.floor_low = false;
-        self.floor_exit_since_us = None;
-        self.low_demand_since_us = None;
-        self.fg_filter_ts_us = None;
-        for slot in &mut self.fg_fast {
-            *slot = 0.0;
-        }
-    }
-
-    fn new_ramp(&self, start_us: u64, peak: f32) -> Ramp {
-        let stages = self.config.control.touch_ramp_stages.max(2) as u32;
-        let step_ms = (self.config.control.touch_ramp_ms / stages as u64).max(1);
-        Ramp {
-            start_us,
-            peak,
-            stages,
-            step_ms,
-        }
-    }
-
-    /// Level of a staged lift at `ts_us`: 1/N of the peak on arrival, then one
-    /// step every `step_ms`, reaching the peak after `touch_ramp_ms`.
-    fn ramp_level(ramp: Option<Ramp>, ts_us: u64) -> Option<f32> {
-        let ramp = ramp?;
-        let step_us = ramp.step_ms.max(1) * US_PER_MS;
-        let elapsed = ts_us.saturating_sub(ramp.start_us);
-        let stage = (1 + elapsed / step_us).min(ramp.stages as u64) as f32;
-        Some(ramp.peak * stage / ramp.stages as f32)
-    }
-
-    /// First monotonic instant at which a ramp is still above its start and
-    /// has another stage to climb.
-    fn ramp_next(ramp: Option<Ramp>, now_us: u64) -> Option<u64> {
-        let ramp = ramp?;
-        let step_us = ramp.step_ms.max(1) * US_PER_MS;
-        let elapsed = now_us.saturating_sub(ramp.start_us);
-        let stage = 1 + elapsed / step_us;
-        if stage >= ramp.stages as u64 {
-            return None;
-        }
-        Some(ramp.start_us + stage * step_us)
-    }
-
     pub fn on_thermal_cap(&mut self, ts_us: u64, cap: Option<f32>) -> Vec<Decision> {
-        self.thermal_cap = cap.map(|value| value.clamp(0.05, 1.0));
+        let cap = cap.map(|value| value.clamp(0.10, 1.0));
+        if cap == self.thermal_cap {
+            return Vec::new();
+        }
+        self.thermal_cap = cap;
         self.evaluate(ts_us, DecisionReason::Thermal)
     }
 
-    /// A one-shot deadline expired.
     pub fn on_deadline(&mut self, ts_us: u64) -> Vec<Decision> {
-        if self.lift_until_us.is_some_and(|until| ts_us >= until) {
-            self.lift_until_us = None;
-            self.lift_ramp = None;
-        }
-        if self.burst_until_us.is_some_and(|until| ts_us >= until) {
-            self.burst_until_us = None;
-            self.burst_ramp = None;
-        }
-        if self.decay_at_us.is_some_and(|at| ts_us >= at) {
-            self.decay_at_us = None;
-        }
-        if !self.screen_on {
-            return Vec::new();
-        }
-        if self.floor_low {
-            if let Some(since) = self.floor_exit_since_us {
-                if ts_us >= since.saturating_add(self.config.control.floor_exit_ms * US_PER_MS) {
-                    // The filtered ratio said "burst", but by the confirmation
-                    // moment the latest observation is already below the exit
-                    // threshold: this was one noisy sample, not a real burst.
-                    let instant_max = self
-                        .clusters
-                        .iter()
-                        .map(|cluster| cluster.foreground_busy)
-                        .fold(0.0_f32, f32::max);
-                    if instant_max < self.config.control.floor_exit_ratio {
-                        self.floor_exit_since_us = None;
-                    } else {
-                        self.floor_low = false;
-                        self.floor_exit_since_us = None;
-                        self.low_demand_since_us = None;
-                        self.quiet = false;
-                    }
-                }
-            }
-        }
         self.evaluate(ts_us, DecisionReason::Load)
     }
 
@@ -540,386 +447,459 @@ impl Controller {
             return None;
         }
         let mut best: Option<Deadline> = None;
-
-        // Staged lifts: one wakeup per climb step. These come before the lift
-        // end because they are always earlier.
-        if self.lift_until_us.is_some_and(|until| now_us < until) {
-            if let Some(at) = Self::ramp_next(self.lift_ramp, now_us) {
-                if at > now_us {
-                    best = Some(Deadline {
-                        at_us: at,
-                        kind: DeadlineKind::Ramp,
-                    });
-                }
-            }
-        }
-        if self.burst_until_us.is_some_and(|until| now_us < until) {
-            if let Some(at) = Self::ramp_next(self.burst_ramp, now_us) {
-                if at > now_us {
-                    let candidate = Deadline {
-                        at_us: at,
-                        kind: DeadlineKind::Ramp,
-                    };
-                    best = match best {
-                        Some(current) if current.at_us <= candidate.at_us => Some(current),
-                        _ => Some(candidate),
-                    };
-                }
-            }
-        }
-        // Downward steps: keep walking to the target one stage at a time. This
-        // is also the only wakeup that can exist while the quiet path is latched.
-        if let Some(at) = self.decay_at_us {
+        let mut consider = |at: u64, kind: DeadlineKind| {
             if at > now_us {
-                let candidate = Deadline {
-                    at_us: at,
-                    kind: DeadlineKind::Decay,
-                };
                 best = match best {
-                    Some(current) if current.at_us <= candidate.at_us => Some(current),
-                    _ => Some(candidate),
+                    Some(current) if current.at_us <= at => Some(current),
+                    _ => Some(Deadline { at_us: at, kind }),
                 };
             }
-        }
+        };
 
-        if let Some(until) = self.lift_until_us {
-            if until > now_us {
-                let candidate = Deadline {
-                    at_us: until,
-                    kind: DeadlineKind::LiftEnd,
-                };
-                best = match best {
-                    Some(current) if current.at_us <= candidate.at_us => Some(current),
-                    _ => Some(candidate),
-                };
-            }
-        }
-        if let Some(until) = self.burst_until_us {
-            if until > now_us {
-                let candidate = Deadline {
-                    at_us: until,
-                    kind: DeadlineKind::BurstEnd,
-                };
-                best = match best {
-                    Some(current) if current.at_us <= candidate.at_us => Some(current),
-                    _ => Some(candidate),
-                };
-            }
-        }
-
-        let lift_active = self.lift_until_us.is_some_and(|until| now_us < until);
-        let burst_active = self.burst_until_us.is_some_and(|until| now_us < until);
-        if self.floor_low {
-            if let Some(since) = self.floor_exit_since_us {
-                let at = since.saturating_add(self.config.control.floor_exit_ms * US_PER_MS);
-                if at > now_us {
-                    let candidate = Deadline {
-                        at_us: at,
-                        kind: DeadlineKind::FloorExit,
-                    };
-                    best = match best {
-                        Some(current) if current.at_us <= candidate.at_us => Some(current),
-                        _ => Some(candidate),
-                    };
-                }
-            }
-        }
-        if !self.quiet && !lift_active && !burst_active {
-            if let Some(low_since) = self.low_demand_since_us {
-                let mut entry =
-                    low_since.saturating_add(self.config.control.floor_settle_ms * US_PER_MS);
-                if let Some(touch) = self.last_touch_us {
-                    entry = entry
-                        .max(touch.saturating_add(self.config.events.quiet_decay_ms * US_PER_MS));
-                }
-                if entry > now_us {
-                    let candidate = Deadline {
-                        at_us: entry,
-                        kind: DeadlineKind::QuietEntry,
-                    };
-                    best = match best {
-                        Some(current) if current.at_us <= candidate.at_us => Some(current),
-                        _ => Some(candidate),
-                    };
+        for window in [self.lift_until_us, self.launch_until_us, self.burst_until_us, self.pressure_until_us] {
+            if let Some(until) = window {
+                if until > now_us {
+                    consider(until, DeadlineKind::LiftEnd);
                 }
             }
         }
 
+        if !self.quiet && self.low_demand_since_us.is_some() {
+            if let Some(since) = self.low_demand_since_us {
+                let settle = since + self.config.control.floor_settle_ms * US_PER_MS;
+                let decay = self.last_touch_us + self.config.events.quiet_decay_ms * US_PER_MS;
+                consider(settle.max(decay), DeadlineKind::QuietEntry);
+            }
+        }
+
+        for (index, cluster) in self.clusters.iter().enumerate() {
+            let desired = self.desired_tier(index, now_us);
+            if desired > cluster.tier {
+                if let Some(since) = cluster.up_since_us {
+                    consider(
+                        since + self.config.control.up_confirm_ms * US_PER_MS,
+                        DeadlineKind::Ramp,
+                    );
+                }
+            } else if desired < cluster.tier && self.down_allowed(index) {
+                consider(
+                    cluster.last_step_us + self.config.control.down_step_ms * US_PER_MS,
+                    DeadlineKind::Decay,
+                );
+            }
+        }
         best
     }
 
-    fn evaluate(&mut self, ts_us: u64, default_reason: DecisionReason) -> Vec<Decision> {
+    fn pressure_active(&self, ts_us: u64) -> bool {
+        self.pressure_until_us.is_some_and(|until| ts_us < until)
+            && ts_us.saturating_sub(self.last_over_budget_us)
+                <= self.config.control.pressure_hold_ms * US_PER_MS
+    }
+
+    fn ratio_tier(&self, ratio: f32, count: usize) -> usize {
+        if count <= 1 {
+            return 0;
+        }
+        (ratio.clamp(0.0, 1.0) * (count - 1) as f32).round() as usize
+    }
+
+    fn scene_floor(&self, count: usize) -> usize {
+        let configured = match self.scene {
+            Scene::Reading => self.config.scene.reading_floor_tier,
+            Scene::Video => self.config.scene.video_floor_tier,
+            _ => self.config.scene.default_floor_tier,
+        };
+        configured
+            .max(self.adaptive_floor)
+            .min(count.saturating_sub(1))
+    }
+
+    fn down_allowed(&self, index: usize) -> bool {
+        let cluster = &self.clusters[index];
+        let desired = self.desired_tier(index, self.last_demand_us);
+        desired < cluster.tier
+            && (self.quiet
+                || cluster.tier >= desired + 2
+                || cluster.tier == 1)
+    }
+
+    fn desired_tier(&self, index: usize, ts_us: u64) -> usize {
+        let count = self.tiers[index].len();
+        if count <= 1 {
+            return 0;
+        }
         if !self.screen_on {
-            self.quiet = true;
-        } else if !self.quiet && self.quiet_ready(ts_us) {
-            self.quiet = true;
-            // Quiet is the floor state by definition; keep the latch aligned
-            // so the exit filter starts from a clean baseline.
-            self.floor_low = true;
-            self.floor_exit_since_us = None;
+            return 0;
+        }
+        let cluster = &self.clusters[index];
+        let floor = self.scene_floor(count);
+        if self.quiet {
+            return floor;
         }
 
-        let quiet = self.quiet;
-        // A pending decay step whose instant has already passed is consumed
-        // here, so an event that arrives before the timer wakeup cannot make the
-        // controller fall faster than the configured interval.
-        if self.decay_at_us.is_some_and(|at| ts_us >= at) {
-            self.decay_at_us = None;
+        let demand = cluster.busy_ema.max(cluster.fg_ema).clamp(0.0, 1.0);
+        // Concave curve: 3% demand -> tier 1/7, 15% -> 2/7, 40% -> 4/7.
+        let mut tier = self.ratio_tier(demand.powf(0.6), count).max(floor);
+
+        // Video decode is mostly off-CPU; hold the calibrated floor unless a
+        // frame actually misses, which is handled by the burst/pressure paths.
+        if self.scene == Scene::Video && !self.pressure_active(ts_us) {
+            tier = floor;
         }
-        let decay_gate = self.decay_at_us.is_some_and(|at| ts_us < at);
-        let factor = self.config.control.drop_factor.max(1.0);
-        let mut stepped_down = false;
+
+        if self.burst_until_us.is_some_and(|until| ts_us < until) {
+            tier = tier.max(self.ratio_tier(self.config.control.frame_burst_level, count));
+        }
+        if self.pressure_active(ts_us) {
+            tier = count - 1;
+        }
+        if self.launch_until_us.is_some_and(|until| ts_us < until) {
+            tier = tier.max(self.ratio_tier(self.config.control.launch_tier_ratio, count));
+        }
+        if self.lift_until_us.is_some_and(|until| ts_us < until)
+            && self.profile.clusters[index].role != Role::Prime
+        {
+            let steps = self.config.control.touch_lift_tiers.max(1) as usize;
+            tier = tier.max((cluster.tier + steps).min(count - 1));
+        }
+        if self.scene == Scene::Ime {
+            tier = tier.min(self.ratio_tier(self.config.control.ime_cap_ratio, count));
+        }
+        if self.profile.clusters[index].role == Role::Prime && !self.pressure_active(ts_us) {
+            tier = tier.min(self.ratio_tier(self.config.control.prime_cap_ratio, count));
+        }
+        if let Some(cap) = self.thermal_cap {
+            tier = tier.min(self.ratio_tier(cap, count));
+        }
+        tier.min(count - 1)
+    }
+
+    /// Upper cap for the governor. It is always at least `safety_ceiling_ratio`
+    /// of the ladder, and fully open during launch, frame bursts and pressure.
+    pub fn cap_tier(&self, index: usize, ts_us: u64) -> usize {
+        let count = self.tiers[index].len();
+        if count <= 1 || !self.screen_on {
+            return count.saturating_sub(1);
+        }
+        if self.pressure_active(ts_us)
+            || self.launch_until_us.is_some_and(|until| ts_us < until)
+            || self.burst_until_us.is_some_and(|until| ts_us < until)
+        {
+            return count - 1;
+        }
+        let safety = ((count - 1) as f32 * self.config.control.safety_ceiling_ratio).ceil() as usize;
+        if self.quiet {
+            return safety.min(count - 1);
+        }
+        let lookahead = self.config.control.lookahead_tiers as usize;
+        (self.clusters[index].tier + lookahead)
+            .max(safety)
+            .min(count - 1)
+    }
+
+    fn evaluate(&mut self, ts_us: u64, base_reason: DecisionReason) -> Vec<Decision> {
+        if self.clusters.is_empty() {
+            return Vec::new();
+        }
+        for cluster in self.clusters.iter_mut() {
+            if cluster.last_step_us == 0 || cluster.last_step_us > ts_us {
+                cluster.last_step_us = ts_us;
+            }
+        }
         let mut decisions = Vec::with_capacity(self.clusters.len());
-
         for index in 0..self.clusters.len() {
-            let min_khz = self.profile.clusters[index].min_khz;
-            let current = self.clusters[index].ceiling_khz;
+            let count = self.tiers[index].len();
+            let old_tier = self.clusters[index].tier;
+            let old_cap = self.clusters[index].cap_tier;
+            let desired = self.desired_tier(index, ts_us);
+            let event = matches!(
+                base_reason,
+                DecisionReason::TouchLift
+                    | DecisionReason::Launch
+                    | DecisionReason::Foreground
+                    | DecisionReason::FrameBurst
+            );
 
-            let (mut chosen, mut reason) = if quiet {
-                let reason = if self.screen_on {
-                    DecisionReason::Quiet
+            let mut new_tier = old_tier;
+            let mut reason = base_reason;
+
+            if desired > old_tier {
+                if event {
+                    // Touch adds one tier, launch jumps to its own mid tier
+                    // (never the top), frame bursts climb by at most two so the
+                    // ladder stays visible instead of slamming to the ceiling.
+                    let step = if base_reason == DecisionReason::Launch {
+                        count - 1
+                    } else {
+                        self.config.control.max_up_step.max(1) as usize
+                    };
+                    new_tier = desired.min(old_tier + step.max(1));
+                } else if self.quiet {
+                    new_tier = desired;
+                    reason = DecisionReason::Quiet;
                 } else {
-                    DecisionReason::ScreenOff
-                };
-                (min_khz, reason)
-            } else {
-                let (fraction, mut reason) = self.compute_fraction(index, ts_us, default_reason);
-                let candidate = self.profile.snap_khz(index, fraction);
-                let current_fraction = self.profile.clusters[index].fraction_of(current);
-                let up = candidate > current;
-                let threshold = if up {
-                    self.config.control.step_hysteresis
-                } else {
-                    self.config.control.step_hysteresis / factor
-                };
-                let diff = (fraction - current_fraction).abs();
-                let mut accept = diff >= threshold || fraction < self.config.control.drop_ratio;
-                if up
-                    && current == min_khz
-                    && self.config.control.floor_residence_ms > 0
-                    && !is_event_driven(reason)
+                    match self.clusters[index].up_since_us {
+                        Some(since)
+                            if ts_us.saturating_sub(since)
+                                >= self.config.control.up_confirm_ms * US_PER_MS =>
+                        {
+                            let step = self.config.control.max_up_step.max(1) as usize;
+                            new_tier = desired.min(old_tier + step);
+                            self.clusters[index].up_since_us = Some(ts_us);
+                            reason = DecisionReason::Load;
+                        }
+                        Some(_) => {
+                            reason = DecisionReason::Unchanged;
+                        }
+                        None => {
+                            self.clusters[index].up_since_us = Some(ts_us);
+                            reason = DecisionReason::Unchanged;
+                        }
+                    }
+                }
+            } else if desired < old_tier {
+                self.clusters[index].up_since_us = None;
+                if self.down_allowed(index)
+                    && ts_us.saturating_sub(self.clusters[index].last_step_us)
+                        >= self.config.control.down_step_ms * US_PER_MS
                 {
-                    let elapsed = ts_us.saturating_sub(self.clusters[index].last_change_us);
-                    if elapsed < self.config.control.floor_residence_ms * US_PER_MS {
-                        accept = false;
-                    }
-                }
-                if accept {
-                    (candidate, reason)
+                    new_tier = old_tier - 1;
+                    reason = if self.quiet {
+                        DecisionReason::Quiet
+                    } else {
+                        DecisionReason::Load
+                    };
+                } else if self.quiet {
+                    reason = DecisionReason::Quiet;
                 } else {
                     reason = DecisionReason::Unchanged;
-                    (current, reason)
                 }
-            };
-
-            // Release a lift stage by stage: one step may not fall by more than
-            // `drop_factor`, and a second step waits for `touch_decay_ms`. A
-            // screen-off still floors instantly (battery before smoothness).
-            if chosen < current && reason != DecisionReason::ScreenOff {
-                if decay_gate {
-                    chosen = current;
-                    reason = DecisionReason::Unchanged;
-                } else {
-                    let current_fraction = self.profile.clusters[index].fraction_of(current);
-                    let lower = self
-                        .profile
-                        .snap_khz(index, current_fraction / factor);
-                    if chosen < lower {
-                        chosen = lower;
-                        reason = if quiet {
-                            DecisionReason::Quiet
-                        } else {
-                            reason
-                        };
-                        stepped_down = true;
-                    }
-                }
+            } else {
+                self.clusters[index].up_since_us = None;
             }
 
-            let changed = chosen != current;
-            if changed {
-                let cluster = &mut self.clusters[index];
-                cluster.ceiling_khz = chosen;
-                cluster.last_change_us = ts_us;
+            if new_tier != old_tier {
+                self.clusters[index].tier = new_tier;
+                self.clusters[index].last_step_us = ts_us;
             }
+            let cap_tier = self.cap_tier(index, ts_us);
+            self.clusters[index].cap_tier = cap_tier;
+            let changed = new_tier != old_tier || cap_tier != old_cap;
+
             decisions.push(Decision {
                 cluster: index,
-                ceiling_khz: chosen,
+                ceiling_khz: self.tiers[index][new_tier],
+                cap_khz: self.tiers[index][cap_tier],
+                tier: new_tier as u32,
+                tier_count: count as u32,
                 reason,
                 changed,
             });
         }
-
-        if decay_gate {
-            // Keep the pending step: the next wakeup is already armed.
-        } else if stepped_down {
-            self.decay_at_us =
-                Some(ts_us.saturating_add(self.config.control.touch_decay_ms * US_PER_MS));
-        } else {
-            self.decay_at_us = None;
-        }
-
         decisions
     }
-
-    fn compute_fraction(
-        &self,
-        index: usize,
-        ts_us: u64,
-        default_reason: DecisionReason,
-    ) -> (f32, DecisionReason) {
-        let cluster = &self.profile.clusters[index];
-        let demand = self.clusters[index].busy;
-        let mut fraction = load_curve(
-            demand,
-            self.config.control.quiet_ratio,
-            self.config.control.reserve_ratio,
-        );
-        let mut reason = default_reason;
-
-        if self.floor_low {
-            fraction = fraction.min(self.config.control.quiet_cap);
-            // The prime cluster is not driven by background or idle foreground
-            // work. It participates only in foreground load, warm start and
-            // frame bursts.
-            if cluster.role == Role::Prime {
-                fraction = 0.0;
-            }
-        }
-
-        if self.lift_until_us.is_some_and(|until| ts_us < until) {
-            let applies = self.lift_all_roles || cluster.role != Role::Prime;
-            let level = Self::ramp_level(self.lift_ramp, ts_us)
-                .unwrap_or(self.config.control.touch_lift_level);
-            // Event lifts must not park the prime cluster at its top tier:
-            // window animations, IME overlays and focus changes are not proof
-            // of compute. Real load still climbs through the load curve and
-            // over-budget frames through the burst window.
-            let level = if cluster.role == Role::Prime {
-                level.min(self.config.control.prime_lift_level)
-            } else {
-                level
-            };
-            if applies {
-                if self.floor_low {
-                    // Leaving the floor: the staged level itself is the
-                    // allowance. The latched quiet cap must not jump above the
-                    // first stages, and stale busy values must not either.
-                    fraction = level;
-                    reason = if self.lift_all_roles {
-                        DecisionReason::Foreground
-                    } else {
-                        DecisionReason::TouchLift
-                    };
-                } else if fraction < level {
-                    fraction = level;
-                    reason = if self.lift_all_roles {
-                        DecisionReason::Foreground
-                    } else {
-                        DecisionReason::TouchLift
-                    };
-                }
-            }
-        }
-
-        if self.burst_until_us.is_some_and(|until| ts_us < until) {
-            let level = Self::ramp_level(self.burst_ramp, ts_us)
-                .unwrap_or(self.config.control.frame_burst_level);
-            if fraction < level {
-                fraction = level;
-                reason = DecisionReason::FrameBurst;
-            }
-        }
-
-        if cluster.role == Role::Prime {
-            fraction = fraction.min(self.config.control.prime_load_cap);
-        }
-
-        fraction = fraction.min(self.config.control.role_cap.for_role(cluster.role));
-
-        if let Some(cap) = self.thermal_cap {
-            let before = fraction;
-            fraction = fraction.min(cap);
-            if fraction < before && !is_event_driven(reason) {
-                reason = DecisionReason::Thermal;
-            }
-        }
-
-        (fraction, reason)
-    }
-
-    fn quiet_ready(&self, ts_us: u64) -> bool {
-        if !self.screen_on || !self.demands_seen {
-            return false;
-        }
-        if self.lift_until_us.is_some_and(|until| ts_us < until) {
-            return false;
-        }
-        if self.burst_until_us.is_some_and(|until| ts_us < until) {
-            return false;
-        }
-        if let Some(touch) = self.last_touch_us {
-            let decay = self.config.events.quiet_decay_ms * US_PER_MS;
-            if ts_us < touch.saturating_add(decay) {
-                return false;
-            }
-        }
-        let Some(low_since) = self.low_demand_since_us else {
-            return false;
-        };
-        let settle = self.config.control.floor_settle_ms * US_PER_MS;
-        if ts_us < low_since.saturating_add(settle) {
-            return false;
-        }
-        // `floor_low` is the latched view; the timestamp comparison covers the
-        // case where the settle window completed between two demand samples
-        // (the probe is change-driven, so a quiet device may publish no sample
-        // at the exact boundary).
-        self.floor_low || ts_us >= low_since.saturating_add(settle)
-    }
 }
 
-fn is_event_driven(reason: DecisionReason) -> bool {
-    matches!(
-        reason,
-        DecisionReason::TouchLift
-            | DecisionReason::FrameBurst
-            | DecisionReason::Foreground
-            | DecisionReason::Launch
-            | DecisionReason::Thermal
-            | DecisionReason::Quiet
-            | DecisionReason::ScreenOff
-    )
-}
-
-/// Concave load curve: compress the low band, keep reserve at the top.
-/// `g(0) = 0`, `g(1) = reserve`, continuous at 0.5.
-fn load_curve(demand: f32, quiet_ratio: f32, reserve_ratio: f32) -> f32 {
-    let demand = demand.clamp(0.0, 1.0);
-    if demand <= 0.5 {
-        quiet_ratio * demand.sqrt()
-    } else {
-        let anchor = quiet_ratio * 0.5_f32.sqrt();
-        anchor + (demand - 0.5) * 2.0 * (reserve_ratio - anchor)
+/// Reduce the hardware frequency list to a 6..10 entry ladder by picking
+/// evenly spaced entries. Small clusters (fewer frequencies) use every step.
+pub fn build_ladder(freqs: &[u32], min_khz: &u32, max_khz: &u32, max_tiers: usize) -> Vec<u32> {
+    let mut sorted: Vec<u32> = freqs.iter().copied().filter(|khz| *khz > 0).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.is_empty() {
+        sorted = vec![*min_khz, *max_khz];
+        sorted.sort_unstable();
+        sorted.dedup();
     }
+    let count = sorted.len();
+    let limit = max_tiers.clamp(6, 10);
+    if count <= limit {
+        return sorted;
+    }
+    let mut ladder = Vec::with_capacity(limit);
+    for slot in 0..limit {
+        let index = slot * (count - 1) / (limit - 1);
+        if ladder.last() != Some(&sorted[index]) {
+            ladder.push(sorted[index]);
+        }
+    }
+    ladder
 }
 
 #[cfg(test)]
-mod unit_tests {
+mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::profile::{CapacitySource, ClusterProfile, DeviceProfile};
+
+    fn profile() -> DeviceProfile {
+        DeviceProfile {
+            schema: 1,
+            platform: "test".to_owned(),
+            sdk: 34,
+            clusters: vec![
+                ClusterProfile {
+                    cpus: vec![0, 1, 2, 3],
+                    role: Role::Efficiency,
+                    min_khz: 307_200,
+                    max_khz: 2_016_000,
+                    capacity: 256,
+                    freq_khz: vec![
+                        307_200, 441_600, 576_000, 691_200, 806_400, 940_800, 1_056_000,
+                        1_171_200, 1_286_400, 1_401_600, 1_536_000, 1_708_800, 2_016_000,
+                    ],
+                    capacity_source: CapacitySource::Sysfs,
+                },
+                ClusterProfile {
+                    cpus: vec![4, 5, 6],
+                    role: Role::Balanced,
+                    min_khz: 499_200,
+                    max_khz: 2_803_200,
+                    capacity: 768,
+                    freq_khz: vec![
+                        499_200, 633_600, 768_000, 902_400, 1_036_800, 1_171_200, 1_305_600,
+                        1_440_000, 1_574_400, 1_708_800, 1_881_600, 2_227_200, 2_496_000,
+                        2_649_600, 2_803_200,
+                    ],
+                    capacity_source: CapacitySource::Sysfs,
+                },
+                ClusterProfile {
+                    cpus: vec![7],
+                    role: Role::Prime,
+                    min_khz: 595_200,
+                    max_khz: 3_360_000,
+                    capacity: 1024,
+                    freq_khz: vec![
+                        595_200, 729_600, 864_000, 998_400, 1_132_800, 1_267_200, 1_401_600,
+                        1_536_000, 1_670_400, 1_804_800, 1_977_600, 2_150_400, 2_323_200,
+                        2_496_000, 2_841_600, 3_072_000, 3_360_000,
+                    ],
+                    capacity_source: CapacitySource::Sysfs,
+                },
+            ],
+        }
+    }
+
+    fn controller() -> Controller {
+        Controller::new(profile(), Config::default())
+    }
+
+    fn demand(ts_ms: u64, busy: f32) -> DemandSample {
+        DemandSample {
+            ts_us: ts_ms * US_PER_MS,
+            cluster_busy: vec![busy; 3],
+            foreground_busy: vec![busy; 3],
+            foreground_active: busy > 0.0,
+        }
+    }
 
     #[test]
-    fn load_curve_is_continuous_and_monotone() {
-        let curve = |d: f32| load_curve(d, 0.5, 1.05);
-        let mut previous = curve(0.0);
-        let mut d = 0.01f32;
-        while d <= 1.0 {
-            let value = curve(d);
-            assert!(value >= previous, "curve must be monotone");
-            previous = value;
-            d += 0.01;
+    fn ladder_has_six_to_ten_steps_and_ends_at_hw_max() {
+        let c = controller();
+        for index in 0..3 {
+            let table = c.tier_table(index);
+            assert!((6..=10).contains(&table.len()), "cluster {index} has {} tiers", table.len());
+            assert_eq!(table[0], c.profile.clusters[index].min_khz);
+            assert_eq!(*table.last().unwrap(), c.profile.clusters[index].max_khz);
         }
-        assert!((curve(0.5) - 0.5 * 0.5f32.sqrt()).abs() < 1e-6);
-        assert!((curve(1.0) - 1.05).abs() < 1e-5);
+    }
+
+    #[test]
+    fn upward_move_is_confirmed_and_step_limited() {
+        let mut c = controller();
+        let first = c.on_demand(demand(100, 0.95));
+        assert_eq!(first[0].tier, 0, "must wait for the confirm window");
+
+        let after = c.on_demand(demand(260, 0.95));
+        for decision in &after {
+            assert!(decision.changed);
+            assert!(decision.tier <= 2, "max_up_step limits the first climb: {:?}", decision);
+            assert!(decision.tier < decision.tier_count - 1, "never jumps to the top");
+        }
+    }
+
+    #[test]
+    fn downward_move_is_rate_limited_to_one_tier() {
+        let mut c = controller();
+        // Climb first.
+        c.on_demand(demand(100, 0.9));
+        c.on_demand(demand(300, 0.9));
+        c.on_demand(demand(500, 0.9));
+        c.on_demand(demand(700, 0.9));
+        let high = c.tier(1);
+        assert!(high >= 3);
+
+        // Drop demand; the controller must not collapse in one sample.
+        let step = c.on_demand(demand(900, 0.0));
+        let tier = step[1].tier as usize;
+        assert_eq!(tier, high - 1, "one tier per down_step_ms");
+    }
+
+    #[test]
+    fn video_scene_holds_the_floor_instead_of_chasing_busy() {
+        let mut c = controller();
+        c.on_scene(1000, Scene::Video);
+        for ms in 1..10 {
+            c.on_demand(demand(1000 + ms * 100, 0.45));
+        }
+        for index in 0..3 {
+            assert_eq!(c.tier(index), 0, "video holds the calibrated floor");
+            assert_eq!(c.ceiling_khz(index), c.profile.clusters[index].min_khz);
+        }
+        assert!(c.cap_khz(0) > c.ceiling_khz(0), "cap keeps headroom");
+    }
+
+    #[test]
+    fn ime_caps_the_ladder_and_never_lifts_prime_on_touch() {
+        let mut c = controller();
+        c.on_scene(100, Scene::Ime);
+        for ms in 1..12 {
+            c.on_demand(demand(100 + ms * 100, 0.9));
+            c.on_touch(100 + ms * 100);
+        }
+        for index in 0..3 {
+            let count = c.tier_count(index);
+            let cap = (c.config().control.ime_cap_ratio * (count - 1) as f32).round() as usize;
+            assert!(c.tier(index) <= cap, "IME stays at or below mid tier");
+        }
+    }
+
+    #[test]
+    fn screen_off_returns_to_the_hardware_minimum_and_opens_the_cap() {
+        let mut c = controller();
+        c.on_demand(demand(100, 0.8));
+        c.on_demand(demand(300, 0.8));
+        let off = c.on_screen(500 * US_PER_MS, false);
+        assert!(off.iter().any(|d| d.changed));
+        assert!(c.cap_khz(2) == c.profile.clusters[2].max_khz);
+        assert!(off[0].ceiling_khz <= c.profile.clusters[0].freq_khz[2]);
+    }
+
+    #[test]
+    fn quiet_path_latches_after_settle_and_has_no_deadline() {
+        let mut c = controller();
+        c.on_screen(0, true);
+        let mut ts = 1200;
+        for _ in 0..8 {
+            ts += 200;
+            c.on_demand(demand(ts, 0.0));
+        }
+        assert!(c.is_quiet());
+        assert!(c.next_deadline(ts * US_PER_MS).is_none());
+    }
+
+    #[test]
+    fn page_turn_touch_lifts_one_tier_only() {
+        let mut c = controller();
+        c.on_scene(0, Scene::Reading);
+        for ms in 1..10 {
+            c.on_demand(demand(ms * 200, 0.0));
+        }
+        let lifted = c.on_touch(2_100 * US_PER_MS);
+        assert!(lifted.iter().any(|d| d.changed));
+        for index in 0..3 {
+            assert!(c.tier(index) <= 1, "touch adds one tier, not a jump");
+        }
     }
 }

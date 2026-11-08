@@ -1,10 +1,10 @@
-# Aegis 默认配置（自有字段，单一自适应模式）
-# 数值为本机与同类 8Gen2 标定起点，Tier B 设备由标定流程覆盖。
+# Aegis v3 默认配置（自有字段，单一自适应模式）
+# 簇数量、频率表、capacity 全部在开机时从 sysfs 推导，不针对任何 SoC 写死。
 schema = 1
 
 [daemon]
 log_level = "info"
-profile_path = "/data/adb/tempo/profile/babylon.toml"
+profile_path = "/data/adb/tempo/profile/device.toml"
 
 [events]
 # 50 ms 采样在静态页面里只是把守护唤醒 20 次/秒做一遍无事可做的决策；
@@ -60,6 +60,65 @@ step_hysteresis = 0.03
 # 0.08 表示三簇静止时仍留有约 8% 的可调度空间，min 只是允许下探的目标，
 # 永远不会把三簇同时锁死在最低频。
 parked_headroom = 0.08
+flat_ceiling_bias = 0.02
+task_fit_margin = 0.22
+max_single_burst_us = 17000
+log_cooldown_us = 70000
+pose_swap_grace_us = 10000
+
+# ---- v3 分级档位 -------------------------------------------------------------
+# 每簇档位表长度（6~10）；档位从 scaling_available_frequencies 等距抽取。
+tier_table_max = 8
+# 负载升档需要持续多久确认；降档每 45ms 只退一级，绝不一步到底/到顶。
+up_confirm_ms = 120
+down_step_ms = 45
+max_up_step = 2
+# 触摸只加一档，超大核不参与触摸抬频（输入法/长按/倍速不会冲顶）。
+touch_lift_tiers = 1
+# 启动/切换应用抬到档位表的 62%，不是顶档；期间上限放开到硬件最高。
+launch_tier_ratio = 0.62
+prime_cap_ratio = 0.70
+ime_cap_ratio = 0.45
+# 任何时刻至少保留 35% 的硬件频率跨度作为上限，避免应用启动撞顶。
+safety_ceiling_ratio = 0.35
+lookahead_tiers = 3
+# 守护启动后 20 秒内完全只读；开机阶段零写入。
+startup_guard_ms = 20000
+pressure_hold_ms = 1000
+demand_smooth_ms = 200
+
+[scene]
+# 场景地板（档位索引）。视频默认从最低档起步，出现超预算帧时自动 +1 档并
+# 保持整个会话；这就是"逐档下降直到零丢帧"的在线自动标定。
+reading_floor_tier = 0
+video_floor_tier = 0
+default_floor_tier = 0
+reading_packages = [
+    "com.dragon.read",
+    "com.tencent.weread",
+    "com.qidian.QDReader",
+    "com.ireader",
+    "com.duokan.reader",
+]
+video_packages = [
+    "tv.danmaku.bili",
+    "com.ss.android.ugc.aweme",
+    "com.ss.android.ugc.aweme.lite",
+    "com.phoenix.read",
+    "com.qiyi.video",
+    "com.tencent.qqlive",
+    "com.youku.phone",
+    "com.hunantv.imgo.activity",
+    "com.google.android.youtube",
+]
+ime_packages = [
+    "com.sohu.inputmethod.sogou",
+    "com.baidu.input",
+    "com.iflytek.inputmethod",
+    "com.google.android.inputmethod.latin",
+    "com.miui.inputmethod",
+    "com.tencent.wetype",
+]
 
 [control.role_cap]
 efficiency = 1.00

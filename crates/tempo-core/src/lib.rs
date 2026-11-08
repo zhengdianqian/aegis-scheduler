@@ -15,7 +15,7 @@ pub use charge::{
 };
 pub use config::{Config, LogLevel, SCHEMA_VERSION};
 pub use controller::{
-    Controller, Deadline, DeadlineKind, Decision, DecisionReason, DemandSample, FrameSample,
+    Controller, Deadline, DeadlineKind, Decision, DecisionReason, DemandSample, FrameSample, Scene,
 };
 pub use profile::{CapacitySource, ClusterProfile, DeviceProfile, LiveCluster, LiveTopology, Role};
 

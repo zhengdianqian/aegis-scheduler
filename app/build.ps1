@@ -25,12 +25,27 @@ $deliveryApk = Join-Path $deliveryDir "Aegis-v$versionName.apk"
 # 1. Regenerate the static WebUI bundle from sources.
 & (Join-Path $webuiRoot 'build.ps1')
 
-# 2. Mirror the bundle into Android assets.
+# 2. Mirror the bundle into Android assets and prove both trees are byte-identical.
 if (-not (Test-Path $webuiDist)) { throw "missing webui dist: $webuiDist" }
 if (Test-Path $assets) { Remove-Item -Path $assets -Recurse -Force }
 New-Item -ItemType Directory -Path $assets | Out-Null
 Get-ChildItem -Path $webuiDist -File | ForEach-Object {
   Copy-Item -Path $_.FullName -Destination (Join-Path $assets $_.Name) -Force
+}
+
+$distFiles = Get-ChildItem -Path $webuiDist -File
+$assetFiles = Get-ChildItem -Path $assets -File
+if ($distFiles.Count -ne $assetFiles.Count) {
+  throw "assets/webui 文件数与 dist 不一致：$($assetFiles.Count) vs $($distFiles.Count)"
+}
+foreach ($file in $distFiles) {
+  $assetPath = Join-Path $assets $file.Name
+  if (-not (Test-Path $assetPath)) { throw "assets/webui 缺少文件：$($file.Name)" }
+  $distHash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash
+  $assetHash = (Get-FileHash -Path $assetPath -Algorithm SHA256).Hash
+  if ($distHash -ne $assetHash) {
+    throw "assets/webui/$($file.Name) 与 dist 哈希不一致"
+  }
 }
 
 # 3. Locate Gradle: $env:GRADLE wins, then the local wrapper install, then PATH.
@@ -95,6 +110,9 @@ if (-not $certDn) { throw "apksigner 未返回证书 DN：`n$verifyOutput" }
 if ($certDn -match 'CN=Android Debug' -or $certSha256 -eq 'a3ef110785845814615dfa224e0e3e79f43fe1427d854463296e3bd9eccd0e4d') {
   throw "产物使用了 debug 证书，拒绝发布：$certDn"
 }
+if ($certDn -notmatch 'CN=Aegis') {
+  throw "产物证书不是 Aegis 正式证书，拒绝发布：$certDn"
+}
 
 $scheme = @{}
 foreach ($line in ($verifyOutput -split "`r?`n")) {
@@ -115,6 +133,12 @@ $packageLine = ([regex]::Match($badging, "package: name='([^']+)' versionCode='(
 $packageName = $packageLine[1].Value
 $versionCode = $packageLine[2].Value
 $apkVersionName = $packageLine[3].Value
+if ($packageName -ne 'com.aegis.scheduler') {
+  throw "APK 包名 $packageName 与 com.aegis.scheduler 不一致"
+}
+if ($versionCode -ne '13') {
+  throw "APK versionCode=$versionCode 与 v3.0 约定的 13 不一致"
+}
 if ($apkVersionName -ne $versionName) {
   throw "APK versionName=$apkVersionName 与 Gradle 配置 $versionName 不一致"
 }

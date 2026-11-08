@@ -17,7 +17,7 @@
     fas: '/data/adb/tempo/fas.json',
     chargePlan: '/data/adb/tempo/charge_plan.json',
     labels: '/data/adb/tempo/labels.json',
-    profile: '/data/adb/tempo/profile/babylon.toml',
+    profile: '/data/adb/tempo/profile/device.toml',
     socket: '/data/adb/tempo/run/control.sock',
     logdir: '/data/adb/tempo/log',
     moduleProp: '/data/adb/modules/aegis_scheduler/module.prop',
@@ -54,6 +54,51 @@
       throw new Error('响应不是 JSON');
     }
     return JSON.parse(raw.slice(start, end + 1));
+  }
+
+  /** 解析 /proc/stat 的 cpuN 行：total 为前 8 个计数之和，idle 含 iowait。 */
+  function parseCpuStat(block) {
+    var cpus = {};
+    text(block).split(/\r?\n/).forEach(function (row) {
+      var line = row.trim();
+      if (!line) return;
+      var parts = line.split(/\s+/);
+      var name = parts[0];
+      if (!/^cpu\d+$/.test(name)) return;
+      var values = parts.slice(1).map(Number);
+      if (values.length < 4) return;
+      var total = 0;
+      for (var index = 0; index < 8; index += 1) {
+        total += isFinite(values[index]) ? values[index] : 0;
+      }
+      var idle = (isFinite(values[3]) ? values[3] : 0) + (isFinite(values[4]) ? values[4] : 0);
+      cpus[name.slice(3)] = { total: total, idle: idle };
+    });
+    return cpus;
+  }
+
+  /** 按簇聚合各 CPU 的 total/idle 差值；任一 CPU 缺数据时该簇返回 null。 */
+  function clusterUsage(clusters, before, after) {
+    return clusters.map(function (cluster) {
+      var cpus = Array.isArray(cluster && cluster.cpus) ? cluster.cpus : [];
+      if (!cpus.length) return null;
+      var total = 0;
+      var idle = 0;
+      for (var index = 0; index < cpus.length; index += 1) {
+        var key = String(cpus[index]);
+        var first = before[key];
+        var second = after[key];
+        if (!first || !second) return null;
+        var totalDelta = second.total - first.total;
+        var idleDelta = second.idle - first.idle;
+        if (totalDelta <= 0 || idleDelta < 0) return null;
+        total += totalDelta;
+        idle += idleDelta;
+      }
+      if (total <= 0) return null;
+      var usage = (total - idle) / total;
+      return usage < 0 ? 0 : (usage > 1 ? 1 : usage);
+    });
   }
 
   function TempoApi(shell) {
@@ -111,7 +156,6 @@
     var command = [
       '"' + binary + '"',
       '--config', PATHS.config,
-      '--profile', PATHS.profile,
       'status',
       '--socket', PATHS.socket,
       '2>&1'
@@ -142,7 +186,6 @@
     var command = [
       '"' + binary + '"',
       '--config', PATHS.config,
-      '--profile', PATHS.profile,
       'power',
       '--socket', PATHS.socket,
       '2>&1'
@@ -187,6 +230,55 @@
       return pairs.map(function (pair) { return pair.khz; });
     }).catch(function () {
       return [];
+    });
+  };
+
+  /**
+   * 固定窗口采样每簇占用率：读两次 /proc/stat，按 CPU 的 idle 差值聚合到簇。
+   * 只在进入页面或用户刷新时调用一次，不做定时轮询；失败返回 null 数组，不伪造。
+   */
+  TempoApi.prototype.queryUsage = function (clusters) {
+    var self = this;
+    if (!Array.isArray(clusters) || !clusters.length) {
+      return Promise.resolve({ values: [], windowMs: 0, error: null });
+    }
+    var command =
+      'a=$(cut -d" " -f1 /proc/uptime 2>/dev/null); ' +
+      'cat /proc/stat 2>/dev/null; ' +
+      'echo __AEGIS_SPLIT__; ' +
+      'sleep 0.5 2>/dev/null || sleep 1; ' +
+      'cat /proc/stat 2>/dev/null; ' +
+      'b=$(cut -d" " -f1 /proc/uptime 2>/dev/null); ' +
+      'echo "__AEGIS_WINDOW__ $a $b"';
+
+    return self._exec(command, 9000).then(function (result) {
+      var output = text(result.stdout);
+      var marker = output.indexOf('__AEGIS_SPLIT__');
+      if (marker === -1) {
+        throw new Error('占用采样窗口未完成');
+      }
+      var before = parseCpuStat(output.slice(0, marker));
+      var tail = output.slice(marker + '__AEGIS_SPLIT__'.length);
+      var windowLine = '';
+      var windowAt = tail.indexOf('__AEGIS_WINDOW__');
+      if (windowAt !== -1) {
+        windowLine = tail.slice(windowAt + '__AEGIS_WINDOW__'.length).trim();
+        tail = tail.slice(0, windowAt);
+      }
+      var after = parseCpuStat(tail);
+      var values = clusterUsage(clusters, before, after);
+      var windowMs = 500;
+      var bounds = windowLine.split(/\s+/).map(Number);
+      if (isFinite(bounds[0]) && isFinite(bounds[1]) && bounds[1] > bounds[0]) {
+        windowMs = Math.round((bounds[1] - bounds[0]) * 1000);
+      }
+      return { values: values, windowMs: windowMs, error: null };
+    }).catch(function (error) {
+      return {
+        values: clusters.map(function () { return null; }),
+        windowMs: 500,
+        error: shorten(error.message, 140)
+      };
     });
   };
 
@@ -473,7 +565,6 @@
     var command = [
       '"' + binary + '"',
       '--config', '"' + PATHS.config + '"',
-      '--profile', '"' + PATHS.profile + '"',
       'config 2>&1'
     ].join(' ');
 
@@ -499,7 +590,6 @@
     var command = [
       '"' + binary + '"',
       '--config', '"' + target + '"',
-      '--profile', '"' + PATHS.profile + '"',
       'validate 2>&1'
     ].join(' ');
 
@@ -629,16 +719,29 @@
       if (statusResult.error) {
         errors.push(statusResult.error);
       }
+      var status = statusResult.status;
+      var clusters = status && Array.isArray(status.clusters) ? status.clusters : [];
+      var actual = status && Array.isArray(status.actual_freq_khz) &&
+        status.actual_freq_khz.length === clusters.length
+        ? status.actual_freq_khz
+        : null;
+
       return Promise.all([
-        self.queryFrequencies(),
+        actual ? Promise.resolve(actual) : self.queryFrequencies().then(function (freqs) {
+          return clusters.length ? freqs.slice(0, clusters.length) : freqs;
+        }),
+        self.queryUsage(clusters),
         self.queryModule()
       ]).then(function (rest) {
         return {
           source: self.kind(),
           binary: binary,
-          status: statusResult.status,
-          freqs: rest[0],
-          module: rest[1],
+          status: status,
+          freqs: rest[0] || [],
+          usage: rest[1].values || [],
+          usageWindowMs: rest[1].windowMs || 0,
+          usageError: rest[1].error || null,
+          module: rest[2],
           errors: errors
         };
       });

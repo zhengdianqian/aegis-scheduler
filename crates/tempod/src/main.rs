@@ -24,8 +24,6 @@ mod power;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod launch;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod mask;
-#[cfg(any(target_os = "linux", target_os = "android"))]
 mod probe;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod screen;

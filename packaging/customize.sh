@@ -13,3 +13,4 @@ fi
 mkdir -p /data/adb/tempo/run /data/adb/tempo/profile
 chmod 700 /data/adb/tempo/run
 chmod 755 "$MODDIR/bin/Aegis" "$MODDIR/bin/tempoctl" 2>/dev/null
+chmod 755 "$MODDIR"/*.sh "$MODDIR"/scripts/*.sh 2>/dev/null

@@ -214,6 +214,15 @@
     var mock = this.mock;
     return new Promise(function (resolve) {
       global.setTimeout(function () {
+        if (command.indexOf('__AEGIS_SPLIT__') !== -1) {
+          resolve({
+            code: 0,
+            stdout: mock.cpuStatA.join('\n') + '\n__AEGIS_SPLIT__\n' +
+              mock.cpuStatB.join('\n') + '\n__AEGIS_WINDOW__ 100.000 100.500\n',
+            stderr: ''
+          });
+          return;
+        }
         if (command.indexOf("<<'AEGIS_PLAN_EOF'") !== -1) {
           var planStart = command.indexOf('\n') + 1;
           var planEnd = command.indexOf('AEGIS_PLAN_EOF', planStart);

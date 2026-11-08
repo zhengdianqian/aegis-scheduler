@@ -14,19 +14,18 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
-use tempo_core::controller::{Controller, Decision, DemandSample, FrameSample};
+use tempo_core::controller::{Controller, Decision, DemandSample, FrameSample, Scene};
 use tempo_core::{Config, DeviceProfile};
 
 use crate::charge::ChargeWatcher;
 use crate::fas::FasCollector;
 use crate::foreground::ForegroundResolver;
 use crate::ipc::{self, ControlContext, Outcome, RuntimeStatus};
-use crate::launch::{self, LaunchEvents, WakePipe};
-use crate::mask::{MaskControl, MaskWindow};
+use crate::launch::{self, WakePipe};
 use crate::power;
 use crate::probe::{self, ProbeSession};
 use crate::screen::ScreenWatcher;
@@ -45,13 +44,11 @@ const CONFIG_WATCH: Token = Token(13);
 const VERIFY: Token = Token(14);
 const CEILING_TIMER: Token = Token(15);
 const WAKE: Token = Token(100);
-/// The pin is released while anything is happening (launch, touch, screen on)
-/// and restored only when the controller itself reports that the system has
-/// settled. Re-pinning a floor while a launch or a load phase is still running
-/// stalls that application: WeChat was seen dying 1.4 s after a remount that
-/// landed mid-start, and deadlocking for minutes at the old 1 s window.
-const MASK_QUIET_HOLD_US: u64 = 1_000_000;
-/// 静默期只做低频率的安全校正。事件提交本身已经维护上限；3 秒一次只会
+/// The writer stays read-only for this long after daemon start, so no cpufreq
+/// write can ever happen during boot or the first unlock (the two historical
+/// boot-hang triggers). After the guard the first ladder state is applied.
+const STARTUP_APPLY_DELAY_US: u64 = 25_000_000;
+/// 静默期只做低频率的安全校正。事件提交本身已经维护上限；15 秒一次只会
 /// 在厂商地板抖动时反复重写 scaling_max_freq（~1 次/秒，每次 ~10 ms 系统
 /// 时间），既耗 CPU 又制造周期性卡顿。
 const CEILING_INTERVAL_US: u64 = 15_000_000;
@@ -135,7 +132,7 @@ pub fn run(
     // The writer is the only component that touches cpufreq. Without the
     // capability the daemon stays observe-only rather than writing blind.
     let mut writer = if apply {
-        match CpufreqWriter::discover(&profile, config.control.ceiling_headroom) {
+        match CpufreqWriter::discover(&profile, config.control.safety_ceiling_ratio) {
             Ok(writer) => {
                 let backup = writer.backup_json();
                 let _ = std::fs::write(run_dir.join("cpufreq-backup.json"), backup);
@@ -157,19 +154,10 @@ pub fn run(
         None
     };
 
-    // Launch window. The floor pin makes the static state cheap, but a pinned
-    // floor also hides the vendor's launch boost. The pin is therefore released
-    // as soon as an activity start, touch or screen-on says the user needs
-    // performance, and restored only when the controller reports the system has
-    // settled. Remounting during a launch is what stalled applications, so the
-    // window follows demand instead of a timer.
-    let mut mask_window = MaskWindow::new(if apply {
-        MaskControl::discover(&profile)
-    } else {
-        None
-    });
-    if mask_window.is_tracked() {
-        tracing::info!("floor pin detected; launch window control armed");
+    // v3 has no floor pin. The writer opens with a read-only guard so the
+    // module can never write cpufreq during boot or the first unlock.
+    if let Some(writer) = writer.as_mut() {
+        writer.arm_guard(Duration::from_millis(config.control.startup_guard_ms));
     }
     let mut wake = WakePipe::new().map_err(|error| context("create wake pipe", error))?;
     poll.registry()
@@ -198,13 +186,11 @@ pub fn run(
     let screen_on = screen.as_ref().map(ScreenWatcher::is_on).unwrap_or(true);
     let screen_decisions = controller.on_screen(now_us(), screen_on);
     commit(&screen_decisions, &mut writer, &status);
-    // One-shot re-assert twenty seconds after the first write. A vendor writer
-    // can raise `scaling_min_freq` in the seconds after boot; re-applying the
-    // ceiling once guarantees the cluster is not left at max==min until the
-    // next real event. It is a single timer, never a periodic one.
-    let startup_decisions = screen_decisions;
+    // One-shot re-assert after the guard expires. A vendor writer can move the
+    // nodes in the seconds after boot; re-evaluating once makes sure the live
+    // state matches the ladder. It is a single timer, never a periodic one.
     let mut verify_retries = 0u8;
-    verify_timer.arm(now_us() + 20_000_000);
+    verify_timer.arm(now_us() + 25_000_000);
     ceiling_timer.arm(now_us() + CEILING_INTERVAL_US);
     if let Ok(mut state) = status.lock() {
         state.screen_on = screen_on;
@@ -371,14 +357,9 @@ pub fn run(
     // keeps producing work, so "draw shell first, load content later" apps
     // are not decayed during their real compute phase.
     let mut launch_until_us: u64 = 0;
-    // Last activity start consumed by the mask window, so one launch does not
+    // Last activity start consumed by the launch logic, so one launch does not
     // reopen the same window on every wake.
     let mut last_start_us: u64 = 0;
-    // Latest demand of any kind (start / touch / screen-on). The pin must not
-    // be restored while a vendor touch boost is still running, otherwise the
-    // boost writes the ceiling back up right after the cap.
-    let mut last_demand_us: u64 = 0;
-    publish_mask(&mask_window, &status);
 
     loop {
         poll.poll(&mut events, None)?;
@@ -460,6 +441,20 @@ pub fn run(
                                         sample.ts_us,
                                     );
                                 }
+                                // Workload class: reading / video / IME change
+                                // the floor and cap policy, not just the load.
+                                let scene = scene_of(foreground.package(), &config);
+                                if let Ok(mut state) = status.lock() {
+                                    state.scene = scene.as_str().to_owned();
+                                }
+                                let scene_decisions = controller.on_scene(sample.ts_us, scene);
+                                if !scene_decisions.is_empty() {
+                                    commit(&scene_decisions, &mut writer, &status);
+                                    match controller.next_deadline(sample.ts_us) {
+                                        Some(deadline) => deadline_source.arm(deadline.at_us),
+                                        None => deadline_source.disarm(),
+                                    }
+                                }
                             }
                             let was_quiet = controller.is_quiet();
                             let mut decisions = controller.on_demand(DemandSample {
@@ -503,17 +498,6 @@ pub fn run(
                                     if let Ok(mut state) = status.lock() {
                                         state.launch_lifts += 1;
                                     }
-                                    // Fallback when the framework log stream is
-                                    // unavailable: the probe's own edge still
-                                    // releases the pin, just a quantum later.
-                                    if mask_window.is_tracked() && !mask_window.is_open() {
-                                        last_demand_us = sample.ts_us;
-                                        open_mask_window(
-                                            &mut mask_window,
-                                            sample.ts_us,
-                                            &status,
-                                        );
-                                    }
                                     tracing::debug!(fg_peak, "app launch edge: launch lift");
                                 }
                             }
@@ -521,19 +505,8 @@ pub fn run(
                             if !idle_now {
                                 record(&status, &decisions, Some(&sample), Some(quiet));
                             }
+                            update_usage(&status, &sample);
                             commit(&decisions, &mut writer, &status);
-                            // The pin returns only after the controller says the
-                            // system has settled and no demand of any kind is
-                            // still fresh. Closing while a vendor touch boost is
-                            // active would let that boost write the ceiling back
-                            // up immediately after the cap.
-                            let settle_us = last_start_us.max(last_demand_us);
-                            if mask_window.is_tracked()
-                                && quiet
-                                && sample.ts_us.saturating_sub(settle_us) >= MASK_QUIET_HOLD_US
-                            {
-                                close_mask_window(&mut mask_window, &status);
-                            }
                             // Thermal guard is sampled on demand events only,
                             // throttled to 1.5 s: no timer, no busy loop, and
                             // far fewer QMI sensor transactions at idle.
@@ -579,17 +552,10 @@ pub fn run(
                         if on {
                             // Unlock animation and the first screen after wake
                             // need the vendor's boost just like a launch.
-                            last_demand_us = at_us;
-                            if mask_window.is_tracked() && !mask_window.is_open() {
-                                open_mask_window(&mut mask_window, at_us, &status);
-                            }
                             refresh_fas(&config, &foreground, &mut fas, &status, true);
                             if let Some(collector) = fas.as_mut() {
                                 collector.request(foreground.package().unwrap_or(""), at_us);
                             }
-                        } else if !mask_window.is_capped() && mask_window.is_tracked() {
-                            // Nothing is being drawn; give the floor back at once.
-                            close_mask_window(&mut mask_window, &status);
                         }
                         match controller.next_deadline(at_us) {
                             Some(deadline) => deadline_source.arm(deadline.at_us),
@@ -683,9 +649,6 @@ pub fn run(
                                 != startup_profile_path
                                 || parsed.daemon.log_level != startup_log_level;
                             config = parsed;
-                            if let Some(writer) = writer.as_mut() {
-                                writer.set_ceiling_headroom(config.control.ceiling_headroom);
-                            }
                             controller = Controller::new(profile.clone(), config.clone());
                             let decisions = controller.on_screen(now_us(), screen_on);
                             commit(&decisions, &mut writer, &status);
@@ -743,12 +706,7 @@ pub fn run(
                     }
                     if batch.downs > 0 || batch.moves > 0 {
                         // A touch is the earliest visible sign that the user
-                        // needs the vendor's boost again: release the pin now,
-                        // it costs a few micro- and microseconds to remount.
-                        last_demand_us = at_us;
-                        if mask_window.is_tracked() && !mask_window.is_open() {
-                            open_mask_window(&mut mask_window, at_us, &status);
-                        }
+                        // needs a lift; the controller adds exactly one tier.
                         // Pick up a WebUI change to the FAS list immediately:
                         // the user toggling the switch should not have to switch
                         // apps before the probe starts.
@@ -779,23 +737,12 @@ pub fn run(
 
             if token == VERIFY {
                 verify_timer.drain();
-                if let Some(writer) = writer.as_mut() {
-                    let _ = writer.apply(&startup_decisions);
-                }
-                if let Ok(mut state) = status.lock() {
-                    state.writes = writer.as_ref().map(CpufreqWriter::applied).unwrap_or(0);
-                    state.cap_writes = writer
-                        .as_ref()
-                        .map(CpufreqWriter::cap_writes)
-                        .unwrap_or(0);
-                    state.floor_writes = writer
-                        .as_ref()
-                        .map(CpufreqWriter::floor_writes)
-                        .unwrap_or(0);
-                    state.rejected_floor = writer
-                        .as_ref()
-                        .map(CpufreqWriter::rejected_floor)
-                        .unwrap_or(0);
+                let at_us = now_us();
+                let decisions = controller.on_deadline(at_us);
+                commit(&decisions, &mut writer, &status);
+                match controller.next_deadline(at_us) {
+                    Some(deadline) => deadline_source.arm(deadline.at_us),
+                    None => deadline_source.disarm(),
                 }
                 // A late vendor write can still park a policy on its minimum.
                 // Re-check once more; this remains a bounded one-shot, not a
@@ -803,7 +750,7 @@ pub fn run(
                 let locked = writer.as_ref().map(CpufreqWriter::is_locked).unwrap_or(false);
                 if locked && verify_retries < 2 {
                     verify_retries += 1;
-                    verify_timer.arm(now_us() + 20_000_000);
+                    verify_timer.arm(now_us() + 25_000_000);
                 }
                 continue;
             }
@@ -848,10 +795,14 @@ pub fn run(
                 wake.drain();
                 if let Some(events) = launch_events.as_ref() {
                     let start_us = events.start_us();
-                    if start_us > last_start_us && mask_window.is_tracked() {
+                    if start_us > last_start_us {
                         last_start_us = start_us;
-                        last_demand_us = start_us;
-                        open_mask_window(&mut mask_window, start_us, &status);
+                        let decisions = controller.on_app_launch(start_us);
+                        commit(&decisions, &mut writer, &status);
+                        match controller.next_deadline(start_us) {
+                            Some(deadline) => deadline_source.arm(deadline.at_us),
+                            None => deadline_source.disarm(),
+                        }
                     }
                 }
                 continue;
@@ -890,9 +841,6 @@ pub fn run(
                             let (text, outcome) = ipc::handle(&mut context, &line);
                             responses.push(text);
                             if outcome == Outcome::Reloaded {
-                                if let Some(writer) = writer.as_mut() {
-                                    writer.set_ceiling_headroom(config.control.ceiling_headroom);
-                                }
                                 controller = Controller::new(profile.clone(), config.clone());
                                 let decisions = controller.on_screen(now_us(), screen_on);
                                 commit(&decisions, &mut writer, &status);
@@ -1014,47 +962,36 @@ fn refresh_fas(
     tracing::debug!(package, eligible, "fas eligibility updated");
 }
 
-/// Releases the floor pin so the vendor stack owns the launch exactly as it
-/// does without the module. Called on an activity start (framework log), a
-/// touch, screen-on, or the probe's own launch edge when the log stream is
-/// unavailable.
-fn open_mask_window(
-    window: &mut MaskWindow,
-    at_us: u64,
-    status: &Arc<Mutex<RuntimeStatus>>,
-) {
-    let opened = window.open();
-    publish_mask(window, status);
-    if opened {
-        tracing::info!(
-            at_us,
-            unmask_us = window.unmask_us(),
-            windows = window.opens(),
-            "demand window opened: floor pin released"
-        );
+/// Maps the foreground package to a workload class. Unknown packages are
+/// `Default`, which never lowers a floor and never caps a cluster.
+pub(crate) fn scene_of(package: Option<&str>, config: &Config) -> Scene {
+    let Some(package) = package else {
+        return Scene::Default;
+    };
+    if config.scene.ime_packages.iter().any(|app| app == package) {
+        Scene::Ime
+    } else if config.scene.video_packages.iter().any(|app| app == package) {
+        Scene::Video
+    } else if config.scene.reading_packages.iter().any(|app| app == package) {
+        Scene::Reading
+    } else {
+        Scene::Default
     }
 }
 
-/// Writes the hardware minimum back, re-binds the mask and lowers the ceiling.
-fn close_mask_window(window: &mut MaskWindow, status: &Arc<Mutex<RuntimeStatus>>) {
-    let took = window.close();
-    publish_mask(window, status);
-    if took > 0 {
-        tracing::info!(
-            remask_us = took,
-            windows = window.opens(),
-            "demand window closed: floor pin restored"
-        );
-    }
-}
-
-fn publish_mask(window: &MaskWindow, status: &Arc<Mutex<RuntimeStatus>>) {
+/// Fixed-window usage estimate for the WebUI. The probe already publishes a
+/// real per-cluster busy ratio every quantum; this keeps a smoothed copy so a
+/// page refresh shows a stable "sampled" value instead of random noise.
+fn update_usage(status: &Arc<Mutex<RuntimeStatus>>, sample: &probe::DemandSnapshot) {
     if let Ok(mut state) = status.lock() {
-        state.mask_tracked = window.is_tracked();
-        state.mask_open = window.is_open();
-        state.mask_windows = window.opens();
-        state.mask_unmask_us = window.unmask_us();
-        state.mask_remask_us = window.remask_us();
+        if state.usage.len() != sample.busy.len() {
+            state.usage = sample.busy.clone();
+        } else {
+            for (slot, busy) in state.usage.iter_mut().zip(sample.busy.iter()) {
+                *slot += (busy.clamp(0.0, 1.0) - *slot) * 0.35;
+            }
+        }
+        state.usage_sampled_us = sample.ts_us;
     }
 }
 
@@ -1064,11 +1001,13 @@ fn commit(
     status: &Arc<Mutex<RuntimeStatus>>,
 ) {
     let mut error = None;
-    // Steady state: every decision still carries the same ceiling/floor, so a
-    // write pass would only re-read the same nodes. Apply only when at least one
-    // cluster actually moved; the periodic ceiling reconcile and the quiet
-    // transition cover vendor-side drift.
-    if decisions.iter().any(|decision| decision.changed) {
+    // Steady state: every decision still carries the same target/cap, so a
+    // write pass would only re-read the same nodes. Apply when a cluster moved,
+    // when the read-only startup guard just expired, or on the slow reconcile.
+    let initial = writer
+        .as_ref()
+        .is_some_and(CpufreqWriter::needs_initial_apply);
+    if initial || decisions.iter().any(|decision| decision.changed) {
         if let Some(writer) = writer.as_mut() {
             if let Err(problem) = writer.apply(decisions) {
                 error = Some(problem);
@@ -1090,6 +1029,7 @@ fn commit(
             .as_ref()
             .map(CpufreqWriter::rejected_floor)
             .unwrap_or(0);
+        state.guard_active = writer.as_ref().is_some_and(CpufreqWriter::guard_active);
         state.write_error = error;
     }
 }

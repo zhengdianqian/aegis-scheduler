@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '2.4';
+  var APP_VERSION = '3.0';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -25,6 +25,7 @@
     touch_lift: '触摸抬频',
     frame_burst: '帧突发',
     foreground: '前台',
+    launch: '启动',
     load: '负载',
     thermal: '热限',
     unchanged: '保持'
@@ -212,15 +213,39 @@
     return seconds + '秒';
   }
 
+  /** 按连续区间显示 CPU 编号，适配 2/3/4 簇及不连续的核集合。 */
   function cpuRange(cpus) {
     if (!Array.isArray(cpus) || !cpus.length) return '—';
-    var sorted = cpus.slice().sort(function (a, b) { return a - b; });
-    if (sorted.length === 1) return 'CPU ' + sorted[0];
-    return 'CPU ' + sorted[0] + '–' + sorted[sorted.length - 1];
+    var sorted = cpus.map(Number).filter(function (cpu) {
+      return isFinite(cpu);
+    }).sort(function (a, b) { return a - b; });
+    if (!sorted.length) return '—';
+    var ranges = [];
+    var start = sorted[0];
+    var previous = sorted[0];
+    for (var index = 1; index < sorted.length; index += 1) {
+      if (sorted[index] === previous + 1) {
+        previous = sorted[index];
+        continue;
+      }
+      ranges.push(start === previous ? String(start) : start + '–' + previous);
+      start = sorted[index];
+      previous = sorted[index];
+    }
+    ranges.push(start === previous ? String(start) : start + '–' + previous);
+    return 'CPU ' + ranges.join(', ');
   }
 
   function roleMeta(role) {
-    return ROLE[role] || { label: String(role || '未知'), color: '#93a3b8' };
+    return ROLE[role] || { label: '核心', color: '#93a3b8' };
+  }
+
+  /** 采样窗口文案：界面明确标注占用率为固定窗口采样值。 */
+  function usageNote(data) {
+    if (data && data.usageError) return '占用采样不可用';
+    var ms = Number(data && data.usageWindowMs);
+    if (!isFinite(ms) || ms <= 0) return '';
+    return '近 ' + (ms / 1000).toFixed(1) + 's 采样';
   }
 
   function sourceLabel(kind) {
@@ -297,7 +322,7 @@
     var mode = running ? '自适应调度' : '等待连接';
     var quiet = running && status.control && status.control.quiet;
     var uptime = running ? formatDuration(status.uptime_ms) : '--';
-    var version = APP_VERSION;
+    var version = 'v' + APP_VERSION;
 
     return '' +
       '<section class="card hero">' +
@@ -331,6 +356,11 @@
       })[0] || null;
     }
     var ceiling = decision && decision.ceiling_khz ? decision.ceiling_khz : cluster.min_khz;
+    var cap = decision && decision.cap_khz ? decision.cap_khz : cluster.max_khz;
+    var tier = Number.isFinite(Number(cluster.tier)) ? Number(cluster.tier) : null;
+    var tierCount = Number.isFinite(Number(cluster.tier_count))
+      ? Number(cluster.tier_count)
+      : (Array.isArray(cluster.tiers) ? cluster.tiers.length : null);
     var current = state.data.freqs[index];
     var hasCurrent = isFinite(Number(current)) && Number(current) > 0;
     var span = Math.max(1, Number(cluster.max_khz) - Number(cluster.min_khz));
@@ -338,7 +368,12 @@
       ? clamp01((Number(current) - Number(cluster.min_khz)) / span)
       : 0;
     var pct = Math.max(ratio * 100, hasCurrent ? 1.5 : 0);
-    var reasonLabel = decision ? (REASON[decision.reason] || decision.reason) : '—';
+    var reasonLabel = decision ? (REASON[decision.reason] || '保持') : '—';
+
+    var usage = state.data && Array.isArray(state.data.usage) ? state.data.usage[index] : null;
+    var hasUsage = typeof usage === 'number' && isFinite(usage);
+    var usagePct = hasUsage ? Math.round(clamp01(usage) * 100) : 0;
+    var hasForeground = typeof cluster.foreground === 'number' && isFinite(cluster.foreground);
 
     return '' +
       '<article class="card cluster" style="--role:' + role.color + '">' +
@@ -356,12 +391,15 @@
             '</div>' +
           '</div>' +
           '<div class="stats">' +
-            '<div class="stats__row"><span>上限</span><b>' + formatGhz(ceiling) + ' GHz</b></div>' +
+            '<div class="stats__row"><span>目标</span><b>' + formatGhz(ceiling) + ' GHz' + (tier !== null && tierCount ? ' · ' + (tier + 1) + '/' + tierCount : '') + '</b></div>' +
+            '<div class="stats__row"><span>上限</span><b>' + formatGhz(cap) + ' GHz</b></div>' +
             '<div class="stats__row"><span>区间</span><b>' + formatGhz(cluster.min_khz) + ' – ' + formatGhz(cluster.max_khz) + '</b></div>' +
             '<div class="stats__row"><span>容量</span><b>' + escapeHtml(cluster.capacity) + '</b></div>' +
             '<div class="bars">' +
-              '<div class="bar"><span>负载</span><i style="width:' + formatPercent(cluster.busy) + '"></i><em>' + formatPercent(cluster.busy) + '</em></div>' +
-              '<div class="bar bar--fg"><span>前台</span><i style="width:' + formatPercent(cluster.foreground) + '"></i><em>' + formatPercent(cluster.foreground) + '</em></div>' +
+              '<div class="bar bar--usage"><span>占用·采样</span><i style="width:' + usagePct + '%"></i><em>' + (hasUsage ? formatPercent(usage) : '--') + '</em></div>' +
+              (hasForeground
+                ? '<div class="bar bar--fg"><span>前台</span><i style="width:' + formatPercent(cluster.foreground) + '"></i><em>' + formatPercent(cluster.foreground) + '</em></div>'
+                : '') +
             '</div>' +
           '</div>' +
         '</div>' +
@@ -385,14 +423,21 @@
       ? clusters.map(function (cluster, index) {
           return renderCluster(cluster, index);
         }).join('')
-      : '<section class="card empty"><p>未能读取设备簇信息，暂不展示频率与上限。</p></section>';
+      : '<section class="card empty">' +
+          '<h2>暂无簇信息</h2>' +
+          '<p>设备未上报簇数据，请确认调度服务正在运行后重试。</p>' +
+          '<button class="ghost-btn empty__action" data-action="refresh">重新读取</button>' +
+        '</section>';
+    var sample = usageNote(data);
 
     return '' +
       renderNotices(notices) +
       renderHero(data) +
       (vendorSuppressed(data.status) ? '<div class="vendor-line">厂商调度已屏蔽</div>' : '') +
       (clusters.length
-        ? '<div class="section-title"><h2>簇状态</h2><span>' + escapeHtml(clusters.length) + ' 簇 · 实时</span></div>' + clusterHtml
+        ? '<div class="section-title"><h2>簇状态</h2><span>' +
+            escapeHtml(clusters.length) + ' 簇 · 实时' + (sample ? ' · ' + escapeHtml(sample) : '') +
+          '</span></div>' + clusterHtml
         : clusterHtml) +
       renderFooter(data);
   }

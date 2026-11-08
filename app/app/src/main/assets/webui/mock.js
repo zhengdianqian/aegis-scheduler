@@ -11,10 +11,10 @@
     status: {
       ok: true,
       service: 'Aegis',
-      version: '2.3',
-      stage: 'P2-observe-only',
-      mode: 'observe-only',
-      scheduler_writes: false,
+      version: '3.0',
+      stage: 'active',
+      mode: 'adaptive',
+      scheduler_writes: true,
       schema: 1,
       platform: 'kalama',
       sdk: 36,
@@ -84,6 +84,29 @@
       updated_ms: 0
     }, null, 2) + '\n',
     freqLines: ['0 307200', '1 499200', '2 595200'],
+    /* 固定 /proc/stat 快照：间隔 0.5s，三簇占用分别约 20% / 35% / 6%，仅用于离线演示。 */
+    cpuStatA: [
+      'cpu  900000 0 0 8100000 0 0 0 0',
+      'cpu0 100000 0 0 900000 0 0 0 0',
+      'cpu1 100000 0 0 900000 0 0 0 0',
+      'cpu2 100000 0 0 900000 0 0 0 0',
+      'cpu3 100000 0 0 900000 0 0 0 0',
+      'cpu4 100000 0 0 900000 0 0 0 0',
+      'cpu5 100000 0 0 900000 0 0 0 0',
+      'cpu6 100000 0 0 900000 0 0 0 0',
+      'cpu7 100000 0 0 900000 0 0 0 0'
+    ],
+    cpuStatB: [
+      'cpu  900750 0 0 8109885 0 0 0 0',
+      'cpu0 100100 0 0 900400 0 0 0 0',
+      'cpu1 100100 0 0 900400 0 0 0 0',
+      'cpu2 100100 0 0 900400 0 0 0 0',
+      'cpu3 100175 0 0 900325 0 0 0 0',
+      'cpu4 100175 0 0 900325 0 0 0 0',
+      'cpu5 100175 0 0 900325 0 0 0 0',
+      'cpu6 100175 0 0 900325 0 0 0 0',
+      'cpu7 100030 0 0 900470 0 0 0 0'
+    ],
     apps: [
       { package: 'com.tencent.mm', name: '微信' },
       { package: 'com.tencent.mobileqq', name: 'QQ' },
@@ -115,8 +138,8 @@
     moduleProp: [
       'id=aegis_scheduler',
       'name=Aegis',
-      'version=2.3',
-      'versionCode=8',
+      'version=3.0',
+      'versionCode=13',
       'author=默默的阿文',
       'description=自适应 CPU 调度+FAS + 充电控制'
     ].join('\n'),

@@ -13,12 +13,13 @@ chmod 700 "$DATA/run"
 # the daemon is still alive so it can also release its own bookkeeping.
 if [ -x "$MODDIR/bin/tempoctl" ] && [ -S "$DATA/run/control.sock" ]; then
     "$MODDIR/bin/tempoctl" --config "$DATA/config.toml" \
-        --profile "$DATA/profile/babylon.toml" \
+        --profile "$DATA/profile/device.toml" \
         restore --socket "$DATA/run/control.sock" >/dev/null 2>&1
 fi
 
 killall -9 Aegis 2>/dev/null
 pkill -9 -f "bin/Aegis" 2>/dev/null
+rm -f "$MODDIR/control.armed"
 
 sh "$MODDIR/scripts/restore.sh" >> "$DATA/Aegis.log" 2>&1
 sh "$MODDIR/scripts/charge_resume.sh" >> "$DATA/charge.log" 2>&1
