@@ -15,6 +15,15 @@ if [ ! -d "$ORIG" ]; then
     exit 0
 fi
 
+# Drop the floor mask first, otherwise the restore writes land in the mask
+# file and the kernel attributes keep the pinned minimum.
+for dir in "$ROOT"/policy*; do
+    node=$dir/scaling_min_freq
+    if mount | grep -q " $node "; then
+        umount "$node" 2>/dev/null
+    fi
+done
+
 for dir in "$ORIG"/policy*; do
     [ -d "$dir" ] || continue
     name=${dir##*/}

@@ -81,6 +81,12 @@ fi
 # --- 3. pristine backup (once per boot, before any write) --------------------
 sh "$MODDIR/scripts/cpufreq_backup.sh" >> "$LOG" 2>&1
 
+# --- 3b. pin the floor under the vendor's write path -------------------------
+# PerfHAL keeps rewriting scaling_min_freq; a bind-mounted mask makes those
+# writes harmless. Applied after the pristine backup so restore still knows the
+# original values.
+sh "$MODDIR/scripts/mask_min.sh" >> "$LOG" 2>&1
+
 # --- 4. start the single writer ---------------------------------------------
 cd "$DATA" || exit 1
 nohup "$BIN" \

@@ -97,6 +97,10 @@ pub struct CpufreqWriter {
     cap_writes: u64,
     floor_writes: u64,
     rejected_floor: u64,
+    /// The module bind-mounts a mask over every `scaling_min_freq`, so the
+    /// kernel floor is permanently the hardware minimum. Writing the floor
+    /// would only edit the mask file; scheduling is done through the ceiling.
+    pin_min: bool,
     pub last_error: Option<String>,
 }
 
@@ -164,6 +168,7 @@ impl CpufreqWriter {
             cap_writes: 0,
             floor_writes: 0,
             rejected_floor: 0,
+            pin_min: masks_floor(),
             last_error: None,
         })
     }
@@ -275,7 +280,11 @@ impl CpufreqWriter {
             // Never let the floor exceed the live ceiling.
             target = target.min(live_max);
 
-            let current_min = read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(policy.hw_min);
+            let current_min = if self.pin_min {
+                policy.hw_min
+            } else {
+                read_u32(&policy.dir.join("scaling_min_freq")).unwrap_or(policy.hw_min)
+            };
             policy.last_target = target;
             policy.unlocked = unlock;
             // The soft ceiling starts above the live floor, otherwise the kernel
@@ -310,7 +319,7 @@ impl CpufreqWriter {
                 );
             }
 
-            if current_min != target && !policy.retry_after.is_some_and(|retry| now < retry) {
+            if !self.pin_min && current_min != target && !policy.retry_after.is_some_and(|retry| now < retry) {
                 if quiet && target < current_min {
                     let since = *policy.quiet_pending_since.get_or_insert(now);
                     if now.duration_since(since) < QUIET_SETTLE {
@@ -463,6 +472,15 @@ pub fn read_u32(path: &Path) -> Option<u32> {
         .trim()
         .parse()
         .ok()
+}
+
+/// True when the module's bind-mount mask is active on any policy floor. In
+/// that state the kernel floor is the hardware minimum and vendor writers
+/// modify the mask file only, so the daemon must not spend writes on it.
+fn masks_floor() -> bool {
+    fs::read_to_string("/proc/mounts")
+        .map(|table| table.lines().any(|line| line.contains("scaling_min_freq")))
+        .unwrap_or(false)
 }
 
 fn write_khz(path: &Path, value: u32) -> Result<(), String> {
