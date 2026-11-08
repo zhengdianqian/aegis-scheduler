@@ -292,6 +292,7 @@ pub fn run(
         .register(&mut charge_timer, CHARGE_TIMER, Interest::READABLE)
         .map_err(|error| context("register charge timer", error))?;
     arm_charge_timer(charge.as_ref(), &charge_timer);
+    let mut last_charge_latched = charge.as_ref().map(ChargeWatcher::is_latched).unwrap_or(false);
 
     // Atomic config replacement (WebUI `mv`) is picked up without polling.
     let mut config_watch = match ConfigWatcher::open(data_dir) {
@@ -344,6 +345,9 @@ pub fn run(
     let mut connections: HashMap<Token, Connection> = HashMap::new();
     let mut next_token = FIRST_CONNECTION;
     let mut last_thermal_us: u64 = 0;
+    // 热区读取会走 QMI，静止页面下没有必要 1.5 s 采一次；安静且不热时放宽到
+    // 6 s，一旦发热或出现交互立即回到 1.5 s。
+    let mut thermal_interval_us: u64 = 1_500_000;
     // The probe publishes one sample per runtime quantum (200 ms by default).
     // Every sample is evaluated once; this is an event gate, not a timer.
     // Resolving the foreground package spawns a dumpsys-backed fallback and is
@@ -362,7 +366,14 @@ pub fn run(
     let mut last_start_us: u64 = 0;
 
     loop {
-        poll.poll(&mut events, None)?;
+        // A signal (SIGCHLD, SIGTERM races, ptrace attach) makes epoll_wait
+        // return EINTR. That is not a failure: retry instead of tearing the
+        // whole scheduler down and handing cpufreq back to the vendor.
+        match poll.poll(&mut events, None) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
 
         for event in events.iter() {
             let token = event.token();
@@ -502,20 +513,35 @@ pub fn run(
                                 }
                             }
                             let quiet = controller.is_quiet();
-                            if !idle_now {
-                                record(&status, &decisions, Some(&sample), Some(quiet));
-                            }
-                            update_usage(&status, &sample);
+                            // One lock for both the sample snapshot and the
+                            // smoothed usage: the WebUI only needs the newest
+                            // values, and a static page must not pay for a
+                            // second mutex round trip per sample.
+                            record(
+                                &status,
+                                if idle_now { None } else { Some(&sample) },
+                                Some(quiet),
+                            );
                             commit(&decisions, &mut writer, &status);
-                            // Thermal guard is sampled on demand events only,
-                            // throttled to 1.5 s: no timer, no busy loop, and
-                            // far fewer QMI sensor transactions at idle.
-                            if sample.ts_us.saturating_sub(last_thermal_us) >= 1_500_000 {
+                            // Thermal guard is sampled on demand events only.
+                            // A quiet, cool device stretches the interval to
+                            // 6 s: every zone read is a QMI transaction, and
+                            // 40 transactions/minute bought nothing on a
+                            // static page. Heat or interaction restores 1.5 s.
+                            if sample.ts_us.saturating_sub(last_thermal_us) >= thermal_interval_us {
                                 last_thermal_us = sample.ts_us;
                                 let temp = power::thermal_c();
                                 if let Ok(mut state) = status.lock() {
                                     state.thermal_available = temp.is_some();
                                 }
+                                let hot = temp
+                                    .map(|value| value >= config.thermal.guard_c - 3.0)
+                                    .unwrap_or(false);
+                                thermal_interval_us = if hot || !quiet {
+                                    1_500_000
+                                } else {
+                                    6_000_000
+                                };
                                 let cap = temp
                                     .map(|value| thermal_cap(value, config.thermal.guard_c));
                                 let decisions = controller.on_thermal_cap(sample.ts_us, cap);
@@ -621,16 +647,31 @@ pub fn run(
                 charge_timer.drain();
                 if let Some(watcher) = charge.as_mut() {
                     let decision = watcher.update(&config, now_us());
-                    tracing::info!(
-                        action = decision.action.as_str(),
-                        stopped = watcher.is_stopped(),
-                        phase = watcher.phase(),
-                        trickle = watcher.is_trickling(),
-                        latched = watcher.is_latched(),
-                        current_ma = ?watcher.last_current_ma(),
-                        reasons = decision.reasons_joined().as_str(),
-                        "charge trickle sample"
-                    );
+                    // 涓流采样只在锁存状态翻转时留 INFO，其余降到 DEBUG：
+                    // 100% 场景下每拍一条日志本身就是可测量的 I/O。
+                    let latched = watcher.is_latched();
+                    let level_changed = latched != last_charge_latched;
+                    last_charge_latched = latched;
+                    if level_changed {
+                        tracing::info!(
+                            action = decision.action.as_str(),
+                            stopped = watcher.is_stopped(),
+                            phase = watcher.phase(),
+                            trickle = watcher.is_trickling(),
+                            latched = watcher.is_latched(),
+                            current_ma = ?watcher.last_current_ma(),
+                            reasons = decision.reasons_joined().as_str(),
+                            "charge trickle latched"
+                        );
+                    } else {
+                        tracing::debug!(
+                            action = decision.action.as_str(),
+                            phase = watcher.phase(),
+                            trickle = watcher.is_trickling(),
+                            current_ma = ?watcher.last_current_ma(),
+                            "charge trickle sample"
+                        );
+                    }
                     publish_charge(watcher, &status);
                 }
                 arm_charge_timer(charge.as_ref(), &charge_timer);
@@ -991,22 +1032,6 @@ pub(crate) fn scene_of(package: Option<&str>, config: &Config) -> Scene {
     }
 }
 
-/// Fixed-window usage estimate for the WebUI. The probe already publishes a
-/// real per-cluster busy ratio every quantum; this keeps a smoothed copy so a
-/// page refresh shows a stable "sampled" value instead of random noise.
-fn update_usage(status: &Arc<Mutex<RuntimeStatus>>, sample: &probe::DemandSnapshot) {
-    if let Ok(mut state) = status.lock() {
-        if state.usage.len() != sample.busy.len() {
-            state.usage = sample.busy.clone();
-        } else {
-            for (slot, busy) in state.usage.iter_mut().zip(sample.busy.iter()) {
-                *slot += (busy.clamp(0.0, 1.0) - *slot) * 0.35;
-            }
-        }
-        state.usage_sampled_us = sample.ts_us;
-    }
-}
-
 fn commit(
     decisions: &[Decision],
     writer: &mut Option<CpufreqWriter>,
@@ -1048,7 +1073,6 @@ fn commit(
 
 fn record(
     status: &Arc<Mutex<RuntimeStatus>>,
-    decisions: &[Decision],
     sample: Option<&probe::DemandSnapshot>,
     quiet: Option<bool>,
 ) {
@@ -1060,11 +1084,21 @@ fn record(
             state.foreground = sample.foreground.clone();
             state.fg_switches = sample.fg_switches.clone();
             state.switches = sample.switches.clone();
+            // Fixed-window usage estimate for the WebUI, smoothed in the same
+            // lock: the probe already publishes a real per-cluster ratio every
+            // quantum, this only keeps a stable "sampled" value for the page.
+            if state.usage.len() != sample.busy.len() {
+                state.usage = sample.busy.clone();
+            } else {
+                for (slot, busy) in state.usage.iter_mut().zip(sample.busy.iter()) {
+                    *slot += (busy.clamp(0.0, 1.0) - *slot) * 0.35;
+                }
+            }
+            state.usage_sampled_us = sample.ts_us;
         }
         if let Some(quiet) = quiet {
             state.quiet = quiet;
         }
-        state.decisions = decisions.to_vec();
     }
 }
 
@@ -1123,10 +1157,16 @@ fn publish_charge(watcher: &ChargeWatcher, status: &Arc<Mutex<RuntimeStatus>>) {
 
 /// Arms a single one-shot timer at the next reservation boundary. No timer is
 /// pending when the plan is disabled, so an idle device has no scheduled wakeup.
-/// 100% 涓流阶段例外：按 3 秒一拍读取真实电流/满充状态，凑满 9 秒证据后锁存。
+/// 100% 涓流阶段例外：按 3 秒一拍读取真实电流/满充状态，凑满 9 秒证据后锁存；
+/// 锁存之后证据已经足够，继续 3 秒一拍只会白读电流并刷日志，改为 30 秒复查。
 fn arm_charge_timer(watcher: Option<&ChargeWatcher>, timer: &OneShotTimer) {
     if watcher.is_some_and(ChargeWatcher::is_trickling) {
-        timer.arm(now_us() + 3_000_000);
+        let interval = if watcher.is_some_and(ChargeWatcher::is_latched) {
+            30_000_000
+        } else {
+            3_000_000
+        };
+        timer.arm(now_us() + interval);
         return;
     }
     match watcher.and_then(ChargeWatcher::next_boundary_secs) {
