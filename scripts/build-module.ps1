@@ -11,7 +11,7 @@ New-Item -ItemType Directory -Force "$stage\bin", "$stage\scripts", "$stage\conf
 Copy-Item "$bin\Aegis", "$bin\tempoctl" "$stage\bin"
 Copy-Item "$root\packaging\service.sh", "$root\packaging\uninstall.sh", "$root\packaging\customize.sh" $stage
 Copy-Item "$root\packaging\module.properties" "$stage\module.prop"
-Copy-Item "$root\packaging\shield.sh", "$root\packaging\charge_resume.sh", "$root\packaging\watchdog.sh", "$root\packaging\cpufreq_backup.sh", "$root\packaging\restore.sh" "$stage\scripts"
+Copy-Item "$root\packaging\shield.sh", "$root\packaging\charge_resume.sh", "$root\packaging\watchdog.sh", "$root\packaging\cpufreq_backup.sh", "$root\packaging\restore.sh", "$root\packaging\mask_min.sh" "$stage\scripts"
 Copy-Item "$root\packaging\config.toml", "$root\packaging\fas.json" "$stage\config"
 Copy-Item "$root\profiles\babylon.toml" "$stage\config\babylon.toml"
 Copy-Item "$root\packaging\icon.png" "$stage\icon.png"
