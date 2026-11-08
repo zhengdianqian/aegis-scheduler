@@ -177,6 +177,11 @@ impl CpufreqWriter {
     /// for a scheduling event. Vendor perf services move floors while the
     /// screen is static; this keeps the cap honest at a slow cadence.
     pub fn reconcile(&mut self) -> Result<(), String> {
+        // mask 常驻时不碰任何 cpufreq 节点：静态由 mask 保底，动态交给
+        // governor，避免软上限把启动窗口压死。
+        if self.pin_min {
+            return Ok(());
+        }
         let now = Instant::now();
         let mut failure: Option<String> = None;
         for policy in &mut self.policies {
@@ -239,6 +244,13 @@ impl CpufreqWriter {
     /// ceiling on `scaling_max_freq`. A live ceiling below the requested value
     /// (usually a vendor thermal clamp) is respected, never fought.
     pub fn apply(&mut self, decisions: &[Decision]) -> Result<(), String> {
+        // mask 常驻时 floor 已被内核钉在硬件最低，静态省电由 mask 保证。
+        // 此时若再写软上限，启动/切换会被 target+headroom 卡住（实测冷启
+        // 明显变慢并出现白屏）。上限交还 governor，让需求侧自由升到硬件
+        // max，daemon 不再介入。
+        if self.pin_min {
+            return Ok(());
+        }
         let mut failure: Option<String> = None;
         for decision in decisions {
             let Some(policy) = self

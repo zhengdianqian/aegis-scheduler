@@ -25,6 +25,8 @@ use crate::charge::ChargeWatcher;
 use crate::fas::FasCollector;
 use crate::foreground::ForegroundResolver;
 use crate::ipc::{self, ControlContext, Outcome, RuntimeStatus};
+use crate::launch::{self, LaunchEvents, WakePipe};
+use crate::mask::{MaskControl, MaskWindow};
 use crate::power;
 use crate::probe::{self, ProbeSession};
 use crate::screen::ScreenWatcher;
@@ -42,6 +44,13 @@ const CHARGE_TIMER: Token = Token(12);
 const CONFIG_WATCH: Token = Token(13);
 const VERIFY: Token = Token(14);
 const CEILING_TIMER: Token = Token(15);
+const WAKE: Token = Token(100);
+/// The pin is released while anything is happening (launch, touch, screen on)
+/// and restored only when the controller itself reports that the system has
+/// settled. Re-pinning a floor while a launch or a load phase is still running
+/// stalls that application: WeChat was seen dying 1.4 s after a remount that
+/// landed mid-start, and deadlocking for minutes at the old 1 s window.
+const MASK_QUIET_HOLD_US: u64 = 1_000_000;
 /// 静默期只做低频率的安全校正。事件提交本身已经维护上限；3 秒一次只会
 /// 在厂商地板抖动时反复重写 scaling_max_freq（~1 次/秒，每次 ~10 ms 系统
 /// 时间），既耗 CPU 又制造周期性卡顿。
@@ -147,6 +156,27 @@ pub fn run(
     } else {
         None
     };
+
+    // Launch window. The floor pin makes the static state cheap, but a pinned
+    // floor also hides the vendor's launch boost. The pin is therefore released
+    // as soon as an activity start, touch or screen-on says the user needs
+    // performance, and restored only when the controller reports the system has
+    // settled. Remounting during a launch is what stalled applications, so the
+    // window follows demand instead of a timer.
+    let mut mask_window = MaskWindow::new(if apply {
+        MaskControl::discover(&profile)
+    } else {
+        None
+    });
+    if mask_window.is_tracked() {
+        tracing::info!("floor pin detected; launch window control armed");
+    }
+    let mut wake = WakePipe::new().map_err(|error| context("create wake pipe", error))?;
+    poll.registry()
+        .register(&mut wake, WAKE, Interest::READABLE)
+        .map_err(|error| context("register wake pipe", error))?;
+    let wake = Arc::new(wake);
+    let launch_events = launch::spawn(Arc::clone(&wake));
 
     let mut screen = match ScreenWatcher::open(&config.events.screen_path) {
         Ok(mut watcher) => {
@@ -341,6 +371,14 @@ pub fn run(
     // keeps producing work, so "draw shell first, load content later" apps
     // are not decayed during their real compute phase.
     let mut launch_until_us: u64 = 0;
+    // Last activity start consumed by the mask window, so one launch does not
+    // reopen the same window on every wake.
+    let mut last_start_us: u64 = 0;
+    // Latest demand of any kind (start / touch / screen-on). The pin must not
+    // be restored while a vendor touch boost is still running, otherwise the
+    // boost writes the ceiling back up right after the cap.
+    let mut last_demand_us: u64 = 0;
+    publish_mask(&mask_window, &status);
 
     loop {
         poll.poll(&mut events, None)?;
@@ -465,6 +503,17 @@ pub fn run(
                                     if let Ok(mut state) = status.lock() {
                                         state.launch_lifts += 1;
                                     }
+                                    // Fallback when the framework log stream is
+                                    // unavailable: the probe's own edge still
+                                    // releases the pin, just a quantum later.
+                                    if mask_window.is_tracked() && !mask_window.is_open() {
+                                        last_demand_us = sample.ts_us;
+                                        open_mask_window(
+                                            &mut mask_window,
+                                            sample.ts_us,
+                                            &status,
+                                        );
+                                    }
                                     tracing::debug!(fg_peak, "app launch edge: launch lift");
                                 }
                             }
@@ -473,6 +522,18 @@ pub fn run(
                                 record(&status, &decisions, Some(&sample), Some(quiet));
                             }
                             commit(&decisions, &mut writer, &status);
+                            // The pin returns only after the controller says the
+                            // system has settled and no demand of any kind is
+                            // still fresh. Closing while a vendor touch boost is
+                            // active would let that boost write the ceiling back
+                            // up immediately after the cap.
+                            let settle_us = last_start_us.max(last_demand_us);
+                            if mask_window.is_tracked()
+                                && quiet
+                                && sample.ts_us.saturating_sub(settle_us) >= MASK_QUIET_HOLD_US
+                            {
+                                close_mask_window(&mut mask_window, &status);
+                            }
                             // Thermal guard is sampled on demand events only,
                             // throttled to 1.5 s: no timer, no busy loop, and
                             // far fewer QMI sensor transactions at idle.
@@ -516,10 +577,19 @@ pub fn run(
                         }
                         commit(&decisions, &mut writer, &status);
                         if on {
+                            // Unlock animation and the first screen after wake
+                            // need the vendor's boost just like a launch.
+                            last_demand_us = at_us;
+                            if mask_window.is_tracked() && !mask_window.is_open() {
+                                open_mask_window(&mut mask_window, at_us, &status);
+                            }
                             refresh_fas(&config, &foreground, &mut fas, &status, true);
                             if let Some(collector) = fas.as_mut() {
                                 collector.request(foreground.package().unwrap_or(""), at_us);
                             }
+                        } else if !mask_window.is_capped() && mask_window.is_tracked() {
+                            // Nothing is being drawn; give the floor back at once.
+                            close_mask_window(&mut mask_window, &status);
                         }
                         match controller.next_deadline(at_us) {
                             Some(deadline) => deadline_source.arm(deadline.at_us),
@@ -672,6 +742,13 @@ pub fn run(
                         refresh_fas(&config, &foreground, &mut fas, &status, true);
                     }
                     if batch.downs > 0 || batch.moves > 0 {
+                        // A touch is the earliest visible sign that the user
+                        // needs the vendor's boost again: release the pin now,
+                        // it costs a few micro- and microseconds to remount.
+                        last_demand_us = at_us;
+                        if mask_window.is_tracked() && !mask_window.is_open() {
+                            open_mask_window(&mut mask_window, at_us, &status);
+                        }
                         // Pick up a WebUI change to the FAS list immediately:
                         // the user toggling the switch should not have to switch
                         // apps before the probe starts.
@@ -763,6 +840,19 @@ pub fn run(
                 match controller.next_deadline(at_us) {
                     Some(deadline) => deadline_source.arm(deadline.at_us),
                     None => deadline_source.disarm(),
+                }
+                continue;
+            }
+
+            if token == WAKE {
+                wake.drain();
+                if let Some(events) = launch_events.as_ref() {
+                    let start_us = events.start_us();
+                    if start_us > last_start_us && mask_window.is_tracked() {
+                        last_start_us = start_us;
+                        last_demand_us = start_us;
+                        open_mask_window(&mut mask_window, start_us, &status);
+                    }
                 }
                 continue;
             }
@@ -924,6 +1014,50 @@ fn refresh_fas(
     tracing::debug!(package, eligible, "fas eligibility updated");
 }
 
+/// Releases the floor pin so the vendor stack owns the launch exactly as it
+/// does without the module. Called on an activity start (framework log), a
+/// touch, screen-on, or the probe's own launch edge when the log stream is
+/// unavailable.
+fn open_mask_window(
+    window: &mut MaskWindow,
+    at_us: u64,
+    status: &Arc<Mutex<RuntimeStatus>>,
+) {
+    let opened = window.open();
+    publish_mask(window, status);
+    if opened {
+        tracing::info!(
+            at_us,
+            unmask_us = window.unmask_us(),
+            windows = window.opens(),
+            "demand window opened: floor pin released"
+        );
+    }
+}
+
+/// Writes the hardware minimum back, re-binds the mask and lowers the ceiling.
+fn close_mask_window(window: &mut MaskWindow, status: &Arc<Mutex<RuntimeStatus>>) {
+    let took = window.close();
+    publish_mask(window, status);
+    if took > 0 {
+        tracing::info!(
+            remask_us = took,
+            windows = window.opens(),
+            "demand window closed: floor pin restored"
+        );
+    }
+}
+
+fn publish_mask(window: &MaskWindow, status: &Arc<Mutex<RuntimeStatus>>) {
+    if let Ok(mut state) = status.lock() {
+        state.mask_tracked = window.is_tracked();
+        state.mask_open = window.is_open();
+        state.mask_windows = window.opens();
+        state.mask_unmask_us = window.unmask_us();
+        state.mask_remask_us = window.remask_us();
+    }
+}
+
 fn commit(
     decisions: &[Decision],
     writer: &mut Option<CpufreqWriter>,
@@ -996,7 +1130,7 @@ fn thermal_cap(temp_c: f32, guard_c: f32) -> f32 {
     }
 }
 
-fn now_us() -> u64 {
+pub(crate) fn now_us() -> u64 {
     let mut now = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
