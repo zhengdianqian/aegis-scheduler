@@ -328,11 +328,8 @@ pub fn run(
     let mut connections: HashMap<Token, Connection> = HashMap::new();
     let mut next_token = FIRST_CONNECTION;
     let mut last_thermal_us: u64 = 0;
-    // The probe publishes one sample per scheduler switch burst. Coalesce
-    // bursts to at most one demand evaluation per 50 ms so a busy system
-    // cannot turn the event loop into a spinning consumer; this is an event
-    // gate, not a timer.
-    let mut last_probe_us: u64 = 0;
+    // The probe publishes one sample per runtime quantum (200 ms by default).
+    // Every sample is evaluated once; this is an event gate, not a timer.
     // Resolving the foreground package spawns a dumpsys-backed fallback and is
     // far more expensive than the probe itself. Coalesce real foreground
     // changes to at most one resolution per 2 s, and skip it entirely during
@@ -381,13 +378,10 @@ pub fn run(
                 if let Some(session) = probe.as_mut() {
                     if controller.is_screen_on() {
                         if let Some(sample) = session.drain() {
-                            // 50 ms 的探针事件在静态页面里几乎全部是“无事可做”的
-                            // 空唤醒；合并到 100 ms 一处处理，只保留一半的
-                            // epoll 唤醒与状态拷贝，交互档位仍然远快于一次触控。
-                            if sample.ts_us.saturating_sub(last_probe_us) < 100_000 {
-                                continue;
-                            }
-                            last_probe_us = sample.ts_us;
+                            // 探针现在按 200 ms 出样本；静态页面里这些样本的
+                            // busy/foreground 几乎不变，状态快照不需要每拍重写。
+                            let idle_now = !sample.foreground_active
+                                && sample.busy.iter().all(|busy| *busy < 0.05);
                             if sample.foreground_changed
                                 && sample.ts_us.saturating_sub(last_foreground_us) >= 2_000_000
                                 // A dumpsys-backed resolution spawns a process
@@ -475,7 +469,9 @@ pub fn run(
                                 }
                             }
                             let quiet = controller.is_quiet();
-                            record(&status, &decisions, Some(&sample), Some(quiet));
+                            if !idle_now {
+                                record(&status, &decisions, Some(&sample), Some(quiet));
+                            }
                             commit(&decisions, &mut writer, &status);
                             // Thermal guard is sampled on demand events only,
                             // throttled to 1.5 s: no timer, no busy loop, and

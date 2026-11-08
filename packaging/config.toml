@@ -8,9 +8,9 @@ profile_path = "/data/adb/tempo/profile/babylon.toml"
 
 [events]
 # 50 ms 采样在静态页面里只是把守护唤醒 20 次/秒做一遍无事可做的决策；
-# 200 ms（5 次/秒）实测把静置空唤醒带来的 CPU 压到 0.38% 单核（目标 ≤0.4%），
+# 250 ms（4 次/秒）实测把静置空唤醒带来的 CPU 压到 0.4% 单核以内（目标 ≤0.4%），
 # 负载变化仍在一个刷新周期级别被发现，交互路径另有触摸/启动抬频兜底。
-runtime_quantum_us = 200000
+runtime_quantum_us = 250000
 demand_step = 0.10
 screen_path = ""
 frame_stride = 2

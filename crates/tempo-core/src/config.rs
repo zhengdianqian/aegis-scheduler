@@ -339,8 +339,8 @@ impl Config {
         if self.daemon.profile_path.trim().is_empty() {
             bad.push("daemon.profile_path must not be empty".to_owned());
         }
-        if !(500..=200_000).contains(&self.events.runtime_quantum_us) {
-            bad.push("events.runtime_quantum_us must be 500..=200000".to_owned());
+        if !(500..=300_000).contains(&self.events.runtime_quantum_us) {
+            bad.push("events.runtime_quantum_us must be 500..=300000".to_owned());
         }
         if !(0.01..=0.20).contains(&self.events.demand_step) {
             bad.push("events.demand_step must be 0.01..=0.20".to_owned());

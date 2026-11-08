@@ -61,15 +61,18 @@ impl ForegroundResolver {
     /// Re-resolves the foreground package from the top-app task ids. Only the
     /// caller decides when this runs: it is bound to foreground transitions.
     ///
-    /// `dumpsys activity` is consulted first because the probe's top-app set
-    /// also contains the input method and other overlay windows; the resumed
-    /// activity is the only reliable source for "which app is in front". The
-    /// `/proc` scan remains as a fallback when the shell helper is unavailable.
+    /// Resolution is `/proc/<tid>/cmdline` only. A `dumpsys` helper was tried
+    /// here and removed: the top-app thread set churns while an app is merely
+    /// scrolling, so a 2 s throttle still spawned `dumpsys window` every 2 s,
+    /// which wakes system_server and window manager and shows up as periodic
+    /// jank plus ~0.25% single-core CPU. The top-app set is already the
+    /// authoritative "in front" signal; the IME filter below removes the
+    /// overlay case that `dumpsys` was originally meant to disambiguate.
     pub fn resolve(&mut self, tids: &[u32]) -> Option<&str> {
         if self.imes.is_none() {
             self.imes = Some(ime_packages());
         }
-        let package = resumed_activity().or_else(|| top_process(tids));
+        let package = top_process(tids);
         let name = package.map(|name| name.split(':').next().unwrap_or(&name).to_owned());
         // An input method stealing the focused window is an overlay event, not
         // an app switch: keep the app behind it so IME show/hide cannot trigger
@@ -82,58 +85,6 @@ impl ForegroundResolver {
         self.package = name;
         self.package.as_deref()
     }
-}
-
-/// Reads the focused window from WindowManager and returns its package. One
-/// short command per foreground transition; never called from a timer.
-fn resumed_activity() -> Option<String> {
-    let window = std::process::Command::new("/system/bin/dumpsys")
-        .args(["window"])
-        .output()
-        .ok()?;
-    if window.status.success() {
-        let text = String::from_utf8_lossy(&window.stdout);
-        for line in text.lines() {
-            let Some(marker) = line
-                .find("mCurrentFocus=")
-                .or_else(|| line.find("mFocusedApp="))
-            else {
-                continue;
-            };
-            if let Some(package) = package_in(&line[marker..]) {
-                return Some(package);
-            }
-        }
-    }
-    let top = std::process::Command::new("/system/bin/dumpsys")
-        .args(["activity", "top"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&top.stdout);
-    for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix("ACTIVITY ") {
-            if let Some(package) = package_in(rest) {
-                return Some(package);
-            }
-        }
-    }
-    None
-}
-
-fn package_in(text: &str) -> Option<String> {
-    for token in text.split_whitespace() {
-        if let Some(slash) = token.find('/') {
-            let package = &token[..slash];
-            if package.contains('.')
-                && !package.contains('{')
-                && !package.contains('}')
-                && !package.contains('=')
-            {
-                return Some(package.to_owned());
-            }
-        }
-    }
-    None
 }
 
 fn top_process(tids: &[u32]) -> Option<String> {

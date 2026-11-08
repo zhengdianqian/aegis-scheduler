@@ -32,8 +32,11 @@ const MAX_CPUS: u32 = 32;
 const UNASSIGNED_CLUSTER: u32 = u32::MAX;
 const FOREGROUND_TASKS: &str = "/dev/cpuset/top-app/tasks";
 /// Foreground membership is refreshed per accumulated event batch, not on a
-/// clock: an idle device never touches the file, and a busy one costs at most
-/// one small read per this many events (or one per second, whichever is rarer).
+/// clock: an idle device never touches the file. The batch gate used to be
+/// "32 events **or** 1 s", which a busy top-app crosses on every quantum
+/// (hundreds of sched_switch events per 250 ms), so the cpuset file was read
+/// four times a second and made `seq_read`/cgroup iteration a visible CPU
+/// item. Requiring both bounds caps it at one read per second.
 const FOREGROUND_REFRESH_EVENTS: u64 = 32;
 const FOREGROUND_REFRESH_US: u64 = 1_000_000;
 /// A batch that moves every cluster by less than this is not worth a publish.
@@ -233,7 +236,7 @@ impl ProbeSession {
             }
             let by_count = events.saturating_sub(*last_fg_event) >= FOREGROUND_REFRESH_EVENTS;
             let by_time = ts_us.saturating_sub(*last_fg_ts_us) >= FOREGROUND_REFRESH_US;
-            if by_count || by_time {
+            if by_count && by_time {
                 *last_fg_event = *events;
                 *last_fg_ts_us = ts_us;
                 if refresh_foreground(ebpf, foreground_pids).unwrap_or(false) {
