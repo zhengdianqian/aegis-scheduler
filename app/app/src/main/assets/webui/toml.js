@@ -44,6 +44,7 @@
       tier_table_max: 8,
       up_confirm_ms: 120,
       max_up_step: 2,
+      cluster_cap_ratio: {},
       prime_cap_ratio: 0.70,
       ime_cap_ratio: 0.45,
       floor_settle_ms: 60,
@@ -589,6 +590,8 @@
         tier_table_max: pickNumber(src, 'control.tier_table_max', d.control.tier_table_max),
         up_confirm_ms: pickNumber(src, 'control.up_confirm_ms', d.control.up_confirm_ms),
         max_up_step: pickNumber(src, 'control.max_up_step', d.control.max_up_step),
+        cluster_cap_ratio: readPath(src, 'control.cluster_cap_ratio') === undefined
+          ? {} : clone(readPath(src, 'control.cluster_cap_ratio')),
         prime_cap_ratio: pickNumber(src, 'control.prime_cap_ratio', d.control.prime_cap_ratio),
         ime_cap_ratio: pickNumber(src, 'control.ime_cap_ratio', d.control.ime_cap_ratio),
         floor_settle_ms: pickNumber(src, 'control.floor_settle_ms', d.control.floor_settle_ms),

@@ -424,10 +424,6 @@ pub fn run(
 
     let mut connections: HashMap<Token, Connection> = HashMap::new();
     let mut next_token = FIRST_CONNECTION;
-    let mut last_thermal_us: u64 = 0;
-    // 热区读取会走 QMI，静止页面下没有必要 1.5 s 采一次；安静且不热时放宽到
-    // 6 s，一旦发热或出现交互立即回到 1.5 s。
-    let mut thermal_interval_us: u64 = 1_500_000;
     // The probe publishes one sample per runtime quantum (200 ms by default).
     // Every sample is evaluated once; this is an event gate, not a timer.
     // Resolving the foreground package spawns a dumpsys-backed fallback and is
@@ -571,27 +567,6 @@ pub fn run(
                             // second mutex round trip per sample.
                             record(&status, Some(&sample), Some(quiet));
                             commit(&decisions, &mut writer, &status);
-                            // Thermal guard is sampled on demand events only.
-                            // A quiet, cool device stretches the interval to
-                            // 6 s: every zone read is a QMI transaction, and
-                            // 40 transactions/minute bought nothing on a
-                            // static page. Heat or interaction restores 1.5 s.
-                            if sample.ts_us.saturating_sub(last_thermal_us) >= thermal_interval_us {
-                                last_thermal_us = sample.ts_us;
-                                let temp = power::thermal_c();
-                                if let Ok(mut state) = status.lock() {
-                                    state.thermal_available = temp.is_some();
-                                }
-                                let hot = temp
-                                    .map(|value| value >= config.thermal.guard_c - 3.0)
-                                    .unwrap_or(false);
-                                thermal_interval_us =
-                                    if hot || !quiet { 1_500_000 } else { 6_000_000 };
-                                let cap =
-                                    temp.map(|value| thermal_cap(value, config.thermal.guard_c));
-                                let decisions = controller.on_thermal_cap(sample.ts_us, cap);
-                                commit(&decisions, &mut writer, &status);
-                            }
                             match controller.next_deadline(sample.ts_us) {
                                 Some(deadline) => deadline_source.arm(deadline.at_us),
                                 None => deadline_source.disarm(),
@@ -1129,7 +1104,7 @@ fn reload_controller(
     let scene = scene_of(foreground.package(), config);
     // 先恢复场景再恢复屏幕，只提交最终状态，避免短暂写入默认场景上限。
     controller.on_scene(at_us, scene);
-    let decisions = controller.on_screen(at_us, screen_on);
+    let decisions = controller.restore_screen_state(at_us, screen_on);
     if let Ok(mut state) = status.lock() {
         state.scene = scene.as_str().to_owned();
         state.quiet = controller.is_quiet();
@@ -1203,20 +1178,6 @@ fn record(
         if let Some(quiet) = quiet {
             state.quiet = quiet;
         }
-    }
-}
-
-/// Thermal ceiling as a fraction of the profile maximum. Vendor thermal
-/// services are never stopped; this only narrows our own lift range.
-fn thermal_cap(temp_c: f32, guard_c: f32) -> f32 {
-    if temp_c >= guard_c + 3.0 {
-        0.55
-    } else if temp_c >= guard_c {
-        0.75
-    } else if temp_c >= guard_c - 3.0 {
-        0.90
-    } else {
-        1.0
     }
 }
 

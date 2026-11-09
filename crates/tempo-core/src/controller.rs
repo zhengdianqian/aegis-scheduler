@@ -14,8 +14,8 @@
 //! * a one tier hysteresis keeps the ladder from flapping;
 //! * the scene floor (reading / video) anchors the operating point, so a video
 //!   does not run at the hardware minimum just because its CPU demand is low;
-//! * the writer receives a matching upper cap a few tiers above the target so a
-//!   vendor boost cannot slam the cluster to its top step while demand is low.
+//! * the writer's upper cap is independent of the target: only thermal limits
+//!   and explicitly configured per-cluster hardware-max ratios restrict it.
 //!
 //! The controller is a pure state machine: explicit monotonic timestamps in,
 //! decisions out. It never reads sysfs and installs no repeating timers.
@@ -121,21 +121,27 @@ pub struct Deadline {
 #[derive(Debug, Clone)]
 struct ClusterState {
     tier: usize,
-    cap_tier: usize,
+    user_cap_khz: u32,
+    last_cap_khz: u32,
     busy_ema: f32,
     fg_ema: f32,
+    busy_raw: f32,
+    fg_raw: f32,
     up_since_us: Option<u64>,
     last_step_us: u64,
     touch_target: usize,
 }
 
 impl ClusterState {
-    fn new() -> Self {
+    fn new(user_cap_khz: u32) -> Self {
         Self {
             tier: 0,
-            cap_tier: usize::MAX,
+            user_cap_khz,
+            last_cap_khz: u32::MAX,
             busy_ema: 0.0,
             fg_ema: 0.0,
+            busy_raw: 0.0,
+            fg_raw: 0.0,
             up_since_us: None,
             last_step_us: 0,
             touch_target: 0,
@@ -160,7 +166,8 @@ pub struct Controller {
     pressure_until_us: Option<u64>,
     last_over_budget_us: u64,
     over_budget_hits: u32,
-    last_demand_us: u64,
+    last_demand_us: Option<u64>,
+    filter_updated_us: Option<u64>,
     thermal_cap: Option<f32>,
     scene: Scene,
     /// Raised when a video/reading scene still produces over-budget frames; it
@@ -185,7 +192,28 @@ impl Controller {
         let clusters = profile
             .clusters
             .iter()
-            .map(|_| ClusterState::new())
+            .map(|cluster| {
+                let ratio = config
+                    .control
+                    .cluster_cap_ratio
+                    .get(&format!("cpu{}", cluster.cpus[0]))
+                    .copied()
+                    .unwrap_or(1.0);
+                let cap_khz = if ratio >= 1.0 {
+                    cluster.max_khz
+                } else {
+                    let limit = f64::from(cluster.max_khz) * f64::from(ratio);
+                    let end = cluster
+                        .freq_khz
+                        .partition_point(|&khz| f64::from(khz) <= limit);
+                    if end == 0 {
+                        cluster.min_khz
+                    } else {
+                        cluster.freq_khz[end - 1]
+                    }
+                };
+                ClusterState::new(cap_khz)
+            })
             .collect();
         Self {
             profile,
@@ -203,7 +231,8 @@ impl Controller {
             pressure_until_us: None,
             last_over_budget_us: 0,
             over_budget_hits: 0,
-            last_demand_us: 0,
+            last_demand_us: None,
+            filter_updated_us: None,
             thermal_cap: None,
             scene: Scene::Default,
             adaptive_floor: 0,
@@ -224,13 +253,16 @@ impl Controller {
 
     pub fn ceiling_khz(&self, index: usize) -> u32 {
         let cluster = &self.clusters[index];
-        self.tiers[index][cluster.tier.min(self.tiers[index].len() - 1)]
+        self.tiers[index][cluster.tier.min(self.tiers[index].len() - 1)].min(self.cap_khz(index))
     }
 
     pub fn cap_khz(&self, index: usize) -> u32 {
-        let cluster = &self.clusters[index];
-        let cap = cluster.cap_tier.min(self.tiers[index].len() - 1);
-        self.tiers[index][cap]
+        let user_cap = self.clusters[index].user_cap_khz;
+        if self.thermal_cap.is_some() {
+            user_cap.min(self.tiers[index][self.thermal_cap_tier(index)])
+        } else {
+            user_cap
+        }
     }
 
     pub fn tier(&self, index: usize) -> usize {
@@ -260,7 +292,7 @@ impl Controller {
     pub fn on_screen(&mut self, ts_us: u64, on: bool) -> Vec<Decision> {
         self.screen_on = on;
         if on {
-            // A screen-on is a warm start: open the cap and hold a mid tier for
+            // A screen-on is a warm start: hold a mid-tier target for
             // the launch window so the lock screen and the first frame do not
             // run at the hardware minimum.
             self.launch_until_us = Some(ts_us + self.config.control.launch_lift_ms * US_PER_MS);
@@ -276,11 +308,28 @@ impl Controller {
             self.burst_until_us = None;
             self.pressure_until_us = None;
             self.over_budget_hits = 0;
+            self.last_demand_us = None;
+            self.filter_updated_us = None;
             for cluster in self.clusters.iter_mut() {
                 cluster.up_since_us = None;
+                cluster.busy_ema = 0.0;
+                cluster.fg_ema = 0.0;
+                cluster.busy_raw = 0.0;
+                cluster.fg_raw = 0.0;
+                cluster.touch_target = 0;
             }
             self.evaluate(ts_us, DecisionReason::ScreenOff)
         }
+    }
+
+    /// Restore screen state after configuration reload without a synthetic launch.
+    pub fn restore_screen_state(&mut self, ts_us: u64, on: bool) -> Vec<Decision> {
+        if !on {
+            return self.on_screen(ts_us, false);
+        }
+        self.screen_on = true;
+        self.launch_until_us = None;
+        self.evaluate(ts_us, DecisionReason::Load)
     }
 
     pub fn on_touch(&mut self, ts_us: u64) -> Vec<Decision> {
@@ -422,14 +471,16 @@ impl Controller {
             return Vec::new();
         }
         let ts = sample.ts_us;
-        let dt_us = ts.saturating_sub(self.last_demand_us);
+        if self.last_demand_us.is_some_and(|last| ts <= last) {
+            return self.evaluate(ts, DecisionReason::Load);
+        }
+        let dt_us = self.filter_updated_us.map(|last| ts.saturating_sub(last));
         let tau_ms = self.config.control.demand_smooth_ms.max(20);
-        let alpha = if self.last_demand_us == 0 || dt_us == 0 {
-            1.0
-        } else {
-            (1.0 - (-(dt_us as f32) / (tau_ms as f32 * US_PER_MS as f32)).exp()).clamp(0.08, 1.0)
-        };
-        self.last_demand_us = ts;
+        let alpha = dt_us.map_or(1.0, |dt| {
+            1.0 - (-(dt as f32) / (tau_ms as f32 * US_PER_MS as f32)).exp()
+        });
+        self.last_demand_us = Some(ts);
+        self.filter_updated_us = Some(ts);
 
         let mut instant_fg = 0.0f32;
         let mut instant_busy = 0.0f32;
@@ -446,12 +497,20 @@ impl Controller {
                 .copied()
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
+            cluster.busy_raw = busy;
+            cluster.fg_raw = fg;
             if alpha >= 1.0 {
                 cluster.busy_ema = busy;
                 cluster.fg_ema = fg;
             } else {
                 cluster.busy_ema += (busy - cluster.busy_ema) * alpha;
                 cluster.fg_ema += (fg - cluster.fg_ema) * alpha;
+            }
+            if (busy - cluster.busy_ema).abs() <= 0.001 {
+                cluster.busy_ema = busy;
+            }
+            if (fg - cluster.fg_ema).abs() <= 0.001 {
+                cluster.fg_ema = fg;
             }
             instant_fg = instant_fg.max(fg);
             instant_busy = instant_busy.max(busy);
@@ -477,7 +536,9 @@ impl Controller {
         if cap.is_some_and(f32::is_nan) {
             return Vec::new();
         }
-        let cap = cap.map(|value| value.clamp(0.10, 1.0));
+        let cap = cap
+            .filter(|&value| value < 1.0)
+            .map(|value| value.max(0.10));
         if cap == self.thermal_cap {
             return Vec::new();
         }
@@ -503,6 +564,18 @@ impl Controller {
                 };
             }
         };
+
+        if self.demand_filter_pending() {
+            if let Some(updated) = self.filter_updated_us {
+                let interval = self.config.control.demand_smooth_ms.clamp(20, 100) * US_PER_MS;
+                consider(
+                    updated
+                        .saturating_add(interval)
+                        .max(now_us.saturating_add(1)),
+                    DeadlineKind::Ramp,
+                );
+            }
+        }
 
         for window in [
             self.lift_until_us,
@@ -580,18 +653,20 @@ impl Controller {
         self.launch_until_us.is_some_and(|until| ts_us < until)
     }
 
-    fn launch_cap_tier(&self, count: usize) -> usize {
+    fn launch_target_tier(&self, count: usize) -> usize {
         let top = count - 1;
-        // Leave the last step for actual demand on ladders with a middle step.
-        // A two-step ladder must open its upper step to offer any launch headroom.
-        if top <= 1 {
-            return top;
-        }
-        self.ratio_tier(
-            (self.config.control.launch_tier_ratio + 0.20).min(1.0),
-            count,
-        )
-        .clamp(1, top - 1)
+        // Keep the existing warm-start target below speculative top-tier boosts.
+        let band = if top <= 1 {
+            top
+        } else {
+            self.ratio_tier(
+                (self.config.control.launch_tier_ratio + 0.20).min(1.0),
+                count,
+            )
+            .clamp(1, top - 1)
+        };
+        self.ratio_tier(self.config.control.launch_tier_ratio, count)
+            .min(band.saturating_sub(1))
     }
 
     fn thermal_cap_tier(&self, index: usize) -> usize {
@@ -608,6 +683,10 @@ impl Controller {
     }
 
     fn desired_tier(&self, index: usize, ts_us: u64) -> usize {
+        self.target_tier(index, ts_us, true)
+    }
+
+    fn target_tier(&self, index: usize, ts_us: u64, include_load: bool) -> usize {
         let count = self.tiers[index].len();
         if count <= 1 {
             return 0;
@@ -629,7 +708,11 @@ impl Controller {
         let load = ((demand - self.config.control.floor_enter_ratio)
             / (0.75 - self.config.control.floor_enter_ratio).max(0.01))
         .clamp(0.0, 1.0);
-        let load_tier = self.ratio_tier(load, count);
+        let load_tier = if include_load {
+            self.ratio_tier(load, count)
+        } else {
+            0
+        };
         let mut tier = load_tier.max(floor);
 
         if self.burst_until_us.is_some_and(|until| ts_us < until) {
@@ -639,8 +722,7 @@ impl Controller {
             tier = count - 1;
         }
         if self.launch_active(ts_us) {
-            let launch_floor = self.ratio_tier(self.config.control.launch_tier_ratio, count);
-            tier = tier.max(launch_floor.min(self.launch_cap_tier(count).saturating_sub(1)));
+            tier = tier.max(self.launch_target_tier(count));
         }
         if self.lift_until_us.is_some_and(|until| ts_us < until)
             && self.profile.clusters[index].role != Role::Prime
@@ -659,36 +741,12 @@ impl Controller {
         tier.min(thermal_limit)
     }
 
-    /// Governor upper bound at `ts_us`, after applying the thermal limit.
-    pub fn cap_tier(&self, index: usize, ts_us: u64) -> usize {
-        let count = self.tiers[index].len();
-        let limit = self.thermal_cap_tier(index);
-        if !self.screen_on || self.pressure_active(ts_us) {
-            return limit;
-        }
-
-        let tier = self.clusters[index].tier;
-        let launch = self.launch_cap_tier(count);
-        let safety =
-            ((count - 1) as f32 * self.config.control.safety_ceiling_ratio).ceil() as usize;
-        // On sparse ladders, rounding the quiet band up may consume all of the
-        // launch headroom. Reserve a step unless the scene already needs it.
-        let idle_cap = safety.min(launch.saturating_sub(1));
-        let lookahead = self.config.control.lookahead_tiers as usize;
-        let desired = self.desired_tier(index, ts_us);
-        let mut cap = if self.quiet || desired == 0 {
-            idle_cap
-        } else {
-            (tier.min(desired) + lookahead).max(safety)
-        };
-        if self.launch_active(ts_us) {
-            cap = if desired < launch {
-                launch
-            } else {
-                cap.max(launch)
-            };
-        }
-        cap.max(tier).min(limit)
+    /// Display tier rounded down from the actual thermal/user upper bound.
+    pub fn cap_tier(&self, index: usize, _ts_us: u64) -> usize {
+        let cap = self.cap_khz(index);
+        self.tiers[index]
+            .partition_point(|&khz| khz <= cap)
+            .saturating_sub(1)
     }
 
     fn check_quiet_entry(&mut self, ts_us: u64) {
@@ -708,7 +766,37 @@ impl Controller {
         }
     }
 
+    fn demand_filter_pending(&self) -> bool {
+        self.clusters
+            .iter()
+            .any(|cluster| cluster.busy_ema != cluster.busy_raw || cluster.fg_ema != cluster.fg_raw)
+    }
+
+    fn advance_demand_filter(&mut self, ts_us: u64) {
+        let Some(last) = self.filter_updated_us else {
+            return;
+        };
+        if ts_us <= last {
+            return;
+        }
+        let tau_us = self.config.control.demand_smooth_ms.max(20) * US_PER_MS;
+        let alpha = 1.0 - (-(ts_us.saturating_sub(last) as f32) / tau_us as f32).exp();
+        for cluster in &mut self.clusters {
+            for (ema, raw) in [
+                (&mut cluster.busy_ema, cluster.busy_raw),
+                (&mut cluster.fg_ema, cluster.fg_raw),
+            ] {
+                *ema += (raw - *ema) * alpha;
+                if (raw - *ema).abs() <= 0.001 {
+                    *ema = raw;
+                }
+            }
+        }
+        self.filter_updated_us = Some(ts_us);
+    }
+
     fn evaluate(&mut self, ts_us: u64, base_reason: DecisionReason) -> Vec<Decision> {
+        self.advance_demand_filter(ts_us);
         self.check_quiet_entry(ts_us);
         if self.clusters.is_empty() {
             return Vec::new();
@@ -722,7 +810,7 @@ impl Controller {
         for index in 0..self.clusters.len() {
             let count = self.tiers[index].len();
             let old_tier = self.clusters[index].tier;
-            let old_cap = self.clusters[index].cap_tier;
+            let old_cap = self.clusters[index].last_cap_khz;
             let desired = self.desired_tier(index, ts_us);
             let event = matches!(
                 base_reason,
@@ -740,18 +828,37 @@ impl Controller {
                 new_tier = if self.screen_on { thermal_limit } else { 0 };
                 self.clusters[index].up_since_us = None;
             } else if desired > old_tier {
-                if event {
-                    // A warm start applies its floor immediately; other events
-                    // still observe the configured upward step limit.
+                let immediate = if event {
+                    let target = match base_reason {
+                        DecisionReason::Launch | DecisionReason::Foreground => {
+                            self.launch_target_tier(count)
+                        }
+                        DecisionReason::TouchLift
+                            if self.profile.clusters[index].role != Role::Prime =>
+                        {
+                            self.clusters[index].touch_target
+                        }
+                        DecisionReason::FrameBurst if self.pressure_active(ts_us) => count - 1,
+                        DecisionReason::FrameBurst => {
+                            self.ratio_tier(self.config.control.frame_burst_level, count)
+                        }
+                        _ => 0,
+                    };
+                    target.min(self.target_tier(index, ts_us, false))
+                } else {
+                    0
+                };
+                if immediate > old_tier {
                     let step = if matches!(
                         base_reason,
                         DecisionReason::Launch | DecisionReason::Foreground
                     ) {
-                        count - 1
+                        immediate - old_tier
                     } else {
                         self.config.control.max_up_step.max(1) as usize
                     };
-                    new_tier = desired.min(old_tier + step.max(1));
+                    new_tier = immediate.min(old_tier + step);
+                    self.clusters[index].up_since_us = (desired > new_tier).then_some(ts_us);
                 } else if self.quiet {
                     new_tier = desired;
                     reason = DecisionReason::Quiet;
@@ -800,14 +907,14 @@ impl Controller {
                 self.clusters[index].tier = new_tier;
                 self.clusters[index].last_step_us = ts_us;
             }
-            let cap_tier = self.cap_tier(index, ts_us);
-            self.clusters[index].cap_tier = cap_tier;
-            let changed = new_tier != old_tier || cap_tier != old_cap;
+            let cap_khz = self.cap_khz(index);
+            self.clusters[index].last_cap_khz = cap_khz;
+            let changed = new_tier != old_tier || cap_khz != old_cap;
 
             decisions.push(Decision {
                 cluster: index,
-                ceiling_khz: self.tiers[index][new_tier],
-                cap_khz: self.tiers[index][cap_tier],
+                ceiling_khz: self.tiers[index][new_tier].min(cap_khz),
+                cap_khz,
                 tier: new_tier as u32,
                 tier_count: count as u32,
                 reason,
@@ -992,6 +1099,21 @@ mod tests {
             let cap = (c.config().control.ime_cap_ratio * (count - 1) as f32).round() as usize;
             assert!(c.tier(index) <= cap, "IME stays at or below mid tier");
         }
+    }
+
+    #[test]
+    fn cooldown_removes_the_thermal_cap_without_removing_user_cap() {
+        let profile = profile();
+        let mut config = Config::default();
+        config.control.cluster_cap_ratio.insert("cpu0".into(), 0.4);
+        let mut controller = Controller::new(profile.clone(), config);
+        let user_cap = controller.cap_khz(0);
+        controller.on_thermal_cap(1, Some(0.10));
+        assert!(controller.cap_khz(0) < user_cap);
+        controller.on_thermal_cap(2, Some(1.0));
+        assert!(controller.thermal_cap.is_none());
+        assert_eq!(controller.cap_khz(0), user_cap);
+        assert_eq!(controller.cap_khz(1), profile.clusters[1].max_khz);
     }
 
     #[test]

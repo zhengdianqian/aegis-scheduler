@@ -60,6 +60,7 @@ struct Policy {
     last_reconcile: Option<Instant>,
     /// Last verified range, used to detect another writer (including thermal).
     observed: Option<(u32, u32)>,
+    pending_max: Option<u32>,
     /// An external ceiling persists across our own successful range changes.
     external_cap: Option<u32>,
     retries: u32,
@@ -124,6 +125,7 @@ impl CpufreqWriter {
                 idle_floor: false,
                 last_reconcile: None,
                 observed: None,
+                pending_max: None,
                 external_cap: None,
                 retries: 0,
                 retry_at: None,
@@ -218,10 +220,13 @@ impl CpufreqWriter {
                 continue;
             };
             let cap = decision.cap_khz.clamp(policy.hw_min, policy.hw_max);
-            let cap = snap_down(&policy.freqs, cap)
-                .unwrap_or(cap)
-                .max(policy.hw_min);
-            if cap > policy.last_cap {
+            // 频点表可能省略最高档；解除限频时不能再按该表向下取整。
+            let cap = if cap == policy.hw_max {
+                cap
+            } else {
+                snap_down(&policy.freqs, cap).unwrap_or(cap).max(policy.hw_min)
+            };
+            if cap > policy.last_cap && policy.pending_max.is_none() {
                 // A new higher cap gets one immediate attempt; repeated decisions
                 // still respect any backoff caused by the kernel rejecting it.
                 policy.retry_at = None;
@@ -420,6 +425,11 @@ fn sync_policy(
             return false;
         }
     };
+    // 内核可能异步应用上限：即时读回旧值，不代表后续变化来自外部。
+    if policy.pending_max == Some(live.1) {
+        policy.observed = Some((policy.observed.map_or(live.0, |range| range.0), live.1));
+        policy.pending_max = None;
+    }
     let externally_changed = policy.observed.is_some_and(|previous| previous != live);
     // Only a max different from our last successful range is external evidence.
     // In particular, our own lower cap must neither tighten nor release this latch.
@@ -472,6 +482,7 @@ fn sync_policy(
             *floor_writes += 1;
         } else {
             *cap_writes += 1;
+            policy.pending_max = Some(value);
         }
         let actual = read_required(path)?;
         if actual != value {
@@ -482,6 +493,11 @@ fn sync_policy(
                 "{}: requested {value}, read back {actual}",
                 path.display()
             ));
+        }
+        if !is_floor {
+            // 后续下限写入即使失败，也不能把已验证的自身上限误判为外部限制。
+            policy.observed = Some((live.0, actual));
+            policy.pending_max = None;
         }
         Ok(())
     });
@@ -558,6 +574,7 @@ mod tests {
                     idle_floor: false,
                     last_reconcile: None,
                     observed: None,
+                    pending_max: None,
                     external_cap: None,
                     retries: 0,
                     retry_at: None,
@@ -686,6 +703,29 @@ mod tests {
         );
         assert_eq!(writer.applied(), before);
         write_khz(&sysfs.0.join("scaling_max_freq"), 700).unwrap();
+    }
+
+    #[test]
+    fn user_cap_release_uses_hardware_max_even_when_missing_from_table() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        writer.policies[0].freqs.retain(|&khz| khz < 1000);
+        writer.apply(&[decision(100, 400, false)]).unwrap();
+        assert!(sysfs.range().1 <= 400);
+        writer.apply(&[decision(100, 1000, false)]).unwrap();
+        assert_eq!(sysfs.range(), (100, 1000));
+    }
+
+    #[test]
+    fn delayed_own_cap_does_not_block_cooldown_release() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        writer.apply(&[decision(500, 1000, false)]).unwrap();
+        writer.policies[0].pending_max = Some(700);
+        write_khz(&sysfs.0.join("scaling_max_freq"), 700).unwrap();
+        writer.reconcile().unwrap();
+        assert_eq!(sysfs.range(), (500, 1000));
+        assert_eq!(writer.policies[0].external_cap, None);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Aegis v3.5.0-rc.1 候选版默认配置，schema=1，单一自适应模式。
+# Aegis v3.6.0 默认配置，schema=1，单一自适应模式。
 # 开机从 sysfs 推导拓扑；capacity 缺失时估算，频表缺失时仅保留端点。
 schema = 1
 
@@ -72,6 +72,11 @@ lookahead_tiers = 3
 startup_guard_ms = 20000
 pressure_hold_ms = 1000
 demand_smooth_ms = 200
+
+# 选配的每簇自愿省电上限；留空或比例 1 不主动限制，保留温控且不锁最高频。
+# 键为实际簇首 CPU（如 cpu0/cpu3/cpu7），比例需 >0 且 <=1。
+# 0.5 = 硬件最高频率的 50%，向下对齐 OPP；低于硬件最低频率时夹到最低频率。
+[control.cluster_cap_ratio]
 
 [scene]
 # 场景地板为档位索引。阅读/视频连续至少 3 次有效超预算反馈才提高自适应地板；

@@ -367,7 +367,7 @@ check('派生规则', '字符串 100% 保持', 'true', String(C.deriveLatch('100
   const app = fs.readFileSync(path.join(__dirname, '../src/app.js'), 'utf8');
   const groups = app.slice(app.indexOf('  var LOG_LEVELS ='), app.indexOf('  function escapeHtml'));
   const validation = app.slice(app.indexOf('  function validateConfigModel('), app.indexOf('  function firstErrorText('));
-  Object.assign(sandbox, { Tempo: { Toml: T }, cfgRangeText: () => 'range' });
+  Object.assign(sandbox, { Tempo: { Toml: T }, state: { data: null }, cfgRangeText: () => 'range' });
   vm.runInContext(groups + validation, sandbox);
   const defaults = T.defaults();
   const model = T.normalize({});

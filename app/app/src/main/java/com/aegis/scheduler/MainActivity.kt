@@ -19,7 +19,10 @@ import org.json.JSONObject
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Aegis 控制台容器。
@@ -34,8 +37,11 @@ class MainActivity : Activity() {
     private lateinit var webView: WebView
     private val executor = Executors.newSingleThreadExecutor()
     private val labelExecutor = Executors.newSingleThreadExecutor()
+    private val shellRequests = AtomicInteger(0)
+    @Volatile private var closing = false
     private val packagesChanged = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            if (closing) return
             labelExecutor.execute {
                 appsCache = null
                 runOnUiThread {
@@ -112,6 +118,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        closing = true
         rootDialog?.dismiss()
         rootDialog = null
         unregisterReceiver(packagesChanged)
@@ -128,10 +135,11 @@ class MainActivity : Activity() {
      * 未授权时给出一次明确的授权引导。
      */
     private fun checkRootOnce() {
-        if (rootCheckStarted) return
+        if (closing || rootCheckStarted) return
         rootCheckStarted = true
         executor.execute {
             val rooted = hasRoot()
+            if (closing || Thread.currentThread().isInterrupted) return@execute
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putBoolean(KEY_ROOT_OK, rooted)
                 .apply()
@@ -152,30 +160,19 @@ class MainActivity : Activity() {
             arrayOf("su", "-c", "id")
         )
         for (argv in attempts) {
-            try {
-                val process = ProcessBuilder(*argv)
-                    .directory(File("/"))
-                    .redirectErrorStream(true)
-                    .start()
-                if (!process.waitFor(8, TimeUnit.SECONDS)) {
-                    process.destroyForcibly()
-                    continue
-                }
-                val output = process.inputStream.bufferedReader().use { it.readText() }
-                val text = output.trim()
-                if (process.exitValue() == 0 && (text.contains("uid=0") || text == "0")) {
-                    rootCommand = argv.dropLast(1).toTypedArray()
-                    return true
-                }
-            } catch (ignored: Exception) {
-                // 尝试下一种 su 调用形式
+            if (closing || Thread.currentThread().isInterrupted) return false
+            val result = executeProcess(argv, 8)
+            val text = result.second.trim()
+            if (result.first == 0 && (text.contains("uid=0") || text == "0")) {
+                rootCommand = argv.dropLast(1).toTypedArray()
+                return true
             }
         }
         return false
     }
 
     private fun showRootDialog() {
-        if (isFinishing || isDestroyed) return
+        if (closing || isFinishing || isDestroyed) return
         if (rootDialog != null) return
         rootDialog = AlertDialog.Builder(this)
             .setTitle("需要 root 权限")
@@ -196,22 +193,71 @@ class MainActivity : Activity() {
     /* ---------- shell ---------- */
 
     private fun runShell(command: String): Triple<Int, String, String> {
+        if (closing) return Triple(125, "", "页面已销毁，拒绝执行命令")
         if (!hasRoot()) return Triple(126, "", "root 控制通道不可用")
         // 业务命令只执行一次，不因失败重试或降级普通 shell。
-        val argv = rootCommand!! + command
+        return executeProcess(rootCommand!! + command, 20)
+    }
+
+    private fun executeProcess(argv: Array<String>, timeoutSeconds: Long): Triple<Int, String, String> {
+        if (closing) return Triple(125, "", "页面已销毁，拒绝执行命令")
+        val output = StringBuilder()
+        val readError = AtomicReference<Exception?>(null)
+        var process: Process? = null
+        var readerThread: Thread? = null
+        fun snapshot(): String = synchronized(output) { output.toString() }
         try {
-                val process = ProcessBuilder(*argv)
-                    .directory(File("/"))
-                    .redirectErrorStream(true)
-                    .start()
-                if (!process.waitFor(20, TimeUnit.SECONDS)) {
-                    process.destroyForcibly()
-                    return Triple(124, "", "命令执行超时")
+            if (Thread.currentThread().isInterrupted) throw InterruptedException()
+            val running = ProcessBuilder(*argv)
+                .directory(File("/"))
+                .redirectErrorStream(true)
+                .start()
+            process = running
+            val drainThread = Thread({
+                try {
+                    running.inputStream.bufferedReader().use { reader ->
+                        val buffer = CharArray(4096)
+                        while (true) {
+                            val count = reader.read(buffer)
+                            if (count < 0) break
+                            synchronized(output) {
+                                val kept = minOf(count, MAX_SHELL_OUTPUT_CHARS - output.length)
+                                if (kept > 0) output.append(buffer, 0, kept)
+                            }
+                        }
+                    }
+                } catch (error: Exception) {
+                    readError.set(error)
                 }
-                val output = process.inputStream.bufferedReader().use { it.readText() }
-                return Triple(process.exitValue(), output, "")
+            }, "aegis-shell-output").apply {
+                isDaemon = true
+                start()
+            }
+            readerThread = drainThread
+            running.outputStream.close()
+            if (!running.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                return Triple(124, snapshot(), "命令执行超时")
+            }
+            // 子进程可能仍持有输出管道，不无限等待 EOF。
+            drainThread.join(1000)
+            if (drainThread.isAlive) return Triple(124, snapshot(), "命令输出读取超时")
+            readError.get()?.let { return Triple(127, snapshot(), it.message ?: "读取命令输出失败") }
+            return Triple(running.exitValue(), snapshot(), "")
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return Triple(130, snapshot(), "命令执行已中断")
         } catch (error: Exception) {
-            return Triple(127, "", error.message ?: "无法执行命令")
+            return Triple(127, snapshot(), error.message ?: "无法执行命令")
+        } finally {
+            // 仅销毁直接启动的进程，不保证回收 su 创建的所有后代进程。
+            process?.let { running ->
+                runCatching { running.destroy() }
+                runCatching { running.destroyForcibly() }
+                runCatching { running.outputStream.close() }
+                runCatching { running.inputStream.close() }
+                runCatching { running.errorStream.close() }
+            }
+            readerThread?.interrupt()
         }
     }
 
@@ -222,13 +268,18 @@ class MainActivity : Activity() {
      * 只包含包名和应用名，不写路径、账号或其他信息。
      */
     private fun scheduleLabelsExport(force: Boolean = false) {
-        if (labelExecutor.isShutdown) return
-        labelExecutor.execute {
-            val now = System.currentTimeMillis()
-            if (!force && labelsExportedAt > 0 && now - labelsExportedAt < LABEL_RETRY_MS) return@execute
-            if (!force && now - labelsLastTry < LABEL_RETRY_MS) return@execute
-            labelsLastTry = now
-            exportLabels()
+        if (closing || labelExecutor.isShutdown) return
+        try {
+            labelExecutor.execute {
+                if (closing) return@execute
+                val now = System.currentTimeMillis()
+                if (!force && labelsExportedAt > 0 && now - labelsExportedAt < LABEL_RETRY_MS) return@execute
+                if (!force && now - labelsLastTry < LABEL_RETRY_MS) return@execute
+                labelsLastTry = now
+                exportLabels()
+            }
+        } catch (ignored: RejectedExecutionException) {
+            // 销毁时执行器可能已关闭。
         }
     }
 
@@ -285,18 +336,39 @@ class MainActivity : Activity() {
             val script = "window.AegisShellResolve(" +
                 JSONObject.quote(id) + "," + code + "," +
                 JSONObject.quote(stdout) + "," + JSONObject.quote(stderr) + ")"
-            runOnUiThread { if (!isDestroyed) webView.evaluateJavascript(script, null) }
+            runOnUiThread { if (!closing && !isDestroyed) webView.evaluateJavascript(script, null) }
         }
 
         @JavascriptInterface
         fun exec(command: String, id: String) {
+            if (closing) {
+                reply(id, 125, "", "页面已销毁，拒绝执行命令")
+                return
+            }
             if (command.isBlank()) {
                 reply(id, 2, "", "命令为空")
                 return
             }
-            executor.execute {
-                val result = runShell(command)
-                reply(id, result.first, result.second, result.third)
+            while (true) {
+                val count = shellRequests.get()
+                if (count >= MAX_SHELL_REQUESTS) {
+                    reply(id, 125, "", "命令通道忙碌，请稍后重试")
+                    return
+                }
+                if (shellRequests.compareAndSet(count, count + 1)) break
+            }
+            try {
+                executor.execute {
+                    try {
+                        val result = runShell(command)
+                        reply(id, result.first, result.second, result.third)
+                    } finally {
+                        shellRequests.decrementAndGet()
+                    }
+                }
+            } catch (error: RejectedExecutionException) {
+                shellRequests.decrementAndGet()
+                reply(id, 125, "", "命令通道已关闭")
             }
         }
 
@@ -306,10 +378,16 @@ class MainActivity : Activity() {
          */
         @JavascriptInterface
         fun apps(id: String, force: Boolean) {
-            labelExecutor.execute {
-                if (force) appsCache = null
-                val json = appMetadata()
-                reply(id, 0, json, "")
+            if (closing) return
+            try {
+                labelExecutor.execute {
+                    if (closing) return@execute
+                    if (force) appsCache = null
+                    val json = appMetadata()
+                    reply(id, 0, json, "")
+                }
+            } catch (error: RejectedExecutionException) {
+                reply(id, 125, "", "应用通道已关闭")
             }
         }
 
@@ -357,6 +435,8 @@ class MainActivity : Activity() {
     }
 
     companion object {
+        private const val MAX_SHELL_REQUESTS = 8
+        private const val MAX_SHELL_OUTPUT_CHARS = 1024 * 1024
         private const val PREFS = "aegis"
         private const val KEY_ROOT_OK = "root_ok"
         private const val LABEL_RETRY_MS = 10 * 60 * 1000L

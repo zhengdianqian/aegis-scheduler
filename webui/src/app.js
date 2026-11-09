@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '3.5.0-rc.1';
+  var APP_VERSION = '3.6.0';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -123,11 +123,11 @@
       title: '换档与目标档位',
       desc: '设置升档确认时间及不同场景的调度目标档位。',
       fields: [
-        { path: 'control.tier_table_max', label: '频率阶梯数', min: 6, max: 10, step: 1, integer: true, tip: '每簇频率阶梯数量，修改后需重启。' },
+        { path: 'control.tier_table_max', label: '频率阶梯数', min: 6, max: 10, step: 1, integer: true, tip: '每簇频率阶梯数量，保存后热更新。' },
         { path: 'control.up_confirm_ms', label: '升档确认', min: 40, max: 400, step: 1, integer: true, unit: 'ms', tip: '持续需求的升档确认时间。' },
         { path: 'control.max_up_step', label: '最大升档步数', min: 1, max: 4, step: 1, integer: true, tip: '单次最多提升的档数。' },
-        { path: 'control.prime_cap_ratio', label: '超大核档位上限', min: 0.30, max: 0.90, step: 0.01, decimals: 2, tip: '正常负载下的超大核档位上限。' },
-        { path: 'control.ime_cap_ratio', label: '输入法档位上限', min: 0.25, max: 0.80, step: 0.01, decimals: 2, tip: '输入法前台时的调度目标档位上限。' }
+        { path: 'control.prime_cap_ratio', label: '超大核调度目标比例', min: 0.30, max: 0.90, step: 0.01, decimals: 2, tip: '限制超大核推测性抬升；经确认的负载需求和持续帧压力可突破，不是硬件频率硬上限。' },
+        { path: 'control.ime_cap_ratio', label: '输入法调度目标比例', min: 0.25, max: 0.80, step: 0.01, decimals: 2, tip: '输入法前台时的调度目标档位比例，不是硬件频率硬上限。' }
       ]
     },
     {
@@ -135,11 +135,11 @@
       title: '采样与确认',
       desc: '事件采样密度与静默确认时间；采样越稀，自身唤醒越少。',
       fields: [
-        { path: 'events.runtime_quantum_us', label: '需求结算窗口', min: 500, max: 300000, step: 250, integer: true, unit: 'µs', tip: '每簇累计运行量达到该值才结算一次需求，不是定时器周期。' },
-        { path: 'events.demand_step', label: '需求上报步长', min: 0.01, max: 0.20, step: 0.01, decimals: 2, tip: '需求变化达到该步长才上报，越大越省唤醒。' },
+        { path: 'events.runtime_quantum_us', label: '需求结算窗口', min: 500, max: 300000, step: 250, integer: true, unit: 'µs', tip: '每簇累计运行量达到该值才结算一次需求，不是定时器周期；修改后需重启服务。' },
+        { path: 'events.demand_step', label: '需求上报步长', min: 0.01, max: 0.20, step: 0.01, decimals: 2, tip: '需求变化达到该步长才上报，越大越省唤醒；修改后需重启服务。' },
         { path: 'events.quiet_decay_ms', label: '静默延迟', min: 20, max: 2000, step: 10, integer: true, unit: 'ms', tip: '最后一次触摸后至少经过该时间才允许进入静默。' },
         { path: 'control.floor_settle_ms', label: '静默确认时间', min: 10, max: 1000, step: 10, integer: true, unit: 'ms', tip: '前台负载持续低于进入阈值多久才确认静默。' },
-        { path: 'daemon.log_level', label: '日志级别', kind: 'select', options: LOG_LEVELS, tip: '日志级别越高写入越少；排查问题时可临时调低。' }
+        { path: 'daemon.log_level', label: '日志级别', kind: 'select', options: LOG_LEVELS, tip: '日志级别越高写入越少；排查问题时可临时调低，修改后需重启服务。' }
       ]
     }
   ];
@@ -175,7 +175,44 @@
   });
   /* 保存时只覆盖界面暴露的字段，其余字段按设备原样保留。 */
   var CFG_WRITE_PATHS = CFG_FIELDS.map(function (def) { return def.path; })
-    .concat(['charge.latch_per_plug']);
+    .concat(['charge.latch_per_plug', 'control.cluster_cap_ratio']);
+
+  function clusterCapFields() {
+    var clusters = state.data && state.data.status && state.data.status.clusters;
+    return (Array.isArray(clusters) ? clusters : []).filter(function (cluster) {
+      return Array.isArray(cluster.cpus) && Number.isInteger(cluster.cpus[0]) && cluster.cpus[0] >= 0;
+    }).map(function (cluster) {
+      return {
+        path: 'control.cluster_cap_ratio.cpu' + cluster.cpus[0],
+        label: 'CPU ' + cluster.cpus.join(', ') + ' · 自愿省电比例',
+        min: 0, max: 1, step: 0.01, clusterCap: true,
+        tip: '硬件范围 ' + formatGhz(cluster.min_khz) + '–' + formatGhz(cluster.max_khz) +
+          ' GHz；1 不主动限制。0.5 按硬件最高频率的 50% 向下对齐 OPP，低于最低频率时夹到最低频率；实际频点由守护计算。'
+      };
+    });
+  }
+
+  function configFields() {
+    return CFG_FIELDS.concat(clusterCapFields());
+  }
+
+  function cfgFieldValue(model, def) {
+    var value = Tempo.Toml.readPath(model, def.path);
+    return def.clusterCap && value === undefined ? 1 : value;
+  }
+
+  function renderClusterCaps(errors) {
+    var fields = clusterCapFields();
+    return '<section class="card cfg-group"><header class="cfg-group__head"><div>' +
+      '<h2>每簇自愿省电（选配）</h2>' +
+      '<p>默认不主动限制；留空配置或比例 1 为不限。仅设置上限，保留系统温控，不锁最高频；温控与调度仍可降低频率。</p>' +
+      '</div><button class="ghost-btn ghost-btn--sm" data-action="cfg-reset" data-group="cluster-caps">恢复不限</button></header>' +
+      (fields.length ? fields.map(function (def) {
+        return renderCfgField(def, state.cfg.draft, errors);
+      }).join('') : '<p>暂未读取到簇状态，未生成任何限制；已有配置保留不变。</p>') +
+      (errors['control.cluster_cap_ratio'] ? '<p class="cfg-error">' + escapeHtml(errors['control.cluster_cap_ratio']) + '</p>' : '') +
+      '</section>';
+  }
 
   function escapeHtml(value) {
     return String(value == null ? '' : value)
@@ -608,17 +645,19 @@
     if (def.kind === 'select') return String(value == null ? '' : value);
     var number = Number(value);
     if (!isFinite(number)) return '--';
+    if (def.clusterCap) return String(value);
     if (def.integer) return String(Math.round(number));
     return number.toFixed(def.decimals == null ? 2 : def.decimals);
   }
 
   function cfgRangeText(def) {
     if (def.kind === 'select') return def.options.join(' / ');
+    if (def.clusterCap) return '>0 且 ≤1';
     return cfgNumberText(def, def.min) + '–' + cfgNumberText(def, def.max);
   }
 
   function renderCfgField(def, model, errors) {
-    var value = Tempo.Toml.readPath(model, def.path);
+    var value = cfgFieldValue(model, def);
     var error = errors[def.path];
     var inputId = 'cfg-' + def.path.replace(/\./g, '-');
     var head =
@@ -665,8 +704,8 @@
 
   function validateConfigModel(model) {
     var errors = {};
-    CFG_FIELDS.forEach(function (def) {
-      var value = Tempo.Toml.readPath(model, def.path);
+    configFields().forEach(function (def) {
+      var value = cfgFieldValue(model, def);
       if (def.kind === 'select') {
         if (def.options.indexOf(String(value)) === -1) errors[def.path] = '取值不在允许范围';
         return;
@@ -684,6 +723,20 @@
         errors[def.path] = '需在 ' + cfgRangeText(def) + ' 范围内';
       }
     });
+
+    var caps = model.control.cluster_cap_ratio;
+    if (!caps || typeof caps !== 'object' || Array.isArray(caps)) {
+      errors['control.cluster_cap_ratio'] = '每簇比例必须是 TOML 表';
+    } else {
+      Object.keys(caps).forEach(function (key) {
+        var value = caps[key];
+        if (!/^cpu\d+$/.test(key) || typeof value !== 'number' || !isFinite(value) || value <= 0 || value > 1) {
+          var message = key + '：键需为 cpu 加实际簇首 CPU，比例必须为数字且 >0、≤1';
+          errors['control.cluster_cap_ratio.' + key] = message;
+          errors['control.cluster_cap_ratio'] = message;
+        }
+      });
+    }
 
     var control = model.control;
     var events = model.events;
@@ -707,9 +760,6 @@
 
     if (control.floor_exit_ratio <= control.floor_enter_ratio) {
       errors['control.floor_exit_ratio'] = '静默退出阈值必须高于静默进入阈值';
-    }
-    if (control.floor_enter_ratio > control.drop_ratio) {
-      errors['control.floor_enter_ratio'] = '静默进入阈值不能高于吸附最低频阈值';
     }
     if (events.quiet_decay_ms + control.floor_settle_ms > 300) {
       var budget = '静默进入预算需 ≤ 300ms（当前 ' + Math.round(events.quiet_decay_ms + control.floor_settle_ms) + 'ms）';
@@ -807,6 +857,7 @@
             }).join('') +
           '</section>';
       }).join('') +
+      renderClusterCaps(errors) +
       renderSavebar(errors);
   }
 
@@ -1147,7 +1198,7 @@
     if (!state.cfg.loaded) return;
     var errors = validateConfigModel(state.cfg.draft);
 
-    CFG_FIELDS.forEach(function (def) {
+    configFields().forEach(function (def) {
       var row = document.querySelector('.cfgrow[data-key="' + def.path + '"]');
       if (!row) return;
       var error = errors[def.path];
@@ -1159,7 +1210,7 @@
       }
       var label = row.querySelector('[data-value-for="' + def.path + '"]');
       if (label) {
-        label.textContent = cfgNumberText(def, Tempo.Toml.readPath(state.cfg.draft, def.path));
+        label.textContent = cfgNumberText(def, cfgFieldValue(state.cfg.draft, def));
       }
     });
 
@@ -1260,10 +1311,10 @@
   /** 保存成功后把回读值同步回控件，避免整页重绘导致整屏闪动。 */
   function syncConfigInputs() {
     if (!state.cfg.loaded) return;
-    CFG_FIELDS.forEach(function (def) {
+    configFields().forEach(function (def) {
       var row = document.querySelector('.cfgrow[data-key="' + def.path + '"]');
       if (!row) return;
-      var value = Tempo.Toml.readPath(state.cfg.draft, def.path);
+      var value = cfgFieldValue(state.cfg.draft, def);
       var text = cfgNumberText(def, value);
       var range = row.querySelector('input[type="range"]');
       if (range) range.value = String(Math.min(def.max, Math.max(def.min, Number(value))));
@@ -1389,6 +1440,19 @@
   }
 
   function resetCfgGroup(groupId) {
+    if (groupId === 'cluster-caps' && state.cfg.loaded) {
+      var caps = state.cfg.draft.control.cluster_cap_ratio;
+      if (!caps || typeof caps !== 'object' || Array.isArray(caps)) {
+        state.cfg.draft.control.cluster_cap_ratio = {};
+      }
+      clusterCapFields().forEach(function (def) {
+        delete state.cfg.draft.control.cluster_cap_ratio[def.path.split('.').pop()];
+      });
+      state.cfg.saveMessage = '已将当前显示的簇恢复不限，尚未保存；其他簇配置保留';
+      state.cfg.saveTone = 'info';
+      render();
+      return;
+    }
     var group = CFG_GROUPS.concat(POWER_GROUPS).filter(function (item) { return item.id === groupId; })[0];
     if (!group || !state.cfg.loaded) return;
     var defaults = Tempo.Toml.defaults();
@@ -1404,7 +1468,9 @@
   function onCfgFieldInput(target) {
     var field = target.closest('[data-field]');
     if (!field) return;
-    var def = CFG_FIELD_MAP[field.dataset.field];
+    var def = CFG_FIELD_MAP[field.dataset.field] || clusterCapFields().filter(function (item) {
+      return item.path === field.dataset.field;
+    })[0];
     if (!def) return;
 
     var raw = field.value;
@@ -1412,7 +1478,15 @@
     if (def.kind === 'select') {
       value = raw;
     } else {
-      if (raw === '' || raw === '-' || raw === '.') return;
+      if (raw === '' || raw === '-' || raw === '.') {
+        if (def.clusterCap) {
+          Tempo.Toml.writePath(state.cfg.draft, def.path, raw);
+          state.cfg.saveMessage = null;
+          state.cfg.saveTone = null;
+          applyValidationUi();
+        }
+        return;
+      }
       value = Number(raw);
       if (!isFinite(value)) return;
       if (def.integer) value = Math.round(value);
@@ -1804,7 +1878,7 @@
 
   /** 只在充电页可见时读取实时电源快照，避免后台轮询。 */
   function fetchPower() {
-    if (!api || state.power.inFlight) return;
+    if (!api || state.power.inFlight || state.tab !== 'power' || document.hidden || global.__AEGIS_FOREGROUND__ === false) return;
     state.power.inFlight = true;
     var finish = function () {
       state.power.inFlight = false;

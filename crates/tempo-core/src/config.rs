@@ -2,6 +2,7 @@
 // Copyright (c) 2026 默默的阿文
 // Aegis is an independent implementation. No third-party module source is included.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,8 @@ pub struct EventsConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ControlConfig {
+    /// Optional hardware-max ratios keyed by the cluster's first CPU (e.g. cpu0).
+    pub cluster_cap_ratio: BTreeMap<String, f32>,
     pub quiet_ratio: f32,
     pub quiet_cap: f32,
     pub floor_enter_ratio: f32,
@@ -105,11 +108,7 @@ pub struct ControlConfig {
     /// Even under sustained UI load the prime cluster is budgeted below its
     /// top tier; only genuinely heavy frame pressure earns the last steps.
     pub prime_load_cap: f32,
-    /// Span above the current floor that the governor may still use. The
-    /// writer caps `scaling_max_freq` at `floor + span * ceiling_headroom`,
-    /// so a vendor boost or an input hint can no longer slam a cluster to its
-    /// top tier while the measured demand stays low. Real frame pressure
-    /// raises the floor first, which lifts the cap with it.
+    /// Legacy hard-cap setting retained for config compatibility.
     pub ceiling_headroom: f32,
     /// Time to climb through all touch ramp stages. Three stages within this
     /// window keep the perceived response under ~50 ms.
@@ -140,14 +139,13 @@ pub struct ControlConfig {
     pub touch_lift_tiers: u32,
     /// Warm-start tier as a fraction of the ladder. Deliberately below 1.0.
     pub launch_tier_ratio: f32,
-    /// Upper cap for the prime cluster under normal load.
+    /// Limits speculative prime targets, not sustained load or the governor maximum.
     pub prime_cap_ratio: f32,
-    /// Upper cap while an input method owns the foreground.
+    /// Limits the target tier while an input method owns the foreground.
     pub ime_cap_ratio: f32,
-    /// Baseline upper bound as a fraction of the ladder, subject to sparse
-    /// idle bands and thermal limits.
+    /// Legacy hard-cap setting retained for config compatibility.
     pub safety_ceiling_ratio: f32,
-    /// Tiers of headroom between the operating target and the max cap.
+    /// Legacy hard-cap setting retained for config compatibility.
     pub lookahead_tiers: u32,
     /// Read-only guard after daemon start; no sysfs writes inside this window.
     pub startup_guard_ms: u64,
@@ -262,6 +260,7 @@ impl Default for EventsConfig {
 impl Default for ControlConfig {
     fn default() -> Self {
         Self {
+            cluster_cap_ratio: BTreeMap::new(),
             quiet_ratio: 0.50,
             quiet_cap: 0.28,
             // Foreground micro-motion on a static page (status bar, cursor
@@ -481,6 +480,23 @@ impl Config {
         }
 
         let c = &self.control;
+        for (key, ratio) in &c.cluster_cap_ratio {
+            let valid_key = key.strip_prefix("cpu").is_some_and(|cpu| {
+                !cpu.is_empty()
+                    && cpu.bytes().all(|byte| byte.is_ascii_digit())
+                    && cpu.parse::<u32>().is_ok()
+            });
+            if !valid_key {
+                bad.push(format!(
+                    "control.cluster_cap_ratio key {key:?} must be cpu followed by a u32"
+                ));
+            }
+            if !ratio.is_finite() || *ratio <= 0.0 || *ratio > 1.0 {
+                bad.push(format!(
+                    "control.cluster_cap_ratio.{key} must be finite and in (0, 1]"
+                ));
+            }
+        }
         if !(0.05..=0.95).contains(&c.quiet_ratio) {
             bad.push("control.quiet_ratio must be 0.05..=0.95".to_owned());
         }
@@ -495,9 +511,6 @@ impl Config {
         }
         if c.floor_exit_ratio <= c.floor_enter_ratio {
             bad.push("control.floor_exit_ratio must be > control.floor_enter_ratio".to_owned());
-        }
-        if c.floor_enter_ratio > c.drop_ratio {
-            bad.push("control.floor_enter_ratio must be <= control.drop_ratio".to_owned());
         }
         if !(10..=1_000).contains(&c.floor_settle_ms) {
             bad.push("control.floor_settle_ms must be 10..=1000".to_owned());
@@ -769,6 +782,43 @@ mod tests {
         cfg.events.quiet_decay_ms = 500;
         cfg.control.floor_settle_ms = 500;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cluster_cap_ratios_are_optional_and_roundtrip() {
+        let mut cfg: Config = toml::from_str("schema = 1\n[control]\nquiet_ratio = 0.5\n").unwrap();
+        assert!(cfg.control.cluster_cap_ratio.is_empty());
+        cfg.control.cluster_cap_ratio.insert("cpu0".into(), 0.5);
+        cfg.control
+            .cluster_cap_ratio
+            .insert("cpu4294967295".into(), 1.0);
+        cfg.validate().unwrap();
+        let parsed: Config = toml::from_str(&cfg.to_toml_string().unwrap()).unwrap();
+        assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn cluster_cap_ratios_reject_invalid_keys_and_values() {
+        for key in [
+            "",
+            "cpu",
+            "CPU0",
+            "prime",
+            "cpu-1",
+            "cpu+1",
+            "cpu1.0",
+            "cpu 0",
+            "cpu4294967296",
+        ] {
+            let mut cfg = Config::default();
+            cfg.control.cluster_cap_ratio.insert(key.into(), 0.5);
+            assert!(cfg.validate().is_err(), "invalid key: {key}");
+        }
+        for ratio in [0.0, -0.5, 1.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut cfg = Config::default();
+            cfg.control.cluster_cap_ratio.insert("cpu0".into(), ratio);
+            assert!(cfg.validate().is_err(), "invalid ratio: {ratio}");
+        }
     }
 
     #[test]
