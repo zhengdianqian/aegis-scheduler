@@ -29,6 +29,7 @@ mod probe;
 mod screen;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod touch;
+mod vendor_policy;
 mod writer;
 
 #[derive(Debug, Parser)]
@@ -53,6 +54,14 @@ struct Args {
     /// Keep the cpufreq policies read-only. Used for measurement baselines.
     #[arg(long)]
     observe: bool,
+
+    /// Prepare vendor XML offline, without loading daemon config or activating it.
+    #[arg(long, value_name = "INPUT", requires = "vendor_policy_output")]
+    vendor_policy_transform: Option<PathBuf>,
+
+    /// New output file for --vendor-policy-transform; never overwrites a file.
+    #[arg(long, value_name = "OUTPUT", requires = "vendor_policy_transform")]
+    vendor_policy_output: Option<PathBuf>,
 
     /// Validate configuration and profile, print a summary, then exit.
     #[arg(long)]
@@ -126,8 +135,67 @@ fn wait_for_boot() -> bool {
     true
 }
 
+#[cfg(test)]
+mod vendor_cli_tests {
+    use super::*;
+
+    #[test]
+    fn offline_conversion_requires_both_paths() {
+        assert!(Args::try_parse_from(["Aegis", "--vendor-policy-transform", "input.xml"]).is_err());
+        assert!(Args::try_parse_from(["Aegis", "--vendor-policy-output", "output.xml"]).is_err());
+        let args = Args::try_parse_from([
+            "Aegis",
+            "--config",
+            "nonexistent-config.toml",
+            "--vendor-policy-transform",
+            "input.xml",
+            "--vendor-policy-output",
+            "output.xml",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.vendor_policy_transform,
+            Some(PathBuf::from("input.xml"))
+        );
+        assert_eq!(args.vendor_policy_output, Some(PathBuf::from("output.xml")));
+    }
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
+
+    if let Some(input) = &args.vendor_policy_transform {
+        let output = args
+            .vendor_policy_output
+            .as_ref()
+            .expect("clap requires output");
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            use std::io::Write;
+            let original = std::fs::read(input)?;
+            let transformed = vendor_policy::transform(&original)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)?;
+            file.write_all(&transformed)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        return match result {
+            Ok(()) => {
+                println!(
+                    "Aegis: vendor XML prepared offline; {}",
+                    vendor_policy::STATUS
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Aegis: vendor XML preparation rejected: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
 
     let mut config = match Config::load(&args.config) {
         Ok(config) => config,

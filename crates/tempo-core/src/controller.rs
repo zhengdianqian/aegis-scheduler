@@ -390,6 +390,20 @@ impl Controller {
         self.evaluate(ts_us, DecisionReason::Launch)
     }
 
+    pub fn on_app_displayed(&mut self, ts_us: u64) -> Vec<Decision> {
+        if !self.screen_on {
+            return Vec::new();
+        }
+        let Some(until) = self.launch_until_us else {
+            return Vec::new();
+        };
+        if ts_us >= until {
+            return Vec::new();
+        }
+        self.launch_until_us = Some(until.min(ts_us.saturating_add(80 * US_PER_MS)));
+        self.evaluate(ts_us, DecisionReason::Load)
+    }
+
     pub fn on_scene(&mut self, ts_us: u64, scene: Scene) -> Vec<Decision> {
         if scene == self.scene {
             return Vec::new();
@@ -615,7 +629,8 @@ impl Controller {
         let load = ((demand - self.config.control.floor_enter_ratio)
             / (0.75 - self.config.control.floor_enter_ratio).max(0.01))
         .clamp(0.0, 1.0);
-        let mut tier = self.ratio_tier(load, count).max(floor);
+        let load_tier = self.ratio_tier(load, count);
+        let mut tier = load_tier.max(floor);
 
         if self.burst_until_us.is_some_and(|until| ts_us < until) {
             tier = tier.max(self.ratio_tier(self.config.control.frame_burst_level, count));
@@ -636,7 +651,10 @@ impl Controller {
             tier = tier.min(self.ratio_tier(self.config.control.ime_cap_ratio, count));
         }
         if self.profile.clusters[index].role == Role::Prime && !self.pressure_active(ts_us) {
-            tier = tier.min(self.ratio_tier(self.config.control.prime_cap_ratio, count));
+            // Limit speculative boosts, not measured CPU demand. Load-driven
+            // climbs still pass through the confirmation window and step limit.
+            let prime_cap = self.ratio_tier(self.config.control.prime_cap_ratio, count);
+            tier = tier.min(prime_cap.max(load_tier));
         }
         tier.min(thermal_limit)
     }

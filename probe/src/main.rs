@@ -92,8 +92,8 @@ static FG_PIDS: HashMap<u32, u8> = HashMap::<u32, u8>::with_max_entries(FG_SLOTS
 static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BYTES, 0);
 
 /// Screen gate, written by the daemon from its display-state event source.
-/// While the screen is off the probe keeps accounting demand but publishes
-/// nothing, so a dozing device stays free of control wake-ups.
+/// While the screen is off the probe only invalidates measurement anchors,
+/// skipping demand accounting and publishing no control wake-ups.
 #[map]
 static SCREEN_ON: Array<u32> = Array::<u32>::with_max_entries(1, 0);
 
@@ -110,39 +110,51 @@ pub fn tempo_sched_switch(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn handle(ctx: &TracePointContext) -> Result<(), i64> {
-    let prev_pid: u32 = ctx.read_at(PREV_PID_OFFSET)?;
-    let next_pid: u32 = ctx.read_at(NEXT_PID_OFFSET)?;
-
-    // `bpf_ktime_get_ns` returns nanoseconds; the whole pipeline (counters,
-    // thresholds, event payload) works in microseconds, so convert once here.
-    let now = bpf_ktime_get_ns() / 1_000;
-    let cpu = bpf_get_smp_processor_id();
-
-    let params = PARAMS.get(0).ok_or(0_i64)?;
     let last_ts = CPU_TS.get_ptr_mut(0).ok_or(0_i64)?;
-
-    // An idle CPU coming back to life contributes no busy time: reset its
-    // anchor so the next switch measures a short interval, and publish nothing.
-    // Rising demand is reported by the ratio step below, like any other change.
-    if prev_pid == 0 {
-        last_ts.write_volatile(now);
-        let _ = next_pid;
-        return Ok(());
-    }
-
+    let cpu = bpf_get_smp_processor_id();
     let cluster = *CPU_CLUSTER.get(cpu).ok_or(0_i64)?;
     if cluster >= MAX_CLUSTERS {
         return Ok(());
     }
-
-    let previous = last_ts.read_volatile();
-    last_ts.write_volatile(now);
-    let delta = if previous == 0 { 0 } else { now.saturating_sub(previous) };
-    if delta == 0 {
+    let state = CLUSTERS.get_ptr_mut(cluster).ok_or(0_i64)?;
+    if !screen_on() {
+        // Zero marks a fresh CPU baseline on wake; do not charge the sleeping
+        // interval or retain a partially accumulated cluster window.
+        last_ts.write_volatile(0);
+        (*state).win_start_us = 0;
+        (*state).acc_us = 0;
+        (*state).fg_acc_us = 0;
+        (*state).busy_bp = 0;
+        (*state).fg_bp = 0;
         return Ok(());
     }
 
-    let state = CLUSTERS.get_ptr_mut(cluster).ok_or(0_i64)?;
+    // `bpf_ktime_get_ns` returns nanoseconds; counters use microseconds.
+    let now = bpf_ktime_get_ns() / 1_000;
+    let previous = last_ts.read_volatile();
+    last_ts.write_volatile(now);
+    if previous == 0 || (*state).win_start_us == 0 {
+        (*state).win_start_us = now;
+        (*state).acc_us = 0;
+        (*state).fg_acc_us = 0;
+        (*state).busy_bp = 0;
+        (*state).fg_bp = 0;
+        return Ok(());
+    }
+
+    let prev_pid: u32 = ctx.read_at(PREV_PID_OFFSET)?;
+    let next_pid: u32 = ctx.read_at(NEXT_PID_OFFSET)?;
+    // An idle CPU coming back to life contributes no busy time.
+    if prev_pid == 0 {
+        let _ = next_pid;
+        return Ok(());
+    }
+    // A sibling CPU may have reset the shared window while this CPU slept.
+    let delta = now.saturating_sub(previous.max((*state).win_start_us));
+    if delta == 0 {
+        return Ok(());
+    }
+    let params = PARAMS.get(0).ok_or(0_i64)?;
     (*state).busy_us = (*state).busy_us.saturating_add(delta);
     (*state).switches = (*state).switches.saturating_add(1);
     let is_foreground = FG_PIDS.get(&prev_pid).is_some();

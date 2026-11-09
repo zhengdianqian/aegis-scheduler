@@ -1,4 +1,4 @@
-# Aegis v3.4.0 默认配置，schema=1，单一自适应模式。
+# Aegis v3.5.0-rc.1 候选版默认配置，schema=1，单一自适应模式。
 # 开机从 sysfs 推导拓扑；capacity 缺失时估算，频表缺失时仅保留端点。
 schema = 1
 

@@ -123,6 +123,69 @@ fn load_climbs_in_steps_and_never_starts_at_the_top() {
 }
 
 #[test]
+fn sustained_cpu_demand_reaches_hardware_max_without_frame_feedback() {
+    for foreground_known in [false, true] {
+        let mut config = Config::default();
+        config.control.prime_cap_ratio = 0.30;
+        let mut controller = Controller::new(profile(), config);
+        for ts in (100..3_000).step_by(160) {
+            let mut sample = demand(ts, 0.9);
+            if !foreground_known {
+                sample.foreground_busy = vec![0.0; 3];
+                sample.foreground_active = false;
+            }
+            controller.on_demand(sample);
+        }
+        for (index, cluster) in controller.profile().clusters.iter().enumerate() {
+            assert_eq!(controller.ceiling_khz(index), cluster.max_khz);
+            assert_eq!(controller.cap_khz(index), cluster.max_khz);
+        }
+        controller.on_thermal_cap(3_000 * MS, Some(0.25));
+        for ts in (3_100..5_000).step_by(160) {
+            controller.on_demand(demand(ts, 0.95));
+        }
+        for (index, cluster) in controller.profile().clusters.iter().enumerate() {
+            let limit = cluster.min_khz + cluster.span_khz() / 4;
+            assert!(controller.ceiling_khz(index) <= controller.cap_khz(index));
+            assert!(controller.cap_khz(index) <= limit);
+        }
+    }
+}
+
+#[test]
+fn touch_and_isolated_load_noise_do_not_unlock_prime() {
+    let mut config = Config::default();
+    config.control.prime_cap_ratio = 0.30;
+    let mut controller = Controller::new(profile(), config);
+    controller.on_demand(demand(100, 0.0));
+    controller.on_deadline(2_000 * MS);
+    let touch = controller.on_touch(2_100 * MS);
+    assert_eq!(touch[2].tier, 0, "touch alone must not lift Prime");
+    controller.on_touch_up(2_110 * MS);
+    let spike = controller.on_demand(demand(2_200, 0.95));
+    assert_eq!(spike[2].tier, 0, "a spike must await confirmation");
+    controller.on_demand(demand(2_210, 0.0));
+    for ts in (2_250..5_000).step_by(50) {
+        controller.on_demand(demand(ts, 0.0));
+    }
+    assert_eq!(controller.tier(2), 0);
+    assert!(controller.cap_khz(2) < controller.profile().clusters[2].max_khz);
+}
+
+#[test]
+fn prime_cpu_demand_does_not_remove_ime_scene_limit() {
+    let config = Config::default();
+    let ratio = config.control.ime_cap_ratio;
+    let mut controller = Controller::new(profile(), config);
+    controller.on_scene(100 * MS, Scene::Ime);
+    for ts in (200..3_000).step_by(160) {
+        controller.on_demand(demand(ts, 0.95));
+    }
+    let limit = (ratio * (controller.tier_count(2) - 1) as f32).round() as usize;
+    assert_eq!(controller.tier(2), limit);
+}
+
+#[test]
 fn cap_is_never_below_the_safety_band() {
     let mut controller = Controller::new(profile(), Config::default());
     for _ in 0..30 {
@@ -341,6 +404,45 @@ fn quiet_entry_waits_for_launch_window_expiry() {
     );
     controller.on_deadline(1_100 * MS);
     assert!(controller.is_quiet());
+}
+
+#[test]
+fn first_frame_shortens_launch_to_eighty_ms() {
+    let mut controller = Controller::new(profile(), Config::default());
+    controller.on_app_launch(100 * MS);
+    controller.on_app_displayed(200 * MS);
+    assert_eq!(controller.next_deadline(200 * MS).unwrap().at_us, 280 * MS);
+    controller.on_demand(demand(210, 0.0));
+    controller.on_deadline(279 * MS);
+    assert!(!controller.is_quiet());
+    controller.on_deadline(280 * MS);
+    assert!(controller.is_quiet());
+}
+
+#[test]
+fn first_frame_never_extends_existing_or_expired_deadline() {
+    let mut controller = Controller::new(profile(), Config::default());
+    assert!(controller.on_app_displayed(50 * MS).is_empty());
+    controller.on_app_launch(100 * MS);
+    controller.on_app_displayed(1_060 * MS);
+    assert_eq!(
+        controller.next_deadline(1_060 * MS).unwrap().at_us,
+        1_100 * MS
+    );
+    assert!(controller.on_app_displayed(1_200 * MS).is_empty());
+    assert!(controller.next_deadline(1_200 * MS).is_none());
+    controller.on_screen(1_300 * MS, false);
+    assert!(controller.on_app_displayed(1_400 * MS).is_empty());
+    assert!(controller.next_deadline(1_400 * MS).is_none());
+}
+
+#[test]
+fn repeated_first_frame_cannot_extend_shortened_deadline() {
+    let mut controller = Controller::new(profile(), Config::default());
+    controller.on_app_launch(100 * MS);
+    controller.on_app_displayed(200 * MS);
+    controller.on_app_displayed(250 * MS);
+    assert_eq!(controller.next_deadline(250 * MS).unwrap().at_us, 280 * MS);
 }
 
 #[test]

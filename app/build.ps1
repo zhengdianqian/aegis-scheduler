@@ -102,8 +102,17 @@ if (-not $buildTools) { throw "未在 $sdkDir\build-tools 下找到 apksigner（
 $apksigner = Join-Path $buildTools 'apksigner.bat'
 $aapt2 = Join-Path $buildTools 'aapt2.exe'
 
-$verifyOutput = & $apksigner verify --verbose --print-certs $apkOut 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) { throw "apksigner verify 失败：`n$verifyOutput" }
+# Windows PowerShell reports native stderr warnings as errors; exit status
+# remains the signature-verification gate.
+$previousErrorAction = $ErrorActionPreference
+try {
+  $ErrorActionPreference = 'Continue'
+  $verifyOutput = & $apksigner verify --verbose --print-certs $apkOut 2>&1 | Out-String
+  $verifyExitCode = $LASTEXITCODE
+} finally {
+  $ErrorActionPreference = $previousErrorAction
+}
+if ($verifyExitCode -ne 0) { throw "apksigner verify 失败：`n$verifyOutput" }
 
 $certDn = ([regex]::Match($verifyOutput, 'Signer #1 certificate DN: (.+)')).Groups[1].Value.Trim()
 $certSha256 = ([regex]::Match($verifyOutput, 'Signer #1 certificate SHA-256 digest: ([0-9a-f]+)')).Groups[1].Value.Trim()

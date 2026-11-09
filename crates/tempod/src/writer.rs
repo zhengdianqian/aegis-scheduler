@@ -14,6 +14,37 @@ use tempo_core::DeviceProfile;
 pub const CPUFREQ_ROOT: &str = "/sys/devices/system/cpu/cpufreq";
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Stable readbacks stretch safety polling only; event-driven applies never wait.
+pub(crate) struct ReconcileBackoff {
+    seconds: u64,
+}
+
+impl ReconcileBackoff {
+    pub(crate) fn new() -> Self {
+        Self { seconds: 1 }
+    }
+
+    pub(crate) fn reset(&mut self) -> u64 {
+        self.seconds = 1;
+        self.seconds * 1_000_000
+    }
+
+    pub(crate) fn expedite(&mut self) -> bool {
+        let stretched = self.seconds > 1;
+        self.reset();
+        stretched
+    }
+
+    pub(crate) fn observe(&mut self, screen_on: bool, disturbed: bool) -> u64 {
+        if disturbed {
+            return self.reset();
+        }
+        let maximum = if screen_on { 8 } else { 30 };
+        self.seconds = (self.seconds * 2).min(maximum);
+        self.seconds * 1_000_000
+    }
+}
+
 struct Policy {
     cluster: usize,
     dir: PathBuf,
@@ -144,11 +175,13 @@ impl CpufreqWriter {
         self.last_error.clone().map_or(Ok(()), Err)
     }
 
-    /// 周期校验两端；尊重外部上限，下限争写或拒绝写入暂时退避。
-    pub fn reconcile(&mut self) -> Result<(), String> {
+    /// 周期校验两端；Ok(true) 表示此次读回观察到漂移（即使未写入）。
+    /// 尊重外部上限，下限争写或拒绝写入暂时退避；读取/写入错误返回 Err。
+    pub fn reconcile(&mut self) -> Result<bool, String> {
         if self.guarded() {
-            return Ok(());
+            return Ok(false);
         }
+        let mut drifted = false;
         let now = Instant::now();
         for policy in &mut self.policies {
             if policy.last_target == 0
@@ -159,7 +192,7 @@ impl CpufreqWriter {
                 continue;
             }
             policy.last_reconcile = Some(now);
-            sync_policy(
+            drifted |= sync_policy(
                 policy,
                 now,
                 &mut self.applied,
@@ -168,7 +201,7 @@ impl CpufreqWriter {
                 &mut self.rejected_floor,
             );
         }
-        self.result()
+        self.result().map(|()| drifted)
     }
 
     /// ceiling_khz 是历史命名的运行下限，cap_khz 才是上限。
@@ -377,16 +410,17 @@ fn sync_policy(
     cap_writes: &mut u64,
     floor_writes: &mut u64,
     rejected_floor: &mut u64,
-) {
+) -> bool {
     let live = match read_range(&policy.dir) {
         Ok(live) => live,
         Err(problem) => {
             if !policy.retry_at.is_some_and(|at| now < at) {
                 backoff(policy, now, problem);
             }
-            return;
+            return false;
         }
     };
+    let externally_changed = policy.observed.is_some_and(|previous| previous != live);
     // Only a max different from our last successful range is external evidence.
     // In particular, our own lower cap must neither tighten nor release this latch.
     if let Some((_, previous_max)) = policy.observed {
@@ -410,10 +444,10 @@ fn sync_policy(
         policy.error = constraint;
         policy.retry_at = None;
         policy.retries = 0;
-        return;
+        return externally_changed;
     }
     if policy.retry_at.is_some_and(|at| now < at) {
-        return;
+        return true;
     }
     if policy.retry_at.is_none() && policy.observed.is_some_and(|previous| previous != live) {
         backoff(
@@ -426,7 +460,7 @@ fn sync_policy(
                 live.1
             ),
         );
-        return;
+        return true;
     }
     let dir = policy.dir.clone();
     let result = set_range(&dir, desired.0, desired.1, |path, value| {
@@ -460,6 +494,7 @@ fn sync_policy(
         }
         Err(problem) => backoff(policy, now, problem),
     }
+    true
 }
 
 fn write_verified(path: &Path, value: u32) -> Result<(), String> {
@@ -570,6 +605,101 @@ mod tests {
             &mut writer.rejected_floor,
         );
         let _ = writer.result();
+    }
+
+    #[test]
+    fn stable_reconcile_backoff_is_bounded_and_disturbance_resets_immediately() {
+        let mut backoff = ReconcileBackoff::new();
+        assert_eq!(backoff.reset(), 1_000_000);
+        for seconds in [2, 4, 8, 8, 8] {
+            assert_eq!(backoff.observe(true, false), seconds * 1_000_000);
+        }
+        for seconds in [16, 30, 30] {
+            assert_eq!(backoff.observe(false, false), seconds * 1_000_000);
+        }
+        assert_eq!(backoff.observe(true, false), 8_000_000);
+        assert_eq!(backoff.observe(false, true), 1_000_000);
+        assert_eq!(backoff.observe(true, true), 1_000_000);
+        assert_eq!(backoff.observe(true, false), 2_000_000);
+        assert!(backoff.expedite());
+        assert!(!backoff.expedite());
+        assert_eq!(backoff.observe(true, false), 2_000_000);
+        assert_eq!(backoff.reset(), 1_000_000);
+    }
+
+    #[test]
+    fn stable_poll_backoff_does_not_delay_event_driven_apply() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        writer.apply(&[decision(100, 300, true)]).unwrap();
+        let mut backoff = ReconcileBackoff::new();
+        for _ in 0..6 {
+            backoff.observe(false, writer.reconcile().unwrap());
+        }
+        assert_eq!(backoff.seconds, 30);
+        writer.apply(&[decision(700, 1000, false)]).unwrap();
+        assert_eq!(sysfs.range(), (700, 1000));
+        writer.apply(&[decision(100, 300, true)]).unwrap();
+        assert_eq!(sysfs.range(), (100, 300));
+    }
+
+    #[test]
+    fn reconcile_reports_current_drift_not_cumulative_writes() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        writer.apply(&[decision(500, 700, false)]).unwrap();
+        assert!(writer.applied() > 0);
+        assert!(!writer.reconcile().unwrap());
+        let before = writer.applied();
+        write_khz(&sysfs.0.join("scaling_min_freq"), 100).unwrap();
+        // Simulate an unverified initial range: reconcile repairs it immediately.
+        writer.policies[0].observed = None;
+        writer.policies[0].last_reconcile = None;
+        assert!(writer.reconcile().unwrap());
+        assert!(writer.applied() > before);
+        writer.policies[0].last_reconcile = None;
+        assert!(!writer.reconcile().unwrap());
+    }
+
+    #[test]
+    fn reconcile_conflict_and_read_error_reset_backoff_without_writes() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        writer.apply(&[decision(500, 700, false)]).unwrap();
+        let before = writer.applied();
+        write_khz(&sysfs.0.join("scaling_min_freq"), 100).unwrap();
+        let mut backoff = ReconcileBackoff::new();
+        backoff.observe(false, false);
+        assert!(writer.reconcile().is_err());
+        writer.policies[0].last_reconcile = None;
+        assert_eq!(
+            backoff.observe(false, writer.reconcile().unwrap_or(true)),
+            1_000_000
+        );
+        assert_eq!(writer.applied(), before);
+        fs::remove_file(sysfs.0.join("scaling_max_freq")).unwrap();
+        writer.policies[0].last_reconcile = None;
+        backoff.observe(false, false);
+        assert_eq!(
+            backoff.observe(false, writer.reconcile().unwrap_or(true)),
+            1_000_000
+        );
+        assert_eq!(writer.applied(), before);
+        write_khz(&sysfs.0.join("scaling_max_freq"), 700).unwrap();
+    }
+
+    #[test]
+    fn reconcile_detects_external_release_even_when_already_at_target() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        writer.apply(&[decision(500, 1000, false)]).unwrap();
+        writer.policies[0].observed = Some((500, 600));
+        writer.policies[0].external_cap = Some(600);
+        let before = writer.applied();
+        assert!(writer.reconcile().unwrap());
+        assert_eq!(writer.applied(), before);
+        writer.policies[0].last_reconcile = None;
+        assert!(!writer.reconcile().unwrap());
     }
 
     #[test]

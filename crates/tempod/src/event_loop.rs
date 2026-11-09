@@ -5,9 +5,9 @@
 //! Event loop.
 //!
 //! Every source registers in one epoll set: the BPF probe ring, the backlight
-//! inotify descriptor, the evdev touch nodes and the FAS trace pipe. There is
-//! no repeating timer anywhere; the only timer is a one-shot `timerfd` armed
-//! for a controller deadline and disarmed when the window closes.
+//! inotify descriptor, the evdev touch nodes and the FAS trace pipe. There is a
+//! one-shot `timerfd` for controller deadlines, plus bounded safety readbacks
+//! and charging reservation/retry timers. Safety polling backs off while stable.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -30,7 +30,7 @@ use crate::power;
 use crate::probe::{self, ProbeSession};
 use crate::screen::ScreenWatcher;
 use crate::touch::TouchWatcher;
-use crate::writer::CpufreqWriter;
+use crate::writer::{CpufreqWriter, ReconcileBackoff};
 
 const LISTENER: Token = Token(0);
 const DEADLINE: Token = Token(1);
@@ -45,8 +45,6 @@ const VERIFY: Token = Token(14);
 const CEILING_TIMER: Token = Token(15);
 const WAKE: Token = Token(100);
 const SIGNAL: Token = Token(101);
-/// 低频读回校验与有限退避配套；只有实际区间偏离目标时才写入。
-const CEILING_INTERVAL_US: u64 = 1_000_000;
 const FIRST_CONNECTION: usize = 16;
 
 fn write_clean_exit_marker(run_dir: &Path) -> io::Result<()> {
@@ -243,7 +241,8 @@ pub fn run(
     let mut screen_on = screen.as_ref().map(ScreenWatcher::is_on).unwrap_or(true);
     let screen_decisions = controller.on_screen(now_us(), screen_on);
     commit(&screen_decisions, &mut writer, &status);
-    ceiling_timer.arm(now_us() + CEILING_INTERVAL_US);
+    let mut ceiling_backoff = ReconcileBackoff::new();
+    ceiling_timer.arm(now_us() + ceiling_backoff.reset());
     if let Ok(mut state) = status.lock() {
         state.screen_on = screen_on;
         state.screen_source = match screen.as_ref() {
@@ -438,8 +437,17 @@ pub fn run(
     // Last activity start consumed by the launch logic, so one launch does not
     // reopen the same window on every wake.
     let mut last_start_us: u64 = 0;
+    let mut pending_start_us: Option<u64> = None;
+    let mut launch_invalidated_us: u64 = 0;
 
     loop {
+        if writer
+            .as_ref()
+            .is_some_and(|writer| writer.last_error.is_some())
+            && ceiling_backoff.expedite()
+        {
+            ceiling_timer.arm(now_us() + 1_000_000);
+        }
         // A signal (SIGCHLD, SIGTERM races, ptrace attach) makes epoll_wait
         // return EINTR. That is not a failure: retry instead of tearing the
         // whole scheduler down and handing cpufreq back to the vendor.
@@ -517,6 +525,8 @@ pub fn run(
                                 // changing the app; only a real package switch
                                 // earns the warm-start lift.
                                 if package_changed {
+                                    pending_start_us = None;
+                                    launch_invalidated_us = sample.ts_us;
                                     let decisions = controller.on_foreground_changed(sample.ts_us);
                                     commit(&decisions, &mut writer, &status);
                                     match controller.next_deadline(sample.ts_us) {
@@ -598,6 +608,7 @@ pub fn run(
                 if let Some(watcher) = screen.as_mut() {
                     while let Some(on) = watcher.refresh() {
                         screen_on = on;
+                        ceiling_timer.arm(now_us() + ceiling_backoff.reset());
                         refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path);
                         refresh_fas(&config, &foreground, &mut fas, &status, on);
                         if let Some(session) = probe.as_mut() {
@@ -606,6 +617,8 @@ pub fn run(
                             }
                         }
                         let at_us = now_us();
+                        pending_start_us = None;
+                        launch_invalidated_us = at_us;
                         let decisions = controller.on_screen(at_us, on);
                         if let Ok(mut state) = status.lock() {
                             state.screen_on = on;
@@ -669,7 +682,7 @@ pub fn run(
                 if let Some(watcher) = charge.as_mut() {
                     if watcher.drain() > 0 {
                         let decision = watcher.update(&config, now_us());
-                        tracing::info!(
+                        tracing::debug!(
                             action = decision.action.as_str(),
                             stopped = watcher.is_stopped(),
                             phase = watcher.phase(),
@@ -838,9 +851,9 @@ pub fn run(
 
             if token == CEILING_TIMER {
                 ceiling_timer.drain();
-                if let Some(writer) = writer.as_mut() {
-                    let _ = writer.reconcile();
-                }
+                let disturbed = writer
+                    .as_mut()
+                    .is_some_and(|writer| writer.reconcile().unwrap_or(true));
                 if let Ok(mut state) = status.lock() {
                     state.writes = writer.as_ref().map(CpufreqWriter::applied).unwrap_or(0);
                     state.cap_writes = writer.as_ref().map(CpufreqWriter::cap_writes).unwrap_or(0);
@@ -856,7 +869,7 @@ pub fn run(
                         state.write_error = writer.last_error.clone();
                     }
                 }
-                ceiling_timer.arm(now_us() + CEILING_INTERVAL_US);
+                ceiling_timer.arm(now_us() + ceiling_backoff.observe(screen_on, disturbed));
                 continue;
             }
 
@@ -875,15 +888,37 @@ pub fn run(
             if token == WAKE {
                 wake.drain();
                 if let Some(events) = launch_events.as_ref() {
-                    let start_us = events.start_us();
-                    if start_us > last_start_us {
-                        last_start_us = start_us;
-                        let decisions = controller.on_app_launch(start_us);
-                        commit(&decisions, &mut writer, &status);
-                        match controller.next_deadline(start_us) {
-                            Some(deadline) => deadline_source.arm(deadline.at_us),
-                            None => deadline_source.disarm(),
+                    let snapshot = events.snapshot();
+                    let at_us = now_us();
+                    if snapshot.start_us > last_start_us {
+                        last_start_us = snapshot.start_us;
+                        pending_start_us = None;
+                        if screen_on
+                            && snapshot.start_us > launch_invalidated_us
+                            && at_us.saturating_sub(snapshot.start_us)
+                                < config.control.launch_lift_ms * 1_000
+                        {
+                            pending_start_us = Some(snapshot.start_us);
+                            let decisions = controller.on_app_launch(snapshot.start_us);
+                            commit(&decisions, &mut writer, &status);
                         }
+                    }
+                    if screen_on
+                        && pending_start_us == Some(snapshot.start_us)
+                        && snapshot.displayed_us >= snapshot.start_us
+                        && snapshot.displayed_us != 0
+                    {
+                        pending_start_us = None;
+                        let decisions = controller.on_app_displayed(snapshot.displayed_us);
+                        commit(&decisions, &mut writer, &status);
+                    }
+                    // Use consumption time: a delayed wake must not arm a
+                    // deadline in the past or revive an expired launch window.
+                    let decisions = controller.on_deadline(at_us);
+                    commit(&decisions, &mut writer, &status);
+                    match controller.next_deadline(at_us) {
+                        Some(deadline) => deadline_source.arm(deadline.at_us),
+                        None => deadline_source.disarm(),
                     }
                 }
                 continue;
@@ -1361,8 +1396,8 @@ impl mio::event::Source for ConfigWatcher {
     }
 }
 
-/// An absolute one-shot `CLOCK_MONOTONIC` timer. Only armed while the
-/// controller has a pending window; disarmed otherwise so the loop can block.
+/// An absolute one-shot `CLOCK_MONOTONIC` timer, shared by deadline and
+/// bounded safety/retry scheduling. Each caller explicitly rearms or disarms it.
 struct OneShotTimer {
     fd: libc::c_int,
 }

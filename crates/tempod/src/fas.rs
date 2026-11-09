@@ -14,11 +14,11 @@
 //! `Scored` frames below the budget are ignored; the worst frame in the sample
 //! is handed to the controller only when it exceeded the budget.
 
-use std::io;
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::Arc;
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use tempo_core::config::FasConfig;
 
@@ -35,113 +35,198 @@ pub struct FasReport {
     pub error: Option<String>,
 }
 
-pub struct FasCollector {
-    sender: Sender<String>,
-    reports: Receiver<FasReport>,
-    last_request_us: u64,
+#[derive(Default)]
+struct ProbeState {
+    pending: Option<String>,
+    report: Option<FasReport>,
+    generation: u64,
     enabled: bool,
-    available: Arc<AtomicBool>,
+    available: bool,
+    closed: bool,
+}
+
+impl ProbeState {
+    fn disable(&mut self) {
+        self.enabled = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = None;
+        self.report = None;
+        self.available = false;
+    }
+
+    fn publish(&mut self, generation: u64, report: FasReport) -> bool {
+        if !self.enabled || self.closed || generation != self.generation {
+            return false;
+        }
+        self.available = report.error.is_none();
+        self.report = Some(report);
+        true
+    }
+}
+
+pub struct FasCollector {
+    shared: Arc<(Mutex<ProbeState>, Condvar)>,
+    last_request_us: u64,
     pub last_error: Option<String>,
 }
 
 impl FasCollector {
     pub fn new(registry: &mio::Registry, token: mio::Token) -> io::Result<Self> {
-        let (request_tx, request_rx) = mpsc::channel::<String>();
-        let (report_tx, report_rx) = mpsc::channel::<FasReport>();
         let waker = mio::Waker::new(registry, token)?;
-        let available = Arc::new(AtomicBool::new(false));
-        let worker_available = available.clone();
-
+        let shared = Arc::new((Mutex::new(ProbeState::default()), Condvar::new()));
+        let worker = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("fas-probe".to_owned())
             .spawn(move || {
                 let mut watermarks = std::collections::HashMap::new();
+                let mut last_generation = 0;
                 loop {
-                    let Ok(package) = request_rx.recv() else {
-                        return;
-                    };
-                    let watermark = watermarks.entry(package.clone()).or_insert(0);
-                    let report = probe(&package, watermark);
-                    let ok = report.error.is_none();
-                    worker_available.store(ok, Ordering::Relaxed);
-                    if report_tx.send(report).is_err() {
+                    let (lock, ready) = &*worker;
+                    let mut state = lock.lock().unwrap();
+                    while state.pending.is_none() && !state.closed {
+                        state = ready.wait(state).unwrap();
+                    }
+                    if state.closed {
                         return;
                     }
-                    let _ = waker.wake();
+                    let package = state.pending.take().unwrap();
+                    let generation = state.generation;
+                    drop(state);
+                    if generation != last_generation {
+                        watermarks.clear();
+                        last_generation = generation;
+                    }
+                    let watermark = watermarks.entry(package.clone()).or_insert(0);
+                    let report = probe(&package, watermark);
+                    if lock.lock().unwrap().publish(generation, report) {
+                        let _ = waker.wake();
+                    }
                 }
             })?;
 
         Ok(Self {
-            sender: request_tx,
-            reports: report_rx,
+            shared,
             last_request_us: 0,
-            enabled: false,
-            available,
             last_error: None,
         })
     }
 
     pub fn is_available(&self) -> bool {
-        self.available.load(Ordering::Relaxed)
+        self.shared.0.lock().unwrap().available
     }
 
     pub fn set_enabled(&mut self, enabled: bool, config: &FasConfig) {
-        self.enabled = enabled;
+        let mut state = self.shared.0.lock().unwrap();
         if !enabled {
-            return;
+            state.disable();
+            self.last_request_us = 0;
+        } else {
+            state.enabled = true;
         }
-        if self.last_error.is_some() {
-            self.last_error = None;
-        }
+        self.last_error = None;
         let _ = config;
     }
 
     pub fn request(&mut self, package: &str, at_us: u64) {
-        if !self.enabled || package.is_empty() {
+        let mut state = self.shared.0.lock().unwrap();
+        if !state.enabled || package.is_empty() {
+            return;
+        }
+        if state.pending.is_some() {
+            state.pending = Some(package.to_owned());
             return;
         }
         if at_us.saturating_sub(self.last_request_us) < REQUEST_INTERVAL_US {
             return;
         }
         self.last_request_us = at_us;
-        let _ = self.sender.send(package.to_owned());
+        state.pending = Some(package.to_owned());
+        self.shared.1.notify_one();
     }
 
     pub fn drain(&mut self) -> Vec<FasReport> {
-        let mut reports = Vec::new();
-        loop {
-            match self.reports.try_recv() {
-                Ok(report) => reports.push(report),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        if let Some(problem) = reports.iter().find_map(|report| report.error.clone()) {
+        let report = self.shared.0.lock().unwrap().report.take();
+        if let Some(problem) = report.as_ref().and_then(|report| report.error.clone()) {
             self.last_error = Some(problem);
         }
-        reports
+        report.into_iter().collect()
+    }
+}
+
+impl Drop for FasCollector {
+    fn drop(&mut self) {
+        let mut state = self.shared.0.lock().unwrap();
+        state.disable();
+        state.closed = true;
+        self.shared.1.notify_one();
     }
 }
 
 fn probe(package: &str, watermark: &mut u64) -> FasReport {
-    let output = Command::new(DUMPSYS)
-        .arg("gfxinfo")
-        .arg(package)
-        .arg("framestats")
-        .output();
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            return FasReport {
-                package: package.to_owned(),
-                worst_ms: 0.0,
-                over_budget: 0,
-                frames: 0,
-                error: Some(format!("dumpsys: {error}")),
-            }
+    let output = command_output(
+        Command::new(DUMPSYS).args(["-t", "2", "gfxinfo", package, "framestats"]),
+        Duration::from_secs(3),
+    );
+    match output {
+        Ok(output) => parse_new_framestats(package, &String::from_utf8_lossy(&output), watermark),
+        Err(error) => FasReport {
+            package: package.to_owned(),
+            worst_ms: 0.0,
+            over_budget: 0,
+            frames: 0,
+            error: Some(format!("dumpsys: {error}")),
+        },
+    }
+}
+
+fn command_output(command: &mut Command, timeout: Duration) -> io::Result<Vec<u8>> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let result = (|| {
+        let mut stdout = child.stdout.take().unwrap();
+        let fd = stdout.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
         }
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_new_framestats(package, &text, watermark)
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
+        let mut eof = false;
+        loop {
+            // Bound each drain so even a continuously writing child hits the deadline.
+            for _ in 0..8 {
+                let mut buffer = [0u8; 8192];
+                match stdout.read(&mut buffer) {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(count) => output.extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(status) = child.try_wait()? {
+                if !status.success() {
+                    return Err(io::Error::other(format!("exit status {status}")));
+                }
+                if eof {
+                    return Ok(output);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "probe timed out"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    // Do not wait on a pipe reader: inherited stdout descriptors cannot hold us up.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 /// Parses the CSV block of `framestats`. Columns 1 and 13 are the intended
@@ -200,6 +285,74 @@ mod tests {
     use super::*;
 
     const HEADER: &str = "Flags,IntendedVsync,Vsync,OldestInputEvent,NewestInputEvent,HandleInputStart,AnimationStart,PerformTraversalsStart,DrawStart,SyncQueued,SyncStart,IssueDrawCommandsStart,SwapBuffers,FrameCompleted";
+
+    #[test]
+    fn pending_requests_keep_only_latest() {
+        let mut collector = FasCollector {
+            shared: Arc::new((Mutex::new(ProbeState::default()), Condvar::new())),
+            last_request_us: 0,
+            last_error: None,
+        };
+        collector.shared.0.lock().unwrap().enabled = true;
+        collector.request("first", REQUEST_INTERVAL_US);
+        // Model the worker taking the one running request.
+        let running = collector.shared.0.lock().unwrap().pending.take();
+        collector.request("old", REQUEST_INTERVAL_US * 2);
+        collector.request("latest", REQUEST_INTERVAL_US * 2 + 1);
+        assert_eq!(running.as_deref(), Some("first"));
+        assert_eq!(
+            collector.shared.0.lock().unwrap().pending.as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn disable_invalidates_queued_and_running_results() {
+        let mut state = ProbeState {
+            enabled: true,
+            pending: Some("queued".into()),
+            ..ProbeState::default()
+        };
+        let old_generation = state.generation;
+        assert!(state.publish(old_generation, parse_framestats("old", "")));
+        state.disable();
+        assert!(state.pending.is_none());
+        assert!(state.report.is_none());
+        assert!(!state.available);
+        state.enabled = true;
+        assert!(!state.publish(old_generation, parse_framestats("late", "")));
+        assert!(state.publish(state.generation, parse_framestats("new", "")));
+        assert_eq!(state.report.unwrap().package, "new");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn child_output_is_drained_and_exit_failure_reported() {
+        let output = command_output(
+            Command::new("sh").args(["-c", "head -c 262144 /dev/zero"]),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(output.len(), 262144);
+        assert!(command_output(
+            Command::new("sh").args(["-c", "exit 7"]),
+            Duration::from_secs(2),
+        )
+        .is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn timeout_kills_and_reaps_child_without_waiting_for_pipe_eof() {
+        let started = Instant::now();
+        let error = command_output(
+            Command::new("sh").args(["-c", "sleep 2 & exec sleep 10"]),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn parse_marks_only_frames() {

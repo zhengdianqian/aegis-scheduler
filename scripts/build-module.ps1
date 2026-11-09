@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "3.4.0",
+    [string]$Version = "3.5.0-rc.1",
     [string]$BuildDir = $env:TEMPO_ANDROID_TARGET_DIR,
     [string]$Apk,
     [string]$OutputDir
