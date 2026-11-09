@@ -98,7 +98,39 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    // 套接字命令不依赖磁盘上的旧配置，损坏配置也能恢复或重新应用。
+    let response = match &cli.command {
+        Command::Status { socket } => Some(query_daemon(socket, "{\"cmd\":\"status\"}")),
+        Command::Power { socket } => Some(query_daemon(socket, "{\"cmd\":\"power.get\"}")),
+        Command::Logs { socket, lines } => Some(query_daemon(
+            socket,
+            &format!("{{\"cmd\":\"log.tail\",\"lines\":{lines}}}"),
+        )),
+        Command::Restore { socket } => {
+            Some(query_daemon(socket, "{\"cmd\":\"scheduler.restore\"}"))
+        }
+        Command::Apply { socket, file } => {
+            let text = std::fs::read_to_string(file)
+                .map_err(|error| format!("read {}: {error}", file.display()))?;
+            Some(query_daemon(
+                socket,
+                &serde_json::json!({ "cmd": "config.apply", "toml": text }).to_string(),
+            ))
+        }
+        _ => None,
+    };
+    if let Some(response) = response {
+        println!("{}", response?);
+        return Ok(());
+    }
     let config = Config::load(&cli.config).map_err(|error| error.to_string())?;
+    if matches!(&cli.command, Command::Config) {
+        println!(
+            "{}",
+            config.to_toml_string().map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
     let profile_path = cli
         .profile
         .clone()
@@ -267,6 +299,13 @@ fn query_daemon(socket: &PathBuf, request: &str) -> Result<String, String> {
 
     let mut stream = UnixStream::connect(socket)
         .map_err(|error| format!("connect {}: {error}", socket.display()))?;
+    let timeout = Some(std::time::Duration::from_secs(5));
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|error| error.to_string())?;
     writeln!(stream, "{request}").map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -275,6 +314,11 @@ fn query_daemon(socket: &PathBuf, request: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())?;
     if line.trim().is_empty() {
         return Err("empty response from daemon".to_owned());
+    }
+    let response: serde_json::Value =
+        serde_json::from_str(&line).map_err(|error| format!("invalid daemon response: {error}"))?;
+    if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+        return Err(line.trim().to_owned());
     }
     Ok(line.trim().to_owned())
 }

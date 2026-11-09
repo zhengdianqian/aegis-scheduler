@@ -17,11 +17,19 @@ if [ -x "$MODDIR/bin/tempoctl" ] && [ -S "$DATA/run/control.sock" ]; then
         restore --socket "$DATA/run/control.sock" >/dev/null 2>&1
 fi
 
-killall -9 Aegis 2>/dev/null
-pkill -9 -f "bin/Aegis" 2>/dev/null
-rm -f "$MODDIR/control.armed"
+for pid in $(pidof Aegis 2>/dev/null); do
+    [ "$(readlink "/proc/$pid/exe")" = "$MODDIR/bin/Aegis" ] || continue
+    kill -TERM "$pid" 2>/dev/null
+    for second in 1 2 3; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if [ "$(readlink "/proc/$pid/exe")" = "$MODDIR/bin/Aegis" ]; then
+        kill -KILL "$pid" 2>/dev/null || exit 1
+    fi
+done
 
-sh "$MODDIR/scripts/restore.sh" >> "$DATA/Aegis.log" 2>&1
-sh "$MODDIR/scripts/charge_resume.sh" >> "$DATA/charge.log" 2>&1
-sh "$MODDIR/scripts/shield.sh" restore >> "$DATA/shield.log" 2>&1
-rm -rf "$DATA/orig"
+if [ "$(cat "$DATA/run/clean-exit" 2>/dev/null)" != "$(printf 'aegis-clean-exit-v1\nwriter_restored=1')" ]; then
+    sh "$MODDIR/scripts/restore.sh" >> "$DATA/Aegis.log" 2>&1 || exit 1
+fi
+rm -f "$MODDIR/control.armed"

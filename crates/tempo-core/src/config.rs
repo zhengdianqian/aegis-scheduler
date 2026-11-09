@@ -144,7 +144,8 @@ pub struct ControlConfig {
     pub prime_cap_ratio: f32,
     /// Upper cap while an input method owns the foreground.
     pub ime_cap_ratio: f32,
-    /// The writer never caps a cluster below this fraction of its ladder.
+    /// Baseline upper bound as a fraction of the ladder, subject to sparse
+    /// idle bands and thermal limits.
     pub safety_ceiling_ratio: f32,
     /// Tiers of headroom between the operating target and the max cap.
     pub lookahead_tiers: u32,
@@ -632,8 +633,13 @@ impl Config {
             }
             for app in list {
                 let trimmed = app.trim();
-                if trimmed.is_empty() || trimmed.len() > 128 || trimmed.split_whitespace().count() != 1 {
-                    bad.push(format!("scene.{name} entry {app:?} is not a valid package name"));
+                if trimmed.is_empty()
+                    || trimmed.len() > 128
+                    || trimmed.split_whitespace().count() != 1
+                {
+                    bad.push(format!(
+                        "scene.{name} entry {app:?} is not a valid package name"
+                    ));
                 }
             }
         }
@@ -670,8 +676,11 @@ impl Config {
         }
         for app in &self.fas.apps {
             let trimmed = app.trim();
-            if trimmed.is_empty() || trimmed.len() > 128 || trimmed.split_whitespace().count() != 1 {
-                bad.push(format!("fas.apps entry {app:?} is not a valid package name"));
+            if trimmed.is_empty() || trimmed.len() > 128 || trimmed.split_whitespace().count() != 1
+            {
+                bad.push(format!(
+                    "fas.apps entry {app:?} is not a valid package name"
+                ));
             }
         }
         if !(6.0..=40.0).contains(&self.fas.frame_budget_ms) {
@@ -699,6 +708,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_config_is_valid_and_fas_is_opt_in() {
+        let cfg: Config = toml::from_str(include_str!("../../../packaging/config.toml"))
+            .expect("模块默认配置必须能被当前版本解析");
+        cfg.validate().expect("模块默认配置必须有效");
+        assert!(!cfg.fas.enabled);
+    }
 
     #[test]
     fn config_defaults_roundtrip() {

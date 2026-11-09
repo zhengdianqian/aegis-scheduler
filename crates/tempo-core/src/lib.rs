@@ -11,7 +11,8 @@ pub mod controller;
 pub mod profile;
 
 pub use charge::{
-    ChargeAction, ChargeDecision, ChargeGovernor, ChargePlan, ChargeReason, ChargeSample, PlanWindow,
+    ChargeAction, ChargeDecision, ChargeGovernor, ChargePlan, ChargeReason, ChargeSample,
+    PlanWindow,
 };
 pub use config::{Config, LogLevel, SCHEMA_VERSION};
 pub use controller::{

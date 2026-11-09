@@ -13,12 +13,11 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use mio::event::Source;
 use mio::{Interest, Registry, Token};
 use serde::Deserialize;
-use tempo_core::charge::{ChargeAction, ChargeDecision, ChargeGovernor, ChargePlan, ChargeSample};
+use tempo_core::charge::{ChargeDecision, ChargeGovernor, ChargePlan, ChargeSample};
 use tempo_core::Config;
 
 const BATTERY: &str = "/sys/class/power_supply/battery";
@@ -98,9 +97,14 @@ pub struct ChargeWatcher {
     original: Option<String>,
     governor: ChargeGovernor,
     stopped: bool,
+    confirmed_stopped: Option<bool>,
+    target_stopped: bool,
+    last_write_error: Option<String>,
+    battery: PathBuf,
+    supplies: PathBuf,
     events: u64,
     plan_path: PathBuf,
-    plan_stamp: Option<u64>,
+    plan_text: Option<String>,
     plan: ChargePlan,
     plan_allowed: bool,
     last: Option<ChargeDecision>,
@@ -109,10 +113,28 @@ pub struct ChargeWatcher {
 
 impl ChargeWatcher {
     pub fn open(plan_path: PathBuf) -> io::Result<Self> {
-        // Verification hook: point the same binary at a scratch switch so a
-        // synthetic full-charge run never touches the real charger.
-        let (node, stop, start) = match std::env::var_os("AEGIS_CHARGE_SWITCH") {
-            Some(path) => (PathBuf::from(path), "1", "0"),
+        let battery = battery_dir();
+        let sandbox_switch = std::env::var_os("AEGIS_CHARGE_SWITCH").map(PathBuf::from);
+        let sandbox_battery = std::env::var_os("AEGIS_BATTERY_DIR").map(PathBuf::from);
+        let sandbox = sandbox_paths(sandbox_battery.as_deref(), sandbox_switch.as_deref())?;
+        let supplies = sandbox
+            .as_ref()
+            .map(|(_, root)| root.clone())
+            .unwrap_or_else(|| PathBuf::from("/sys/class/power_supply"));
+        let (node, stop, start) = match sandbox {
+            Some((path, _)) => {
+                let enabled = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.ends_with("charging_enabled") || name == "charge_enabled"
+                    });
+                (
+                    path,
+                    if enabled { "0" } else { "1" },
+                    if enabled { "1" } else { "0" },
+                )
+            }
             None => {
                 let candidate = CANDIDATES
                     .iter()
@@ -155,6 +177,15 @@ impl ChargeWatcher {
         }
 
         let original = read_node(&node);
+        let confirmed_stopped = original.as_deref().and_then(|value| {
+            if value == stop {
+                Some(true)
+            } else if value == start {
+                Some(false)
+            } else {
+                None
+            }
+        });
         Ok(Self {
             fd,
             node,
@@ -162,10 +193,15 @@ impl ChargeWatcher {
             start,
             original,
             governor: ChargeGovernor::new(),
-            stopped: false,
+            stopped: confirmed_stopped.unwrap_or(false),
+            confirmed_stopped,
+            target_stopped: false,
+            last_write_error: None,
+            battery,
+            supplies,
             events: 0,
             plan_path,
-            plan_stamp: None,
+            plan_text: None,
             plan: ChargePlan::default(),
             plan_allowed: true,
             last: None,
@@ -183,6 +219,14 @@ impl ChargeWatcher {
 
     pub fn is_stopped(&self) -> bool {
         self.stopped
+    }
+
+    pub fn needs_retry(&self) -> bool {
+        self.confirmed_stopped != Some(self.target_stopped)
+    }
+
+    pub fn last_write_error(&self) -> Option<&str> {
+        self.last_write_error.as_deref()
     }
 
     /// 100% 涓流阶段：此时守护按 3 秒一拍读取 current/status 收集满充证据。
@@ -243,17 +287,30 @@ impl ChargeWatcher {
 
     /// Reads one sample, advances the governor and applies the action.
     pub fn update(&mut self, config: &Config, ts_us: u64) -> ChargeDecision {
+        self.confirmed_stopped = read_node(&self.node).and_then(|value| {
+            if value == self.stop {
+                Some(true)
+            } else if value == self.start {
+                Some(false)
+            } else {
+                None
+            }
+        });
+        self.stopped = self.confirmed_stopped == Some(true);
         self.refresh_plan();
         let (day, minute, _) = local_now();
         self.plan_allowed = self.plan.allows(day, minute);
 
-        let battery = battery_dir();
-        let percent = read_u32(&battery.join("capacity")).map(|value| value as u8);
+        let battery = &self.battery;
+        let percent = read_u32(&battery.join("capacity"))
+            .filter(|value| *value <= 100)
+            .map(|value| value as u8);
         let mut sample = ChargeSample {
             ts_us,
             percent,
-            temp_c: read_u32(&battery.join("temp")).map(|value| value as f32 / 10.0),
-            plugged: external_power_present(),
+            temp_c: read_i32(&battery.join("temp")).map(|value| value as f32 / 10.0),
+            plugged: external_power_present(&self.supplies),
+            charging_suspended: self.confirmed_stopped != Some(false),
             ..ChargeSample::default()
         };
         // 只有 100% 涓流阶段才需要电流/电压/status 证据，避免把节点读取
@@ -267,25 +324,12 @@ impl ChargeWatcher {
                 .is_some_and(|status| status.eq_ignore_ascii_case("full"));
         }
         self.last_current_ma = sample.current_ma.map(|value| value.unsigned_abs() as i32);
-        let was_stopped = self.stopped;
         let decision = self
             .governor
             .update(&sample, &config.charge, Some(self.plan_allowed));
 
-        if !sample.plugged {
-            // Leaving the charger clears every hold. Restore the switch so the
-            // next plug-in is governed by the fresh session, not by a stale stop.
-            if was_stopped {
-                self.write(self.start);
-            }
-        } else {
-            match decision.action {
-                ChargeAction::Stop => self.write(self.stop),
-                ChargeAction::Resume => self.write(self.start),
-                ChargeAction::None | ChargeAction::Hold => {}
-            }
-        }
-        self.stopped = self.governor.is_stopped();
+        self.target_stopped = !decision.allow_charge;
+        self.apply_target();
         self.last = Some(decision.clone());
         decision
     }
@@ -303,21 +347,14 @@ impl ChargeWatcher {
     }
 
     fn refresh_plan(&mut self) {
-        let stamp = fs::metadata(&self.plan_path)
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs());
-        if stamp == self.plan_stamp {
+        let text = fs::read_to_string(&self.plan_path).ok();
+        if text == self.plan_text {
             return;
         }
-        self.plan_stamp = stamp;
-        let text = match fs::read_to_string(&self.plan_path) {
-            Ok(text) => text,
-            Err(_) => {
-                self.plan = ChargePlan::default();
-                return;
-            }
+        self.plan_text = text.clone();
+        let Some(text) = text else {
+            self.plan = ChargePlan::default();
+            return;
         };
         let parsed: PlanFile = match serde_json::from_str(&text) {
             Ok(parsed) => parsed,
@@ -328,22 +365,36 @@ impl ChargeWatcher {
             .into_iter()
             .map(|window| (window.start, window.end))
             .collect();
-        self.plan = ChargePlan::normalize(
-            parsed.enabled,
-            &parsed.mode,
-            &parsed.weekdays,
-            &windows,
-        );
+        self.plan = ChargePlan::normalize(parsed.enabled, &parsed.mode, &parsed.weekdays, &windows);
     }
 
-    fn write(&self, value: &str) {
-        let _ = fs::write(&self.node, value);
+    fn apply_target(&mut self) {
+        if !self.needs_retry() {
+            return;
+        }
+        let value = if self.target_stopped {
+            self.stop
+        } else {
+            self.start
+        };
+        match write_confirmed(&self.node, value) {
+            Ok(()) => {
+                self.confirmed_stopped = Some(self.target_stopped);
+                self.stopped = self.target_stopped;
+                self.last_write_error = None;
+            }
+            Err(error) => {
+                self.confirmed_stopped = None;
+                tracing::warn!(node = %self.node.display(), target = value, %error, "charge switch write unconfirmed; retry required");
+                self.last_write_error = Some(error.to_string());
+            }
+        }
     }
 }
 
 impl Drop for ChargeWatcher {
     fn drop(&mut self) {
-        if self.stopped {
+        if self.stopped || self.needs_retry() {
             let value = self
                 .original
                 .clone()
@@ -355,7 +406,12 @@ impl Drop for ChargeWatcher {
 }
 
 impl Source for ChargeWatcher {
-    fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> io::Result<()> {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
         registry.register(&mut mio::unix::SourceFd(&self.fd), token, interests)
     }
 
@@ -376,8 +432,8 @@ impl Source for ChargeWatcher {
 /// USB/AC presence, not `battery/status`. Once charging is suspended the
 /// battery reports `Discharging` even though a cable is attached, so using the
 /// status field would mistake our own stop for an unplug and oscillate.
-fn external_power_present() -> bool {
-    if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
+fn external_power_present(supplies: &Path) -> bool {
+    if let Ok(entries) = fs::read_dir(supplies) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.file_name().is_some_and(|name| name == "battery") {
@@ -390,22 +446,71 @@ fn external_power_present() -> bool {
             if read_u32(&path.join("online")) == Some(1) {
                 return true;
             }
-            if read_u32(&path.join("present")) == Some(1) {
-                return true;
-            }
         }
     }
-    // Fallback for devices without an online node.
-    !read_text(&Path::new(BATTERY).join("status"))
-        .map(|status| status.eq_ignore_ascii_case("discharging"))
-        .unwrap_or(false)
+    false
+}
+
+fn sandbox_paths(
+    battery: Option<&Path>,
+    switch: Option<&Path>,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sandbox requires battery and switch under the same non-sysfs root",
+        )
+    };
+    match (battery, switch) {
+        (None, None) => Ok(None),
+        (Some(battery), Some(switch)) => {
+            let battery = battery.canonicalize()?;
+            let root = battery.parent().ok_or_else(invalid)?.to_path_buf();
+            let switch = switch.canonicalize()?;
+            if battery.file_name().is_none_or(|name| name != "battery")
+                || root == Path::new("/")
+                || root.starts_with("/sys")
+                || !switch.starts_with(&root)
+            {
+                return Err(invalid());
+            }
+            validate_sandbox_tree(&root, &root)?;
+            Ok(Some((switch, root)))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn validate_sandbox_tree(path: &Path, root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sandbox symlinks are not allowed",
+            ));
+        }
+        if entry.file_type()?.is_dir() && entry.path().starts_with(root) {
+            validate_sandbox_tree(&entry.path(), root)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_confirmed(path: &Path, value: &str) -> io::Result<()> {
+    fs::write(path, value)?;
+    confirm_readback(path, value)
+}
+
+fn confirm_readback(path: &Path, value: &str) -> io::Result<()> {
+    if fs::read_to_string(path)?.trim() != value {
+        return Err(io::Error::other("charge switch rejected requested value"));
+    }
+    Ok(())
 }
 
 fn writable(path: &Path) -> bool {
-    fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .is_ok()
+    fs::OpenOptions::new().write(true).open(path).is_ok()
 }
 
 fn read_text(path: &Path) -> Option<String> {
@@ -425,6 +530,262 @@ fn read_i32(path: &Path) -> Option<i32> {
 
 fn read_node(path: &Path) -> Option<String> {
     read_text(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Sandbox(PathBuf);
+    impl Sandbox {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "aegis-charge-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(root.join("battery")).unwrap();
+            fs::create_dir(root.join("usb")).unwrap();
+            fs::write(root.join("usb/type"), "USB").unwrap();
+            fs::write(root.join("usb/online"), "1").unwrap();
+            fs::write(root.join("battery/capacity"), "100").unwrap();
+            fs::write(root.join("battery/temp"), "330").unwrap();
+            Self(root)
+        }
+        fn watcher(&self, enabled: bool) -> ChargeWatcher {
+            let (stop, start) = if enabled { ("0", "1") } else { ("1", "0") };
+            let node = self.0.join("battery").join(if enabled {
+                "charging_enabled"
+            } else {
+                "input_suspend"
+            });
+            fs::write(&node, start).unwrap();
+            ChargeWatcher {
+                fd: -1,
+                node,
+                stop,
+                start,
+                original: Some(start.into()),
+                governor: ChargeGovernor::new(),
+                stopped: false,
+                confirmed_stopped: Some(false),
+                target_stopped: false,
+                last_write_error: None,
+                battery: self.0.join("battery"),
+                supplies: self.0.clone(),
+                events: 0,
+                plan_path: self.0.join("plan.json"),
+                plan_text: None,
+                plan: ChargePlan::default(),
+                plan_allowed: true,
+                last: None,
+                last_current_ma: None,
+            }
+        }
+    }
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn sandbox_requires_both_paths_and_rejects_escape() {
+        let sandbox = Sandbox::new();
+        let watcher = sandbox.watcher(false);
+        assert!(sandbox_paths(Some(&watcher.battery), None).is_err());
+        assert!(sandbox_paths(None, Some(&watcher.node)).is_err());
+        assert!(sandbox_paths(Some(&watcher.battery), Some(&watcher.node))
+            .unwrap()
+            .is_some());
+        assert!(sandbox_paths(Some(&watcher.battery), Some(Path::new("/dev/null"))).is_err());
+        std::os::unix::fs::symlink("/sys", sandbox.0.join("escape")).unwrap();
+        assert!(sandbox_paths(Some(&watcher.battery), Some(&watcher.node)).is_err());
+    }
+
+    #[test]
+    fn online_not_present_and_missing_sensors_are_not_full() {
+        let sandbox = Sandbox::new();
+        let mut watcher = sandbox.watcher(false);
+        let mut config = Config::default();
+        config.charge.stop_at_percent = 100;
+        assert!(watcher.update(&config, 0).allow_charge);
+        assert!(watcher.update(&config, 20_000_000).allow_charge);
+        assert!(!watcher.is_latched());
+        fs::write(sandbox.0.join("usb/present"), "1").unwrap();
+        fs::write(sandbox.0.join("usb/online"), "0").unwrap();
+        assert!(!external_power_present(&sandbox.0));
+        fs::remove_file(sandbox.0.join("usb/online")).unwrap();
+        assert!(!external_power_present(&sandbox.0));
+    }
+
+    #[test]
+    fn failed_stop_and_resume_retry_for_both_polarities() {
+        for enabled in [false, true] {
+            let sandbox = Sandbox::new();
+            let mut watcher = sandbox.watcher(enabled);
+            let mut config = Config::default();
+            config.charge.stop_at_percent = 80;
+            fs::remove_file(&watcher.node).unwrap();
+            fs::create_dir(&watcher.node).unwrap();
+            watcher.update(&config, 0);
+            assert!(watcher.needs_retry());
+            assert!(!watcher.is_stopped());
+            assert!(watcher.last_write_error().is_some());
+            fs::remove_dir(&watcher.node).unwrap();
+            fs::write(&watcher.node, watcher.start).unwrap();
+            watcher.update(&config, 1);
+            assert!(!watcher.needs_retry());
+            assert!(watcher.is_stopped());
+            assert_eq!(read_node(&watcher.node).as_deref(), Some(watcher.stop));
+            fs::remove_file(&watcher.node).unwrap();
+            fs::create_dir(&watcher.node).unwrap();
+            fs::write(sandbox.0.join("usb/online"), "0").unwrap();
+            watcher.update(&config, 2);
+            assert!(watcher.needs_retry());
+            fs::remove_dir(&watcher.node).unwrap();
+            fs::write(&watcher.node, watcher.stop).unwrap();
+            watcher.update(&config, 3);
+            assert!(!watcher.needs_retry());
+            assert!(!watcher.is_stopped());
+            assert_eq!(read_node(&watcher.node).as_deref(), Some(watcher.start));
+        }
+    }
+
+    #[test]
+    fn external_switch_overrides_are_reconciled_for_both_polarities() {
+        for enabled in [false, true] {
+            let sandbox = Sandbox::new();
+            let mut watcher = sandbox.watcher(enabled);
+            let mut config = Config::default();
+            config.charge.stop_at_percent = 80;
+            watcher.update(&config, 0);
+            assert!(watcher.is_stopped());
+            fs::write(&watcher.node, watcher.start).unwrap();
+            watcher.update(&config, 1);
+            assert!(watcher.is_stopped());
+            assert!(!watcher.needs_retry());
+            assert_eq!(read_node(&watcher.node).as_deref(), Some(watcher.stop));
+            fs::write(watcher.battery.join("capacity"), "50").unwrap();
+            watcher.update(&config, 2);
+            assert!(!watcher.is_stopped());
+            fs::write(&watcher.node, watcher.stop).unwrap();
+            watcher.update(&config, 3);
+            assert!(!watcher.is_stopped());
+            assert!(!watcher.needs_retry());
+            assert_eq!(read_node(&watcher.node).as_deref(), Some(watcher.start));
+        }
+    }
+
+    #[test]
+    fn unreadable_or_invalid_switch_resets_full_evidence() {
+        for invalid_value in [false, true] {
+            let sandbox = Sandbox::new();
+            let mut watcher = sandbox.watcher(false);
+            let mut config = Config::default();
+            config.charge.stop_at_percent = 100;
+            fs::write(watcher.battery.join("current_now"), "0").unwrap();
+            watcher.update(&config, 0);
+            if invalid_value {
+                fs::write(&watcher.node, "invalid").unwrap();
+            } else {
+                fs::remove_file(&watcher.node).unwrap();
+                fs::create_dir(&watcher.node).unwrap();
+            }
+            watcher.update(&config, 10_000_000);
+            assert!(!watcher.is_latched());
+            if invalid_value {
+                // Unknown input was corrected by a confirmed write.
+                assert!(!watcher.needs_retry());
+            } else {
+                assert!(watcher.needs_retry());
+                assert_eq!(watcher.confirmed_stopped, None);
+                assert!(!watcher.is_stopped());
+                fs::remove_dir(&watcher.node).unwrap();
+                fs::write(&watcher.node, watcher.start).unwrap();
+            }
+            watcher.update(&config, 11_000_000);
+            assert!(!watcher.needs_retry());
+            watcher.update(&config, 19_000_000);
+            assert!(!watcher.is_latched());
+            watcher.update(&config, 20_000_000);
+            assert!(watcher.is_latched());
+        }
+    }
+
+    #[test]
+    fn readback_rejection_is_an_error_and_remains_retryable() {
+        let sandbox = Sandbox::new();
+        let mut watcher = sandbox.watcher(false);
+        assert!(confirm_readback(&watcher.node, watcher.stop).is_err());
+        // /dev/null accepts writes but cannot return the requested state.
+        watcher.node = PathBuf::from("/dev/null");
+        watcher.target_stopped = true;
+        watcher.apply_target();
+        assert!(watcher.needs_retry());
+        assert!(watcher.last_write_error().unwrap().contains("rejected"));
+        watcher.node = sandbox.0.join("battery/input_suspend");
+        watcher.apply_target();
+        assert!(!watcher.needs_retry());
+    }
+
+    #[test]
+    fn sandbox_full_evidence_temperature_and_replug() {
+        let sandbox = Sandbox::new();
+        let mut watcher = sandbox.watcher(false);
+        let mut config = Config::default();
+        config.charge.stop_at_percent = 100;
+        fs::write(watcher.battery.join("current_now"), "80000").unwrap();
+        watcher.update(&config, 0);
+        fs::write(watcher.battery.join("temp"), "460").unwrap();
+        watcher.update(&config, 4_000_000);
+        assert!(watcher.is_stopped());
+        fs::write(watcher.battery.join("current_now"), "0").unwrap();
+        watcher.update(&config, 20_000_000);
+        assert!(!watcher.is_latched());
+        fs::write(watcher.battery.join("temp"), "390").unwrap();
+        watcher.update(&config, 21_000_000);
+        assert!(!watcher.is_stopped());
+        fs::write(watcher.battery.join("current_now"), "-80000").unwrap();
+        watcher.update(&config, 24_000_000);
+        watcher.update(&config, 32_000_000);
+        assert!(!watcher.is_latched());
+        watcher.update(&config, 33_000_000);
+        assert!(watcher.is_latched());
+        assert!(watcher.is_stopped());
+        fs::write(sandbox.0.join("usb/online"), "0").unwrap();
+        watcher.update(&config, 34_000_000);
+        assert!(!watcher.is_latched());
+        assert!(!watcher.is_stopped());
+        fs::write(sandbox.0.join("usb/online"), "1").unwrap();
+        watcher.update(&config, 35_000_000);
+        assert!(!watcher.is_latched());
+        fs::write(watcher.battery.join("status"), "Full").unwrap();
+        watcher.update(&config, 36_000_000);
+        assert!(watcher.is_latched());
+    }
+
+    #[test]
+    fn plan_content_changes_visible_without_timestamp_delay() {
+        let sandbox = Sandbox::new();
+        let mut watcher = sandbox.watcher(false);
+        fs::write(
+            &watcher.plan_path,
+            r#"{"enabled":true,"windows":[{"start":"23:00","end":"07:00"}]}"#,
+        )
+        .unwrap();
+        watcher.refresh_plan();
+        assert!(watcher.plan.enabled);
+        fs::write(
+            &watcher.plan_path,
+            r#"{"enabled":false,"windows":[{"start":"23:00","end":"07:00"}]}"#,
+        )
+        .unwrap();
+        watcher.refresh_plan();
+        assert!(!watcher.plan.enabled);
+    }
 }
 
 /// Local wall clock as (day 1=Monday..7=Sunday, minutes after midnight,

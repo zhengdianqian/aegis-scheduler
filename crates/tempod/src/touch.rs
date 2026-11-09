@@ -17,6 +17,7 @@ const EV_KEY: u16 = 1;
 const EV_ABS: u16 = 3;
 const BTN_TOUCH: u16 = 0x14a;
 const ABS_MT_POSITION_X: usize = 53;
+const ABS_MT_POSITION_Y: usize = 54;
 const EVENT_SIZE: usize = 24;
 const MAX_DEVICES: usize = 6;
 
@@ -25,16 +26,44 @@ const EXCLUDED_NAMES: &[&str] = &[
 ];
 
 /// What one read of a touch node contained.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
+pub enum TouchEdge {
+    Down,
+    Up,
+    Move,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TouchBatch {
     pub downs: u32,
     pub ups: u32,
     pub moves: u32,
+    pub edges: Vec<TouchEdge>,
 }
 
 impl TouchBatch {
     pub fn is_empty(&self) -> bool {
         self.downs == 0 && self.ups == 0 && self.moves == 0
+    }
+
+    fn record(&mut self, kind: u16, code: u16, value: i32) {
+        if kind == EV_KEY && code == BTN_TOUCH {
+            if value != 0 {
+                self.downs += 1;
+                self.edges.push(TouchEdge::Down);
+            } else {
+                self.ups += 1;
+                self.edges.push(TouchEdge::Up);
+            }
+        } else if kind == EV_ABS
+            && (code == ABS_MT_POSITION_X as u16 || code == ABS_MT_POSITION_Y as u16)
+        {
+            // 坐标 0 同样有效，纵向移动也必须续期触摸窗口。
+            self.moves += 1;
+            if !matches!(self.edges.last(), Some(TouchEdge::Move)) {
+                self.edges.push(TouchEdge::Move);
+            }
+        }
     }
 }
 
@@ -64,7 +93,12 @@ impl TouchWatcher {
 
     fn open(path: &str) -> Option<Self> {
         let c_path = std::ffi::CString::new(path).ok()?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             return None;
         }
@@ -73,9 +107,7 @@ impl TouchWatcher {
         let excluded = EXCLUDED_NAMES
             .iter()
             .any(|needle| name.to_ascii_lowercase().contains(needle));
-        let usable = !excluded
-            && has_abs(fd, ABS_MT_POSITION_X)
-            && has_key(fd, BTN_TOUCH as usize);
+        let usable = !excluded && has_abs(fd, ABS_MT_POSITION_X) && has_key(fd, BTN_TOUCH as usize);
         if !usable {
             unsafe { libc::close(fd) };
             return None;
@@ -94,7 +126,11 @@ impl TouchWatcher {
         let mut buffer = [0u8; EVENT_SIZE * 64];
         loop {
             let read = unsafe {
-                libc::read(self.fd, buffer.as_mut_ptr() as *mut libc::c_void, buffer.len())
+                libc::read(
+                    self.fd,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    buffer.len(),
+                )
             };
             if read <= 0 {
                 break;
@@ -104,15 +140,7 @@ impl TouchWatcher {
                 let kind = u16::from_le_bytes([chunk[16], chunk[17]]);
                 let code = u16::from_le_bytes([chunk[18], chunk[19]]);
                 let value = i32::from_le_bytes([chunk[20], chunk[21], chunk[22], chunk[23]]);
-                if kind == EV_KEY && code == BTN_TOUCH {
-                    if value != 0 {
-                        batch.downs += 1;
-                    } else {
-                        batch.ups += 1;
-                    }
-                } else if kind == EV_ABS && code == ABS_MT_POSITION_X as u16 && value != 0 {
-                    batch.moves += 1;
-                }
+                batch.record(kind, code, value);
             }
         }
         batch
@@ -196,4 +224,37 @@ fn eviocgbit(ev: usize, len: usize) -> libc::c_int {
 
 fn eviocgname(len: usize) -> libc::c_int {
     (2u32 << 30 | (len as u32) << 16 | (b'E' as u32) << 8 | 0x06) as libc::c_int
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_preserves_release_then_press_order() {
+        let mut batch = TouchBatch::default();
+        batch.record(EV_KEY, BTN_TOUCH, 0);
+        batch.record(EV_KEY, BTN_TOUCH, 1);
+        batch.record(EV_ABS, ABS_MT_POSITION_X as u16, 20);
+        batch.record(EV_ABS, ABS_MT_POSITION_Y as u16, 30);
+        assert!(matches!(
+            batch.edges.as_slice(),
+            [TouchEdge::Up, TouchEdge::Down, TouchEdge::Move]
+        ));
+    }
+
+    #[test]
+    fn both_axes_including_zero_coordinates_count_as_moves() {
+        let mut batch = TouchBatch::default();
+        batch.record(EV_ABS, ABS_MT_POSITION_Y as u16, 123);
+        batch.record(EV_ABS, ABS_MT_POSITION_Y as u16, 0);
+        batch.record(EV_ABS, ABS_MT_POSITION_X as u16, 0);
+        batch.record(EV_ABS, 47, 1);
+        batch.record(EV_KEY, BTN_TOUCH, 1);
+        batch.record(EV_KEY, BTN_TOUCH, 0);
+        assert_eq!(batch.moves, 3);
+        assert_eq!(batch.downs, 1);
+        assert_eq!(batch.ups, 1);
+        assert!(!batch.is_empty());
+    }
 }

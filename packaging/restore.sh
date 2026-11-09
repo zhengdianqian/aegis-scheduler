@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 默默的阿文
 #
-# One-key restore. Writes back the pristine governor/min/max captured by
+# One-key restore. Writes back the pristine min/max captured by
 # cpufreq_backup.sh. Safe to run at any time, also from a terminal:
 #   su 0 sh /data/adb/modules/aegis_scheduler/scripts/restore.sh
 
@@ -10,29 +10,54 @@ DATA=/data/adb/tempo
 ORIG=$DATA/orig
 ROOT=/sys/devices/system/cpu/cpufreq
 
-if [ ! -d "$ORIG" ]; then
-    echo "aegis: no pristine backup in $ORIG; nothing to restore"
+boot_id=$(cat /proc/sys/kernel/random/boot_id) || exit 1
+if [ -z "$boot_id" ] || [ "$(cat "$ORIG/boot_id" 2>/dev/null)" != "$boot_id" ]; then
+    echo "aegis: no cpufreq backup for the current boot; nothing to restore"
     exit 0
 fi
 
-# Drop the floor mask first, otherwise the restore writes land in the mask
-# file and the kernel attributes keep the pinned minimum.
-for dir in "$ROOT"/policy*; do
-    node=$dir/scaling_min_freq
-    if mount | grep -q " $node "; then
-        umount "$node" 2>/dev/null
+failed=0
+# Never change governors, thermal services, or thermal limit nodes.
+restore_node() {
+    if [ "$(cat "$2" 2>/dev/null)" != "$1" ]; then
+        printf '%s\n' "$1" > "$2" || return 1
     fi
-done
+    [ "$(cat "$2" 2>/dev/null)" = "$1" ]
+}
 
 for dir in "$ORIG"/policy*; do
     [ -d "$dir" ] || continue
     name=${dir##*/}
     target=$ROOT/$name
-    [ -d "$target" ] || continue
-    # Maximum first, then minimum: an intermediate state must never be min>max.
-    [ -f "$dir/max_freq" ] && cat "$dir/max_freq" > "$target/scaling_max_freq" 2>/dev/null
-    [ -f "$dir/min_freq" ] && cat "$dir/min_freq" > "$target/scaling_min_freq" 2>/dev/null
-    [ -f "$dir/governor" ] && cat "$dir/governor" > "$target/scaling_governor" 2>/dev/null
+    min=$(cat "$dir/min_freq")
+    max=$(cat "$dir/max_freq")
+    current_min=$(cat "$target/scaling_min_freq")
+    current_max=$(cat "$target/scaling_max_freq")
+    if ! [ "$min" -gt 0 ] 2>/dev/null || ! [ "$max" -ge "$min" ] 2>/dev/null ||
+       ! [ "$current_min" -gt 0 ] 2>/dev/null || ! [ "$current_max" -gt 0 ] 2>/dev/null; then
+        echo "aegis: $name: incomplete backup or unavailable policy" >&2
+        failed=1
+        continue
+    fi
+    if [ "$current_min" -gt "$max" ]; then
+        if ! restore_node "$min" "$target/scaling_min_freq"; then
+            echo "aegis: $name: minimum restore rejected; stop this policy" >&2
+            failed=1
+            continue
+        fi
+    fi
+    if ! restore_node "$max" "$target/scaling_max_freq"; then
+        echo "aegis: $name: maximum restore rejected; stop this policy" >&2
+        failed=1
+        continue
+    fi
+    restore_node "$min" "$target/scaling_min_freq" || failed=1
+    if [ "$(cat "$target/scaling_min_freq")" != "$min" ] ||
+       [ "$(cat "$target/scaling_max_freq")" != "$max" ]; then
+        echo "aegis: $name: restore readback did not match" >&2
+        failed=1
+    fi
 done
 
+[ "$failed" -eq 0 ] || exit 1
 echo "aegis: cpufreq restored from $ORIG"

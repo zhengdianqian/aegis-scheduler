@@ -43,7 +43,7 @@ for dir in /sys/devices/system/cpu/cpufreq/policy*; do
         freqs=$(cat "$dir/scaling_available_frequencies" 2>/dev/null || true)
     fi
     if [ -z "$freqs" ] && [ -f "$dir/stats/time_in_state" ]; then
-        freqs=$(awk 'NR > 1 { print $1 }' "$dir/stats/time_in_state")
+        freqs=$(awk '$1 ~ /^[0-9]+$/ { print $1 }' "$dir/stats/time_in_state")
     fi
     if [ -z "$freqs" ] && [ -f "$dir/scaling_available_freqs" ]; then
         freqs=$(cat "$dir/scaling_available_freqs" 2>/dev/null || true)
@@ -65,7 +65,7 @@ for dir in /sys/devices/system/cpu/cpufreq/policy*; do
     if [ -n "$cap" ]; then
         cap_src=sysfs
     else
-        cap=$((max * ncpu))
+        cap=$max
         cap_src=estimated
     fi
 

@@ -1,237 +1,149 @@
 # Aegis
 
-**自适应 CPU 调度 + FAS 帧感知 + 充电控制**，面向骁龙 8Gen2 深度标定，并对其他 SoC 做尽力适配。
+**v3.4.0 · versionCode 17**｜Android arm64 CPU 分档自适应调频、可选 FAS UI 帧反馈、充电控制。
+模块 id：`aegis_scheduler`；APP 包名：`com.aegis.scheduler`；支持通过 KernelSU / Magisk 安装。
 
-Aegis 是一个完全独立实现的 Android 调频模块（KernelSU / Magisk）。一套参数覆盖冷启动、应用内热切换、最近任务回切、突然触摸、通知弹窗等全部场景；后台常驻 100% 事件驱动，零周期轮询，息屏不阻止 Doze。
+模块根据设备实际 cpufreq policy 生成档案，**主动控制每簇 `scaling_min_freq` 和 `scaling_max_freq`**。启动、触摸和负载变化时仍由模块决定上下限，不是把控制交还厂商。正常控制不改 governor，不关闭厂商 thermal / perf HAL。厂商 QoS、温控和其他写入者仍可能覆盖或限制结果，不能承诺所有手机兼容、零掉帧或固定省电幅度。
 
-- 许可证：**GPL-3.0-or-later**
-- 版权：`Copyright (c) 2026 默默的阿文`
-- 模块 id：`aegis_scheduler`｜对外显示名：**Aegis**
-- 版本：`v2.5`（`versionCode=11`）
-- 模块描述：`自适应 CPU 调度+FAS + 充电控制`
-- 首发承诺机型：骁龙 8Gen2（`kalama` / `babylon`）
+## 安装、检查与跨机适配
 
-> 本项目自 2026 年起由 **默默的阿文** 独立编写，不是任何现有项目的 fork，不包含任何第三方项目的源码、注释、命名、配置模板、脚本模板或构建产物。
+1. 确认设备已 root，保留可用的模块禁用/救砖途径。先禁用其他调频及充电控制模块并重启，避免备份到其限制值；仅自动迁移旧 `tempo_sched`，不会自动识别所有竞争模块。
+2. 首次安装前保存现有 CPU policy、充电状态及旧配置；升级前备份 `/data/adb/tempo/`。**不要把另一台手机的 `profile/` 或 `orig/` 拷到本机使用。**
+3. 在模块管理器刷入 `Aegis-v3.4.0.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v3.4.0.apk`。已有不同签名 APP 可能无法覆盖安装。
+4. 打开 Aegis，在 root 管理器中为 APP **单独授权超级用户权限**。随模块安装不等于已获 root；也可使用模块管理器支持的 WebUI。
+5. 服务等待开机完成（最多 180 秒）、解锁检查（最多 120 秒）及额外 30 秒，再生成档案、校验配置、备份并启动守护；默认还有 20 秒 cpufreq 只读保护。不要把启动保护期当成调频失效。
+6. 检查状态、探针、频表和读回错误，再逐项测试触摸/长按、冷启动、前台切换、阅读、视频、息屏和充电。每次只改一类参数，保留原配置和同条件对照记录。
 
----
-
-## 特性
-
-| 能力 | 说明 |
-| --- | --- |
-| **自适应单档调度** | 统一的自适应模型，不区分游戏/日常/省电档位，按实时负载自动升降频 |
-| **静默锁最低档 / 需求窗口放开** | 静默时 mask 挡住 `scaling_min_freq`，并把 `scaling_max_freq` 临时压到同一硬件最小档，簇只能跑最低档；启动、触摸、亮屏立刻先恢复 max 再 `umount` 三簇，完全走厂商加速路径；控制器确认静默且距最近需求 ≥1 s 后才重钉 |
-| **档位渐进** | 抬频三级递进（约 20 ms/级，60 ms 到达目标档），回落按滞回逐级下降（单步最多减半），不会从最低频直跳高频 |
-| **启动边沿** | 检测到应用启动（静默→前台、前台负载≥0.30）时控制器进入抬频状态；mask 模式下由需求窗口把 cpufreq 完全交还厂商，控制器不写节点（`pin_min`），启动帧率由厂商 perfservice 负责 |
-| **FAS 帧感知**（默认关闭） | 仅对用户在 WebUI 手动勾选的应用生效，前台切换时解析一次并缓存，事件触发而非轮询；WebUI 与 APP 均显示中文应用名 |
-| **全事件驱动** | BPF ring、屏幕 inotify、evdev 触摸、FAS 结果、一次性 `timerfd`；静默时阻塞在 `epoll_wait`，无任何固定周期定时器 |
-| **开机安全** | `sys.boot_completed` 未置 1 前绝不写任何 cpufreq 节点（最多等 180 s，超时退出保留厂商默认）；开机后再留 10 s + 守护内部稳定期 |
-| **看门狗兜底** | 守护异常退出（OOM / 崩溃 / 手动 kill）后 60 s 内自动还原原始 governor/min/max |
-| **充电控制** | 上限 / 回差复充 / 100% 插电锁存 / 预约时段（支持跨零点）/ 温度停充，优先级「温度 > 上限/锁存 > 预约」 |
-| **可逆** | 原始值备份在 `/data/adb/tempo/orig/`，`restore.sh` 一键还原；卸载自动执行恢复 |
-| **不碰厂商 HAL** | `perfservice`、`perf-hal`、`miuibooster`、`mi_thermald`、`android.thermal-hal` 全部保持运行 |
-
-## 组成
-
-| 组件 | 说明 |
-| --- | --- |
-| `bin/Aegis` | 常驻守护，单一 epoll 事件循环，零固定周期定时器，空闲 CPU 接近 0 |
-| `bin/tempoctl` | 命令行控制与离线回放（`status` / `config.apply` / `restore` / `power.get` / `log.tail`） |
-| `webroot/` | 内置 WebUI（KernelSU / Magisk 模块页内嵌，也可浏览器打开），与 APP 内置资源为同一份 8 文件构建 |
-| `Aegis-v2.5.apk` | 独立控制端（包名 `com.aegis.scheduler`，WebView 壳，读写同一 socket） |
-
-> 同时只保留一个控制端（`com.aegis.scheduler`）。若设备上存在旧包名的控制端请先卸载，避免两个进程同时写配置。
-
-## 工作原理
-
-1. **探针**：BPF 统计各簇运行时间与需求，按 50 ms 观察窗口累积；只有需求变化超过独立阈值才发布事件，避免事件率虚高。
-2. **静默判据**：进入静默用瞬时比率（`floor_enter_ratio` 持续 `floor_settle_ms`），退出用快速滤波并要求持续窗口（`floor_exit_ratio` / `floor_exit_ms`），单点尖峰被过滤；触摸、帧超时、前台切换、亮屏会立即打断静默并抬频。
-3. **启动边沿**：满足 `was_quiet && foreground_active && max(foreground_busy) ≥ 0.30 && 距上次启动 ≥ 800 ms` 时，控制器清空静默/回落状态，三簇地板一次性抬到 `launch_lift_level=1.00`，保持 `launch_lift_ms=800`，之后按 `touch_decay_ms=45` 逐级回落。
-4. **地板钉住 + 封顶**：静默期 `scaling_min_freq` 由 bind mount 钉在硬件最小档（`mask_min.sh`）。注意厂商写入这个节点时内容会落进 mask 文件，所以真正把簇压住的是同一时刻把 `scaling_max_freq` 也降到硬件最小档（`min == max`）；若厂商 boost 又把 max 写高，200 ms 采样内的 `assert_cap` 会重新压回。
-5. **需求窗口**：钉住会屏蔽厂商自己的启动 boost，因此钉住是可释放的——`ActivityTaskManager` 的 `START`、evdev 触摸、亮屏会立即**先恢复 max 再** `umount` 三簇 mask，让启动/交互完全走官方路径；控制器判定系统已静默且距最近一次需求（启动/触摸/亮屏）≥1 s 后，才写回硬件最小档、`mount --bind` 并重新封顶。仅在静默时钉住，因此静态更省电，而启动与滑动不吃亏。
-6. **控制器不写 max**：调度控制器本身任何阶段都不写 `scaling_max_freq`；唯一的 max 写入来自 mask 的需求窗口机制，且任何启动/触摸事件都会先把它放开。
-
-## 安装
-
-1. **卸载旧模块**：模块管理器里删除或禁用历史调度模块（本模块会自动给旧目录打 `disable`，但推荐手动卸载以免残留两份 WebUI）。旧目录请保留而非删除，便于回滚。
-2. 通过 **KernelSU / Magisk 刷入** `Aegis-v2.5.zip`。
-3. 重启，等待 `sys.boot_completed=1`。开机阶段不写任何 cpufreq；开机完成并稳定后才接管。
-4. 打开 **WebUI**（模块页面内嵌），或安装 `Aegis-v2.5.apk`。
-5. 首次运行 APP 需在 KernelSU「超级用户」页为 **Aegis** 打开开关。未授权时界面提示「控制服务未就绪」，仅控制命令不可用。
-
-## 使用
-
-### WebUI
-
-- 首页：实时频率、电量、温度、充电状态、当前前台包名
-- 调度：静默阈值、抬频档位、回落速度（修改后 `config.apply`，必要时重启守护）
-- FAS：总开关 + 应用勾选列表（写入 `/data/adb/tempo/fas.json`，列表为空即完全关闭）；应用名来自 APP 导出的 `/data/adb/tempo/labels.json`（中文优先），该文件缺失或超过 30 天时回退显示包名
-- 充电：上限、恢复阈值、停充/恢复温度、预约时段
-- 日志：抽屉式查看，可关闭，行数有上限，切换参数后自动刷新
-
-### 命令行
+以下在设备的 root shell 执行：
 
 ```sh
-# 状态
-/data/adb/modules/aegis_scheduler/bin/tempoctl status
-
-# 还原原始调频
-/data/adb/modules/aegis_scheduler/bin/tempoctl restore \
-  --config /data/adb/tempo/config.toml \
-  --profile /data/adb/tempo/profile/babylon.toml \
-  --socket /data/adb/tempo/run/control.sock
+CTL=/data/adb/modules/aegis_scheduler/bin/tempoctl
+$CTL status
+$CTL profile
+$CTL validate
+$CTL power
+$CTL logs --lines 80
 ```
 
-Unix socket：`/data/adb/tempo/run/control.sock`，一行 JSON 请求 / 一行 JSON 响应。
-命令：`status`、`config.get`、`config.apply`、`power.get`、`log.tail`、`scheduler.restore`。
+- `status` 用于确认探针、写入开关/错误、当前档位和充电控制状态；`power` 是实时节点快照。目标区间不等于驱动已接受，更不等于当前频率恒定。
+- 开机按 `policy*`、关联 CPU、频率边界与 capacity 生成 `/data/adb/tempo/profile/device.toml`，不限定三簇或某个 SoC。capacity 缺失时以最大频率估算角色，并非真实性能测量。
+- 频表探测依次尝试 `scaling_available_frequencies`、`stats/time_in_state`、`scaling_available_freqs`，再补最小/最大端点。没有完整频表时无法凭空恢复全部 OPP；稀疏频表会使分档变粗。writer 自身的贴档只读取 `scaling_available_frequencies`，其他来源仍须真机验证驱动接受度。
+- 缺少 policy/有效档案会停止启动；探针附着失败时不启用 CPU writer。屏幕事件不可用时按亮屏处理；充电开关不可用时不能停充。这些降级不表示整机已兼容。
+- 更换内核/ROM 后重新核实节点、频表和充电语义。不要为消除错误去关闭 thermal、修改节点权限或同时运行多个 writer。
 
-## 配置
+## 控制逻辑与边界
 
-- 主配置：`/data/adb/tempo/config.toml`
-- 设备档案：`/data/adb/tempo/profile/babylon.toml`
-- FAS 侧车：`/data/adb/tempo/fas.json`
-- 预约充电：`/data/adb/tempo/charge_plan.json`
+- 每簇从实际频表按索引抽取档位；默认最多 8 档，可设 6–10，原始频点不足时保留现有档位。负载经 EMA 平滑，升档需确认，常规降档一次一档；亮屏、前台切换、应用启动有独立短窗口。**单纯负载上升不作为应用启动事件。**
+- 同一触摸接触会话固定一次加档目标，不因持续移动或长按叠加；prime 角色不参与触摸加档，但仍可响应负载、启动和帧压力。
+- 阅读/视频/输入法场景按前台包分类。单次 UI 帧超预算提供短时救援；连续至少 3 次有效超预算反馈才提高阅读/视频自适应地板，健康反馈重置连续计数，反馈间隔过长重新计数。场景改变重置自适应地板；这不是视频解码质量检测。
+- 模块写两端并读回验证，必要时先降低 min 或先提高 max，避免上下限次序冲突。外部改写/驱动拒绝会报告错误并有限退避重试。观察到外部降低 max 后，floor/cap 不越过该约束；只有外部明确放宽才解除。该机制不是内核原子仲裁，无法保证捕获两次读取之间的瞬时限制。正常写入不改 governor 或 thermal 节点；内核温控仍可能钳制频率。
+- **不是零轮询**：BPF 有需求观察窗口，CPU 区间约每秒校验，看门狗约每 2 秒检查；FAS 请求有 2 秒节流，启用预约/停充时有约 30 秒复核，涓流与写失败重试约 3 秒；控制台在可见总览刷新状态。事件循环阻塞与这些低频检查并存，实际唤醒开销需设备实测。
 
-### `[control]` 关键字段
+### FAS 与控制界面
 
-| 字段 | 默认 | 说明 |
-| --- | --- | --- |
-| `floor_enter_ratio` | 0.05 | 进入静默的瞬时比率上限 |
-| `floor_exit_ratio` | 0.12 | 退出静默的滤波比率（必须大于进入值） |
-| `floor_settle_ms` | 60 | 进入静默需保持的时间 |
-| `floor_exit_ms` | 60 | 退出静默需保持的时间 |
-| `fg_fast_ms` | 100 | 退出判据的快速滤波时间常数 |
-| `touch_lift_ms` | 150 | 手指抬起后保持抬频的窗口 |
-| `touch_lift_level` | 0.30 | 抬频目标（簇跨度的比例，只到中档，按压不飙高档） |
-| `touch_ramp_ms` / `touch_ramp_stages` | 60 / 3 | 三级抬频，约 20 ms 一级 |
-| `touch_decay_ms` | 45 | 回落每一级的最小间隔 |
-| `drop_factor` | 2.0 | 单次回落最多降到当前的 1/2 |
-| `launch_lift_ms` / `launch_lift_level` | 1000 / 1.00 | 应用启动边沿的短窗口高地板 |
-| `frame_burst_ms` / `frame_burst_level` | 150 / 0.70 | 帧超时突发的抬频窗口与目标 |
-| `prime_lift_level` | 0.45 | 超大核的事件抬频上限（启动/触摸都受此约束） |
-| `prime_load_cap` | 0.78 | 超大核的持续负载上限，只有重载帧压力才逼近顶档 |
-| `ceiling_headroom` | 0.18 | 软上限：`scaling_max_freq = 地板 + 该比例 × 硬件跨度` |
-| `parked_headroom` | 0.08 | 静默余量，保证上限始终高于地板，绝不锁最低频 |
+APP / WebUI 共用控制服务和配置，提供状态、调度、FAS 选包、充电与日志。应用列表异步加载；包名是匹配依据，显示名称不参与调度。FAS 默认关闭，需打开总开关并选中应用；空列表不是“全部应用”。
 
-### `[fas]`
+FAS 在选中的前台应用上异步读取 `dumpsys gfxinfo <包名> framestats`，仅使用新增帧（最多最近 60 帧）的最慢耗时反馈。它测量的是 **Android UI 帧时间，不是视频解码帧、视频输出帧或全部 GPU 渲染路径**；没有有效新帧不能证明流畅，不能以此保证视频 0 掉帧。帧预算需匹配刷新率/场景，默认 16 ms 不适合所有应用。
 
-| 字段 | 默认 | 说明 |
-| --- | --- | --- |
-| `enabled` | `false` | FAS 总开关 |
-| `apps` | `[]` | 启用 FAS 的包名集合，为空即完全关闭 |
-| `frame_budget_ms` | 16.0 | 帧预算，95th percentile 超过它时抬频 |
+### 充电控制
 
-### 充电与温控
+- 默认 80% 停充、降至 70% 复充；温度默认 45°C 停充、降至恢复门槛 40°C 或以下后解除温度阻断。优先级为温度、100% 满充锁存、普通上限、预约窗口；解除一项阻断不保证立即充电。
+- 上限设为 100% 时，**电量显示 100 并不会立即断充**：需驱动 `status=Full`，或持续小电流证据（默认绝对值不高于 100 mA 持续 9 秒；可附加电压门槛）才锁存。锁存按插电会话保持，重新插电、重启或相关配置改变会重置。电流单位、正负号、电池状态必须按本机驱动核实。
+- 预约支持 `everyday` / `workdays` / `custom`、周一至周日 `1..7`、最多 6 个 `HH:MM` 时段；跨零点的后半段归属开始日。停用或无有效时段不限制充电，开始与结束相同不是全天。
+- 从已知候选节点中选第一个可写开关：`qcom-battery/input_suspend` 或 battery 下的 `input_suspend`、`battery_input_suspend`、`charging_enabled`、`battery_charging_enabled`、`charge_enabled`。`input_suspend` 类停/开为 `1/0`，enabled 类为 `0/1`。可写不代表语义一定正确，可能同时影响输入供电，并非通用旁路充电。
+- 写入失败须以错误和读回结果为准，不能把逻辑“允许/禁止”当作硬件事实。沙盒使用成对的 `AEGIS_BATTERY_DIR` / `AEGIS_CHARGE_SWITCH` 隔离假节点；**沙盒逻辑验证不代替其他手机的真实节点、充停与恢复验证**，勿在日常服务中设置测试环境变量。
 
-| 段 | 字段 | 说明 |
-| --- | --- | --- |
-| `[charge]` | `stop_at_percent` / `resume_at_percent` | 充电上限与回差恢复阈值 |
-| `[charge]` | `temp_stop_c` / `temp_resume_c` | 停充 / 恢复温度（带回差） |
-| `[charge]` | `latch_per_plug` | 100% 满电锁存，仅当次插电有效，重插或重启即清除 |
-| `[thermal]` | `guard_c` / `profile` | 触达温度上限时压低簇上限，回落后逐级恢复 |
+## 配置速查
 
-## 实测数据（8Gen2 / babylon）
+实际配置：`/data/adb/tempo/config.toml`；默认模板：[packaging/config.toml](packaging/config.toml)。`schema = 1`，未知字段会被拒绝；旧数据目录名 `tempo` 与程序名 `tempoctl` 仍沿用，不要自行改名。FAS 侧车 `fas.json`、预约 `charge_plan.json` 与主配置同目录，建议用界面维护，避免主配置与侧车互相覆盖。
 
-### v2.5（最新）
+下表默认值指**模块模板**，不是 Rust 内部缺省值；完整约束以 [config.rs](crates/tempo-core/src/config.rs) 的 `validate()` 为准。
 
-四场景均为**亮屏静态、不操作**，官方（mask 全放开）与 v2.5 同页面/同内容、各 180 s，`time_in_state` 增量 + `/proc/stat` 占用率。
-
-| 场景 | c0 均频（3×A510） | c1 均频（4×A710/A720） | c2 均频（1×X3） | 最低档占比 c0/c1/c2 | jank | p90 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 小说正文静止（番茄） | 875 → **307 MHz**（−65%） | 912 → **499 MHz**（−45%） | 631 → **595 MHz**（−6%） | 10.4/42.0/98.1% → **100/100/100%** | n/a（无新帧） | n/a |
-| 视频静止播放（抖音，180 s） | 1230 → **307 MHz**（−75%） | 1140 → **499 MHz**（−56%） | 620 → **595 MHz**（−4%） | 0.0/0.0/98.7% → **100/100/100%** | 0 → **0**（21 486 帧） | 23 → **29 ms** |
-| 输入法打字（设置 9 键，60 s） | 1152 → 1159 MHz（+0.6%） | 1051 → **1077 MHz**（+2.5%） | 742 → 757 MHz（+2.0%） | 0/59.3/94.2% → 0.5/56.6/93.6% | 42.6% → 41.7% | 21 → 25 ms |
-| 长按倍速（B 站视频，60 s） | 1534 → 1541 MHz（+0.4%） | 1062 → 1041 MHz（−1.9%） | 654 → **630 MHz**（−3.6%） | 0/0/97.5% → 0/0/**98.6%** | 0.81% → 3.17% | 6 → 8 ms |
-
-- **小说静止**：三簇 100% 时间落在硬件最低档，且 20 s 一次的即时采样 9/9 次都在最低档——低频不是"平均下来低"，而是持续最低。
-- **视频静止**：最低档连续播放 180 s、21 486 帧、Janky 0；p90 29 ms 仍在 30 fps 的 33 ms 预算内。最低档即为实测下限，未再上探。
-- **输入法**：c1 稳定在 1.05–1.08 GHz，未回到 2.18 GHz 的整簇抬频；抬频由厂商路径负责，模块不写。
-- **长按倍速**：c2 630 MHz、98.6% 时间在最低档，未出现超大核冲顶（此前问题为 0.82 GHz，现仍不冲顶）。
-- 输入法/长按两场景发生在**需求窗口内**（触摸已释放钉住），所以频率与官方基本一致——这两个场景只要求"不比官方更激进"，v2.5 满足。
-
-**冷启动（同会话交错 A/B，每次切换后 5 s 收敛，force-stop 后 `am start -W -S`）**
-
-| 应用 | ON 中位 | OFF 中位 | Δ |
-| --- | --- | --- | --- |
-| 抖音 | 861 ms | 885 ms | −2.7% |
-| 番茄 | 2119 ms | 2050 ms | +3.4% |
-| 淘宝 | 1893 ms | 1878 ms | +0.8% |
-| 微信 | 2063 ms | 2035 ms | +1.4% |
-| 设置 | 1032 ms | 1151 ms | −10.3% |
-
-全部落在 ±10% 内；微信在 `force-stop + -S` 压力下有原生偶发卡死（官方态同样复现，属测试口径下的厂商/微信问题，非模块引入）。
-
-### 历史：v2.1.1（机制已变，仅存档）
-
-**静态 3 分钟（亮屏静置，181 s，`time_in_state` 增量）**
-
-| 簇 | 平均频率 | 最低档占比 | 最高档占比 |
-| --- | --- | --- | --- |
-| c0 | **455.8 MHz** | 82.25%（307200） | 4.76%（2016000） |
-| c1 | **596.9 MHz** | 92.43%（499200） | 3.19%（2592000） |
-| c2 | **635.9 MHz** | 97.50%（595200） | 2.22%（2342400） |
-
-- 静态电流中位 **79 mA**、均值 **85.7 mA**（17 × 10 s 有效采样，`input_suspend=1` 真放电；首个采样点为充电切换瞬态，已剔除），4.33 V 约 **0.37 W**。
-- 守护自身 CPU：9 ticks / 181 s ≈ **0.05% 单核**；voluntary ctxt 增量 404 / 181 s ≈ **2.2 次/秒**。
-- 静置期 `max_freq` 全程保持 2016000 / 2592000 / 2342400，未被封顶。
-- 与官方调度同场景对照：官方平均频率 772.4 / 611.8 / 666.5 MHz、电流中位 151 mA。v2.1.0 A/B 口径频率差 −1.4% / −2.6% / −1.3%；v2.1.1 本轮复测 c0 地板由厂商 QoS 放行到 307200（v2.1.0 时为 672000），因此 c0 平均频率 455.8 MHz **不能与上一轮直接横比**。中位电流 79 mA 仅为单轮记录，**不作为功耗结论，不宣称“功耗大幅下降”**。
-
-**冷启动（force-stop 确认无 pid 后，各 3 次）**
-
-| 应用 | TotalTime | 总帧 | Janky | 90th | 99th |
-| --- | --- | --- | --- | --- | --- |
-| 设置 | 398–424 ms | 59 | 2（3.39%） | 23–32 ms | 69–77 ms |
-| 微信 | 442–649 ms | 54–58 | 25.86%–26.47% | 250–350 ms | 300–550 ms |
-| Chrome | 650–777 ms | 113–199 | 0.90%–1.71% | 12 ms | 250–350 ms |
-
-微信冷启动仍是弱项：官方同场景基线为 22.4%–23.4%（90th 250 ms），本版 25.9%–26.5%、90th 250 ms。启动窗口内 c1/c2 已处于硬件上限，把 lift 降到 200 ms / 0.50 反而得到 25.00%，说明剩余卡顿来自微信主线程、IO 与 MIUI `perfservice`（logcat 可见 `Skipped 31/52 frames`、`onResume took 156ms`、`MiuiPerfServiceClient ... Slow handle traversal`），不是 CPU 地板不足。**目标“<10% / 90th<100ms”未达成，不虚报。**
-
-**热切换**
-
-| 场景 | 指标 |
+| 类别 | 当前生效字段及含义 |
 | --- | --- |
-| 微信应用内 6 次底栏切换 | 232 帧，Janky 12（**5.17%**），50/90/99 = 5 / 24 / 129 ms |
-| 最近任务卡片回切设置 | 87 帧，Janky 3（**3.45%**），50/90/99 = 7 / 14 / 65 ms |
+| `[daemon]` | `log_level="info"`；`profile_path="/data/adb/tempo/profile/device.toml"`（模块服务也显式传入该路径） |
+| `[events]` | `runtime_quantum_us=250000`（500–300000 µs）、`demand_step=0.10`（0.01–0.20）：探针观察与发布阈值；`screen_path=""` 自动发现屏幕节点；`quiet_decay_ms=60`：最近触摸后的静默等待 |
+| `[control]` 静默 | `floor_enter_ratio=0.05`、`floor_exit_ratio=0.12`（退出必须高于进入）、`floor_settle_ms=60`；`quiet_decay_ms + floor_settle_ms ≤ 300` |
+| 负载分档 | `tier_table_max=8`（6–10）、`up_confirm_ms=120`（40–400）、`down_step_ms=45`（15–200）、`max_up_step=2`（1–4）、`demand_smooth_ms=200`（50–1000） |
+| 交互窗口 | `touch_lift_tiers=1`（1–3）、`touch_lift_ms=150`（20–600）、`launch_lift_ms=1000`（200–1500）、`launch_tier_ratio=0.62`（0.30–0.90）；比例按档位索引计算，不是固定 GHz |
+| 目标与 cap | `prime_cap_ratio=0.70`、`ime_cap_ratio=0.45` 约束目标档位；`lookahead_tiers=3`（1–5）留出上限余量，`safety_ceiling_ratio=0.35` 是档位基线，受稀疏表与温控约束；启动 cap 同样受分档限制，并非总放开至最高 |
+| 帧反馈 | `frame_slack_ms=3.0`、`frame_burst_ms=150`、`frame_burst_level=0.70`、`pressure_hold_ms=1000`：超预算余量、短时救援及持续压力保持 |
+| 启动保护 | `startup_guard_ms=20000`（5000–120000）：守护启动后的 cpufreq 只读期，不表示充电控制也暂停 |
+| `[scene]` | `reading_floor_tier` / `video_floor_tier` / `default_floor_tier` 默认 0，允许 0–5、按实际档位截断；`reading_packages` / `video_packages` / `ime_packages` 为分类包名列表，各最多 64 项，不等于 FAS 选包 |
+| `[fas]` | `enabled=false`、`apps=[]`（最多 64）、`frame_budget_ms=16.0`（6–40 ms）；侧车保存界面选包 |
+| `[charge]` | `stop_at_percent=80`（50–100）、`resume_at_percent=70`（至少 20 且小于上限）；`temp_stop_c=45.0`、`temp_resume_c=40.0`（恢复温度必须低于停充温度） |
+| 满充证据 | `full_current_ma=100`（20–1000 mA）、`full_hold_seconds=9`（1–60 s）、可选 `full_voltage_mv`（3000–5000 mV，默认不配置） |
+| `[thermal]` | `guard_c=45.0`（20–80°C）：以电池温度施加附加 CPU 上限，不能替代 CPU/电池硬件温控 |
+| `[ui]` | `language="zh"`：界面语言配置；当前界面主要为中文 |
 
-**突发与 Doze**
+**旧兼容字段不等于生效调参项。** 当前分档控制不读取以下字段来决定频率，但仍解析并校验，勿随意删除约束或填写越界值：
 
-- 通知弹出后峰值可达各簇硬件上限，但超过最低档的累计时间仅 **0.27 s / 0.15 s / 0.04 s**，单次抬频窗口 ≤ 0.5 s。
-- 息屏 60 s：`dumpsys deviceidle` → `mState=IDLE`；守护累计 **0 ticks**，全部事件源阻塞于 `epoll_wait`。
+- `[control]` 的 `quiet_ratio`、`quiet_cap`、`floor_exit_ms`、`fg_fast_ms`、`floor_residence_ms`、`drop_ratio`、`drop_factor`、`touch_lift_level`、`touch_ramp_ms`、`touch_ramp_stages`、`touch_decay_ms`、`launch_lift_level`、`prime_lift_level`、`prime_load_cap`、`ceiling_headroom`、`reserve_ratio`、`step_hysteresis`、`parked_headroom`，及 `[control.role_cap]` 全组。
+- `[events].frame_stride` 不用于当前 gfxinfo 抽帧；`[thermal].profile` 未选择实际温控曲线；`[charge].latch_per_plug` 的实际锁存逻辑由 `stop_at_percent == 100` 推导。
 
-## 已知限制
+3.4 已从默认模板移除未定义且不生效的 `flat_ceiling_bias`、`task_fit_margin`、`max_single_burst_us`、`log_cooldown_us`、`pose_swap_grace_us`。迁移旧配置时也应删除这些项，再执行 `--check`；不要把不存在的参数当作调优开关。
 
-- **mask 文件不是硬保证**：厂商写 `scaling_min_freq` 时内容会落进 mask 文件，所以静默期真正把频率压住的是 `scaling_max_freq = hw_min` 的封顶；厂商在 touch boost 尾期若又写高 max，200 ms 采样内的 `assert_cap` 会压回，期间可能有极短反弹（本轮未观测到肉眼可见问题）。
-- **交互期间完全放开**：封顶只在静默期成立；触摸、启动、亮屏会先恢复 max 再释放 min，因此输入法/长按等场景频率与官方一致（这是为"不卡"做的取舍，不是遗漏）。
-- **视频 p90 29 ms（官方 23 ms）**：最低档连续 180 s 零丢帧，但帧时间波动略大；更高码率/60 fps 片源需要按逐档下降法重新标定地板。
-- **微信 force-stop 冷启**：本机在 `-S` 冷启压力下有原生偶发卡死，官方态同样复现；不作为模块缺陷，也不宣称"微信永不白屏"。
-- **机型覆盖**：仅 8Gen2 / babylon 完成四场景 + 冷启验证；其他 SoC 走自适应档案，能力不足时转 observe-only。
-- **充电控制**：逻辑在沙盒验证，本轮未做真机充电验证。
-
-## 回滚
+修改前复制配置为候选文件，经校验再应用（root shell）：
 
 ```sh
-# 一键还原原始 governor/min/max（任意时刻可执行）
+cp /data/adb/tempo/config.toml /data/local/tmp/aegis-candidate.toml
+# 编辑候选文件后：
+$CTL --config /data/local/tmp/aegis-candidate.toml \
+  --profile /data/adb/tempo/profile/device.toml validate
+$CTL apply --file /data/local/tmp/aegis-candidate.toml
+```
+
+查看返回的 `ok` / `restart_required`。改变探针窗口、发布阈值、日志级别、档案路径或启动保护需重启守护（推荐重启设备）；应用配置可能重置控制状态，之后重新检查。服务启动时无效配置会尝试 `.bak`，再尝试模块默认配置，仍无效则不接管。
+
+## 备份与回滚
+
+写入前在 `/data/adb/tempo/orig/` 保存本次开机的原始 min/max/governor，按 boot id 识别；守护另存 `run/cpufreq-backup.json`。**恢复只写 min/max，不改 governor、thermal 或限制节点**，跨开机/跨手机旧备份不可用于强行恢复。
+
+```sh
+# 在线恢复 CPU 上下限，并暂停本守护实例继续调频
+/data/adb/modules/aegis_scheduler/bin/tempoctl restore
+
+# 完整停用：先在模块管理器禁用，然后在 root shell 清理当前实例
+sh /data/adb/modules/aegis_scheduler/uninstall.sh
+
+# 服务已停止时的离线 CPU 恢复（仅当前 boot 备份有效）
 sh /data/adb/modules/aegis_scheduler/scripts/restore.sh
-
-# 经控制 socket 还原并释放守护记录
-/data/adb/modules/aegis_scheduler/bin/tempoctl \
-  --config /data/adb/tempo/config.toml \
-  --profile /data/adb/tempo/profile/babylon.toml \
-  restore --socket /data/adb/tempo/run/control.sock
 ```
 
-在模块管理器中禁用或删除模块即可；`uninstall.sh` 会自动还原 cpufreq、恢复充电、清理守护进程。历史模块目录建议保留（仅置 `disable`），以便随时切回。
+确认读回成功后重启；要切回旧模块，应先停用本模块并重启，再启用旧模块，不要同时运行。直接运行离线恢复脚本不能阻止仍存活的 writer 再写入。正常退出会尝试恢复 CPU 和充电开关原值；异常退出看门狗兜底针对 CPU，**不保证强杀后充电开关自动恢复**，遇到停充需检查并使用已核实的本机恢复方式或重启。开机健康标记未清除而再次启动时，服务会禁用模块；先看日志再决定是否重新启用。
 
-## 从源码构建
+## 从源码构建（Windows PowerShell）
 
-- 守护：Rust workspace（`crates/`），`cargo build --release --target aarch64-linux-android`
-- WebUI：`webui/`，构建产物同步到 `packaging/webroot/`（8 个文件）
-- APP：`app/`，Kotlin + Jetpack Compose，`./gradlew :app:assembleRelease`
-- 模块打包：`make package` 输出 `Aegis-v<ver>.zip`
+准备 Rust/Cargo 与 `aarch64-linux-android` target、Android NDK（默认 API 26）、探针要求的 Rust nightly/rust-src 与 `bpf-linker`（见 `probe/rust-toolchain.toml`）、JDK 17+、项目兼容的 Gradle、Android SDK 36、Build Tools 35.0.0 或 36.0.0、Python 3。首次依赖下载需要网络或完整缓存。输出路径使用纯 ASCII。
 
-> 工程路径含中文时请设置 `CARGO_TARGET_DIR` 到纯 ASCII 路径，否则部分链接步骤会失败。
+在仓库根目录执行，路径按本机修改：
 
-## 许可
+```powershell
+$env:ANDROID_NDK_HOME = 'D:\Android\ndk\android-ndk-r29'
+$env:ANDROID_HOME = 'D:\Android\Sdk'
+$env:TEMPO_ANDROID_TARGET_DIR = 'D:\aegis-build\android'
+$env:TEMPO_PROBE_TARGET_DIR = 'D:\aegis-build\probe'
+$env:AEGIS_APK_OUTPUT_DIR = 'D:\aegis-build\output'
+rustup target add aarch64-linux-android
 
-以 **GPL-3.0-or-later** 发布，完整文本见 [LICENSE](LICENSE)。
-`Copyright (c) 2026 默默的阿文`
+# 探针；脚本要求 bpf-linker.exe 所在目录，自动调用时默认 D:\dev\bpflinker
+.\scripts\build-probe.ps1 -BpfLinker 'D:\dev\bpflinker'
+# 自动重建探针，再执行 cargo build --target aarch64-linux-android --workspace --release
+.\scripts\build-android.ps1 -Release
+# 重建 WebUI、同步 APP assets、Gradle release、正式签名验证并输出 APK
+.\app\build.ps1
+.\scripts\build-module.ps1 -Version '3.4.0' `
+  -BuildDir $env:TEMPO_ANDROID_TARGET_DIR `
+  -Apk 'D:\aegis-build\output\Aegis-v3.4.0.apk' `
+  -OutputDir 'D:\aegis-build\output'
+```
+
+`build-module.ps1` 只打包现有 Android 二进制、`webui/dist/` 和匹配的已签名 APK，不会代替编译。需要直接使用 Cargo 时，先构建非空 `probe/dist/tempo.bpf.o`，设置 NDK linker、CC/AR 和 `CARGO_TARGET_DIR`（参照 `scripts/build-android.ps1`），再运行 `cargo build --release --target aarch64-linux-android --workspace`。不能只编译宿主程序后改名打包。
+
+正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 产物版本应为 3.4.0 / 17，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
+
+## 验证状态与许可
+
+此 README 描述当前实现与验证方法，**不是 v3.4.0 真机验收报告**。未运行的构建、回归、跨机节点验证及功耗测试不记为成功；旧版本的帧率、电流和频率记录不能代表本版结果，故不在此沿用。正式适配需记录设备/内核/ROM、参数、节点读回、测试条件及同条件对照；降低频率不自动等于降低整机功耗。
+
+GPL-3.0-or-later，见 [LICENSE](LICENSE)。Copyright (c) 2026 默默的阿文。

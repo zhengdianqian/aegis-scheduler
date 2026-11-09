@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '3.0';
+  var APP_VERSION = '3.4.0';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -99,11 +99,10 @@
       title: '静默与压缩',
       desc: '前台空闲时能压到多低、落到最低频有多快。',
       fields: [
-        { path: 'control.quiet_ratio', label: '负载压缩', min: 0.05, max: 0.95, step: 0.01, decimals: 2, tip: '把负载映射为目标频率的压缩系数，越小越省电。' },
-        { path: 'control.quiet_cap', label: '空闲上限', min: 0.05, max: 0.90, step: 0.01, decimals: 2, tip: '前台整体空闲时，允许的最高频率占可调区间的比例。' },
+        { path: 'control.demand_smooth_ms', label: '需求平滑时间', min: 50, max: 1000, step: 10, integer: true, unit: 'ms', tip: '需求滤波时间常数。' },
+        { path: 'control.floor_exit_ratio', label: '静默退出阈值', min: 0.02, max: 0.40, step: 0.01, decimals: 2, tip: '前台负载达到该比例后退出静默。' },
         { path: 'control.floor_enter_ratio', label: '静默进入阈值', min: 0.005, max: 0.20, step: 0.005, decimals: 3, tip: '前台阶梯负载持续低于该比例，视为没有有效前台工作。' },
-        { path: 'control.drop_ratio', label: '吸附最低频阈值', min: 0.01, max: 0.30, step: 0.01, decimals: 2, tip: '目标比例低于该值时直接吸附到该簇最低频率。' },
-        { path: 'control.drop_factor', label: '下落倍率', min: 1.0, max: 16.0, step: 0.5, decimals: 1, tip: '向下换档的滞回阈值按该倍率收紧，做到快下慢上。' }
+        { path: 'control.down_step_ms', label: '降档间隔', min: 15, max: 200, step: 1, integer: true, unit: 'ms', tip: '每次下降一档的最小间隔。' }
       ]
     },
     {
@@ -112,7 +111,8 @@
       desc: '触摸、前台切换与掉帧时的一次性抬频，用来保住交互手感。',
       fields: [
         { path: 'control.touch_lift_ms', label: '触摸抬频窗口', min: 20, max: 600, step: 10, integer: true, unit: 'ms', tip: '一次触摸后维持抬频的时间。' },
-        { path: 'control.touch_lift_level', label: '触摸抬频目标', min: 0.10, max: 1.0, step: 0.01, decimals: 2, tip: '抬频窗口内允许达到的频率比例。' },
+        { path: 'control.touch_lift_tiers', label: '触摸抬升档数', min: 1, max: 3, step: 1, integer: true, tip: '触摸提升档数，不直接抬升超大核。' },
+        { path: 'control.launch_tier_ratio', label: '启动档位比例', min: 0.30, max: 0.90, step: 0.01, decimals: 2, tip: '启动与前台切换的预热档位。' },
         { path: 'control.frame_slack_ms', label: '帧余量', min: 0.5, max: 20.0, step: 0.5, decimals: 1, unit: 'ms', tip: '渲染时间允许超出帧预算的余量。' },
         { path: 'control.frame_burst_ms', label: '掉帧抬频窗口', min: 40, max: 1000, step: 10, integer: true, unit: 'ms', tip: '检测到帧超时后的一次性抬频时间。' },
         { path: 'control.frame_burst_level', label: '掉帧抬频目标', min: 0.10, max: 1.0, step: 0.01, decimals: 2, tip: '掉帧抬频窗口内允许达到的频率比例。' }
@@ -120,14 +120,14 @@
     },
     {
       id: 'shift',
-      title: '换档与角色上限',
-      desc: '向上换档的滞回与按核心角色的硬上限，跨簇数通用。',
+      title: '换档与目标档位',
+      desc: '设置升档确认时间及不同场景的调度目标档位。',
       fields: [
-        { path: 'control.step_hysteresis', label: '向上换档滞回', min: 0.002, max: 0.20, step: 0.002, decimals: 3, tip: '目标比例相对上次发布值至少变化多少才向上换档。' },
-        { path: 'control.reserve_ratio', label: '高负载余量', min: 1.0, max: 1.25, step: 0.05, decimals: 2, tip: '高负载段允许超过线性满档的顶部余量。' },
-        { path: 'control.role_cap.efficiency', label: '能效核上限', min: 0.20, max: 1.0, step: 0.01, decimals: 2, tip: '能效簇允许达到的最高频率比例。' },
-        { path: 'control.role_cap.balanced', label: '均衡核上限', min: 0.20, max: 1.0, step: 0.01, decimals: 2, tip: '均衡簇允许达到的最高频率比例。' },
-        { path: 'control.role_cap.prime', label: '超大核上限', min: 0.20, max: 1.0, step: 0.01, decimals: 2, tip: '超大簇允许达到的最高频率比例。' }
+        { path: 'control.tier_table_max', label: '频率阶梯数', min: 6, max: 10, step: 1, integer: true, tip: '每簇频率阶梯数量，修改后需重启。' },
+        { path: 'control.up_confirm_ms', label: '升档确认', min: 40, max: 400, step: 1, integer: true, unit: 'ms', tip: '持续需求的升档确认时间。' },
+        { path: 'control.max_up_step', label: '最大升档步数', min: 1, max: 4, step: 1, integer: true, tip: '单次最多提升的档数。' },
+        { path: 'control.prime_cap_ratio', label: '超大核档位上限', min: 0.30, max: 0.90, step: 0.01, decimals: 2, tip: '正常负载下的超大核档位上限。' },
+        { path: 'control.ime_cap_ratio', label: '输入法档位上限', min: 0.25, max: 0.80, step: 0.01, decimals: 2, tip: '输入法前台时的调度目标档位上限。' }
       ]
     },
     {
@@ -135,12 +135,10 @@
       title: '采样与确认',
       desc: '事件采样密度与静默确认时间；采样越稀，自身唤醒越少。',
       fields: [
-        { path: 'events.runtime_quantum_us', label: '需求结算窗口', min: 500, max: 50000, step: 250, integer: true, unit: 'µs', tip: '每簇累计运行量达到该值才结算一次需求，不是定时器周期。' },
+        { path: 'events.runtime_quantum_us', label: '需求结算窗口', min: 500, max: 300000, step: 250, integer: true, unit: 'µs', tip: '每簇累计运行量达到该值才结算一次需求，不是定时器周期。' },
         { path: 'events.demand_step', label: '需求上报步长', min: 0.01, max: 0.20, step: 0.01, decimals: 2, tip: '需求变化达到该步长才上报，越大越省唤醒。' },
-        { path: 'events.frame_stride', label: '帧事件合并', min: 1, max: 16, step: 1, integer: true, unit: '帧', tip: '每 N 帧最多上报一次，1 表示不合并。' },
         { path: 'events.quiet_decay_ms', label: '静默延迟', min: 20, max: 2000, step: 10, integer: true, unit: 'ms', tip: '最后一次触摸后至少经过该时间才允许进入静默。' },
         { path: 'control.floor_settle_ms', label: '静默确认时间', min: 10, max: 1000, step: 10, integer: true, unit: 'ms', tip: '前台负载持续低于进入阈值多久才确认静默。' },
-        { path: 'control.floor_residence_ms', label: '最低频驻留', min: 0, max: 2000, step: 10, integer: true, unit: 'ms', tip: '非事件驱动的抬升需要的最短驻留；触摸与帧事件不受限。' },
         { path: 'daemon.log_level', label: '日志级别', kind: 'select', options: LOG_LEVELS, tip: '日志级别越高写入越少；排查问题时可临时调低。' }
       ]
     }
@@ -254,7 +252,7 @@
   function sourceLabel(kind) {
     if (kind === 'ksu') return { text: '已连接', tone: 'live' };
     if (kind === 'app') return { text: '已连接', tone: 'live' };
-    return { text: '', tone: 'demo' };
+    return { text: kind === 'demo' ? '模拟演示 · 非真实设备数据' : '控制通道不可用', tone: 'demo' };
   }
 
   function appLabel(app) {
@@ -349,21 +347,17 @@
       '</section>';
   }
 
+  function formatRange(min, max) {
+    return (min > 0 ? formatGhz(min) : '--') + ' – ' + (max > 0 ? formatGhz(max) : '--') + ' GHz';
+  }
+
   function renderCluster(cluster, index) {
     var role = roleMeta(cluster.role);
-    var decision = null;
-    if (state.data && state.data.status && state.data.status.control &&
-        Array.isArray(state.data.status.control.decisions)) {
-      decision = state.data.status.control.decisions.filter(function (item) {
-        return item && Number(item.cluster) === index;
-      })[0] || null;
-    }
-    var ceiling = decision && decision.ceiling_khz ? decision.ceiling_khz : cluster.min_khz;
-    var cap = decision && decision.cap_khz ? decision.cap_khz : cluster.max_khz;
-    var tier = Number.isFinite(Number(cluster.tier)) ? Number(cluster.tier) : null;
-    var tierCount = Number.isFinite(Number(cluster.tier_count))
-      ? Number(cluster.tier_count)
-      : (Array.isArray(cluster.tiers) ? cluster.tiers.length : null);
+
+
+
+
+
     var current = state.data.freqs[index];
     var hasCurrent = isFinite(Number(current)) && Number(current) > 0;
     var span = Math.max(1, Number(cluster.max_khz) - Number(cluster.min_khz));
@@ -371,12 +365,10 @@
       ? clamp01((Number(current) - Number(cluster.min_khz)) / span)
       : 0;
     var pct = Math.max(ratio * 100, hasCurrent ? 1.5 : 0);
-    var reasonLabel = decision ? (REASON[decision.reason] || '保持') : '—';
 
     var usage = state.data && Array.isArray(state.data.usage) ? state.data.usage[index] : null;
     var hasUsage = typeof usage === 'number' && isFinite(usage);
     var usagePct = hasUsage ? Math.round(clamp01(usage) * 100) : 0;
-    var hasForeground = typeof cluster.foreground === 'number' && isFinite(cluster.foreground);
 
     return '' +
       '<article class="card cluster" style="--role:' + role.color + '">' +
@@ -384,7 +376,6 @@
           '<span class="role-dot"></span>' +
           '<h2>' + escapeHtml(role.label) + '</h2>' +
           '<span class="cluster__cpus">' + escapeHtml(cpuRange(cluster.cpus)) + '</span>' +
-          '<span class="tag' + (decision && decision.reason === 'quiet' ? ' tag--quiet' : '') + '">' + escapeHtml(reasonLabel) + '</span>' +
         '</header>' +
         '<div class="cluster__body">' +
           '<div class="ring" style="--pct:' + pct.toFixed(1) + '%">' +
@@ -394,15 +385,9 @@
             '</div>' +
           '</div>' +
           '<div class="stats">' +
-            '<div class="stats__row"><span>目标</span><b>' + formatGhz(ceiling) + ' GHz' + (tier !== null && tierCount ? ' · ' + (tier + 1) + '/' + tierCount : '') + '</b></div>' +
-            '<div class="stats__row"><span>上限</span><b>' + formatGhz(cap) + ' GHz</b></div>' +
-            '<div class="stats__row"><span>区间</span><b>' + formatGhz(cluster.min_khz) + ' – ' + formatGhz(cluster.max_khz) + '</b></div>' +
-            '<div class="stats__row"><span>容量</span><b>' + escapeHtml(cluster.capacity) + '</b></div>' +
+            '<div class="stats__row"><span>硬件区间</span><b>' + formatGhz(cluster.min_khz) + ' – ' + formatGhz(cluster.max_khz) + '</b></div>' +
             '<div class="bars">' +
               '<div class="bar bar--usage"><span>占用·采样</span><i style="width:' + usagePct + '%"></i><em>' + (hasUsage ? formatPercent(usage) : '--') + '</em></div>' +
-              (hasForeground
-                ? '<div class="bar bar--fg"><span>前台</span><i style="width:' + formatPercent(cluster.foreground) + '"></i><em>' + formatPercent(cluster.foreground) + '</em></div>'
-                : '') +
             '</div>' +
           '</div>' +
         '</div>' +
@@ -474,34 +459,35 @@
       return '<div class="applist__state">没有匹配的应用</div>';
     }
 
-    return apps.map(function (app) {
+    var more = apps.length > state.fasLimit;
+    return apps.slice(0, state.fasLimit).map(function (app) {
       var label = appLabel(app);
       var selected = state.fas.packages.indexOf(app.package) !== -1;
       var kind = app.type === 'system' ? '系统应用' : '用户应用';
       return '' +
         '<button class="approw' + (selected ? ' is-selected' : '') + '" data-pkg="' + escapeHtml(app.package) + '" aria-pressed="' + selected + '"' + (state.fas.enabled ? '' : ' disabled') + '>' +
-          (app.icon
-            ? '<span class="appicon appicon--img"><img src="data:image/png;base64,' + escapeHtml(app.icon) + '" alt=""></span>'
-            : '<span class="appicon" style="--h:' + appHue(app.package) + '">' + escapeHtml(appInitial(app, label)) + '</span>') +
+          '<span class="appicon" style="--h:' + appHue(app.package) + '">' + escapeHtml(appInitial(app, label)) + '</span>' +
           '<span class="appmeta">' +
             '<b>' + escapeHtml(label) + '</b>' +
             '<small>' + escapeHtml(app.package) + ' · ' + kind + '</small>' +
           '</span>' +
           '<span class="mini-switch" aria-hidden="true"><span></span></span>' +
         '</button>';
-    }).join('');
+    }).join('') + (more ? '<button class="ghost-btn" data-action="fas-more">显示更多（已显示 ' + state.fasLimit + ' / ' + apps.length + '）</button>' : '');
   }
 
   function renderFas() {
     var fas = state.fas;
     var count = fas.packages.length;
     var statusLine;
-    if (!fas.enabled) {
-      statusLine = 'FAS 已关闭，勾选的应用不会生效。';
+    if (!state.fasLoaded) {
+      statusLine = state.fasLoading ? '正在读取 FAS 设置…' : 'FAS 设置不可用';
+    } else if (!fas.enabled) {
+      statusLine = '总开关关闭';
     } else if (!count) {
-      statusLine = '未勾选任何应用，FAS 完全不工作。';
+      statusLine = '总开关开启，未选择应用';
     } else {
-      statusLine = '已对 ' + count + ' 个应用开启帧感知。';
+      statusLine = '总开关开启，已选 ' + count + ' 个应用';
     }
 
     return '' +
@@ -511,7 +497,7 @@
             '<h2>FAS 帧感知</h2>' +
             '<p>帧感知会略微增加功耗，只对你选中的应用开启</p>' +
           '</div>' +
-          '<button class="switch' + (fas.enabled ? ' is-on' : '') + '" data-action="fas-toggle" role="switch" aria-checked="' + fas.enabled + '" aria-label="FAS 总开关"><span></span></button>' +
+          '<button class="switch' + (fas.enabled ? ' is-on' : '') + '" data-action="fas-toggle" role="switch" aria-checked="' + fas.enabled + '" aria-label="FAS 总开关"' + (state.fasLoaded && !state.fasLoading ? '' : ' disabled') + '><span></span></button>' +
         '</div>' +
         '<div class="fas-hint' + (fas.enabled && !count ? ' fas-hint--warn' : '') + '">' + escapeHtml(statusLine) + '</div>' +
       '</section>' +
@@ -537,7 +523,7 @@
             ? '保存失败：' + humanizeError(state.fasError)
             : state.fasSaving
               ? '正在保存…'
-              : state.fasNote || '修改会立即保存并生效。'
+              : state.fasNote || '修改会保存并回读确认；守护是否采纳请查看运行状态与日志。'
         ) + '</div>' +
       '</section>';
   }
@@ -690,6 +676,10 @@
         errors[def.path] = '必须是数字';
         return;
       }
+      if (def.integer && Math.floor(number) !== number) {
+        errors[def.path] = '必须是整数';
+        return;
+      }
       if (number < def.min || number > def.max) {
         errors[def.path] = '需在 ' + cfgRangeText(def) + ' 范围内';
       }
@@ -715,6 +705,9 @@
       errors['charge.temp_resume_c'] = '恢复温度必须低于停充温度';
     }
 
+    if (control.floor_exit_ratio <= control.floor_enter_ratio) {
+      errors['control.floor_exit_ratio'] = '静默退出阈值必须高于静默进入阈值';
+    }
     if (control.floor_enter_ratio > control.drop_ratio) {
       errors['control.floor_enter_ratio'] = '静默进入阈值不能高于吸附最低频阈值';
     }
@@ -1329,8 +1322,9 @@
             : null;
           deriveChargeLatch(state.cfg.draft);
         }
-        state.cfg.saveMessage = '已保存并生效';
-        state.cfg.saveTone = 'ok';
+        state.cfg.saveMessage = result.restart_required ? '守护已保存；部分设置需重启服务后生效' : '守护已采纳并应用设置';
+        if (result.error) state.cfg.saveMessage += '；回读失败：' + humanizeError(result.error);
+        state.cfg.saveTone = result.restart_required || result.error ? 'info' : 'ok';
         syncConfigInputs();
         applyValidationUi();
         updatePowerLive();
@@ -1375,7 +1369,7 @@
       var finish = function (ok) {
         state.cfg.saving = false;
         if (ok) {
-          state.cfg.saveMessage = '已恢复上一份配置';
+          state.cfg.saveMessage = result.restart_required ? '已恢复配置；部分设置需重启服务后生效' : '守护已采纳上一份配置';
           state.cfg.saveTone = 'ok';
         }
         render();
@@ -1493,9 +1487,12 @@
     fasLoading: false,
     fasLoadError: null,
     fasSaving: false,
+    fasDirty: false,
+    fasEditRevision: 0,
     fasNote: null,
     fasError: null,
     fasQuery: '',
+    fasLimit: 60,
     power: {
       snapshot: null,
       error: null,
@@ -1624,7 +1621,7 @@
       if (state.tab === 'fas') updateFasList();
     };
 
-    api.queryPackages().then(function (result) {
+    api.queryPackages(force).then(function (result) {
       var apps = result.apps || [];
       if (result.error || !apps.length) {
         finish(result.error, apps);
@@ -1659,22 +1656,35 @@
   }
 
   function toggleApp(pkg) {
-    if (!state.fas.enabled) return;
+    if (!state.fasLoaded || state.fasLoading || !state.fas.enabled) return;
     var index = state.fas.packages.indexOf(pkg);
+    if (index === -1 && state.fas.packages.length >= 64) {
+      state.fasError = '最多选择 64 个应用';
+      updateFasStatus();
+      return;
+    }
     if (index === -1) state.fas.packages.push(pkg);
     else state.fas.packages.splice(index, 1);
-    updateFasList();
+    var rows = document.querySelectorAll('[data-pkg]');
+    for (var i = 0; i < rows.length; i += 1) {
+      if (rows[i].dataset.pkg !== pkg) continue;
+      rows[i].classList.toggle('is-selected', index === -1);
+      rows[i].setAttribute('aria-pressed', String(index === -1));
+    }
+    updateFasStatus();
     persistFas();
   }
 
   function ensureFasLoaded(force) {
-    if (state.fasLoading) return;
+    if (state.fasLoading || state.fasSaving || state.fasDirty) return;
     if (state.fasLoaded && !force) return;
+    var revision = state.fasEditRevision;
     state.fasLoading = true;
     state.fasLoadError = null;
     if (state.tab === 'fas') render();
     api.loadFas().then(function (result) {
       state.fasLoading = false;
+      if (state.fasDirty || state.fasSaving || revision !== state.fasEditRevision) return;
       if (!result.error) {
         state.fas.enabled = !!result.enabled;
         state.fas.packages = result.packages || [];
@@ -1686,12 +1696,26 @@
       if (state.tab === 'fas') render();
     }).catch(function (error) {
       state.fasLoading = false;
+      if (state.fasDirty || state.fasSaving || revision !== state.fasEditRevision) return;
       state.fasLoaded = false;
       state.fasLoadError = String((error && error.message) || error);
       if (state.tab === 'fas') render();
     });
   }
 
+  function updateFasStatus() {
+    var count = document.getElementById('fas-count');
+    if (count) count.textContent = '已选 ' + state.fas.packages.length;
+    var hint = document.querySelector('.fas-hint');
+    if (hint) {
+      hint.textContent = !state.fas.enabled ? '总开关关闭' : '总开关开启，已选 ' + state.fas.packages.length + ' 个应用';
+      hint.classList.toggle('fas-hint--warn', state.fas.enabled && !state.fas.packages.length);
+    }
+    var note = document.querySelector('.fas-spec');
+    if (note) note.textContent = state.fasError ? '保存失败：' + humanizeError(state.fasError) : state.fasSaving ? '正在保存…' : state.fasNote || '';
+  }
+
+  var fasSearchTimer = null;
   var fasSaveTimer = null;
 
   /** FAS 写入侧车文件，做了 350ms 合并，避免连续勾选反复写盘。 */
@@ -1699,13 +1723,20 @@
     if (!api) return;
     global.clearTimeout(fasSaveTimer);
     state.fasSaving = true;
+    state.fasDirty = true;
+    var revision = ++state.fasEditRevision;
     state.fasNote = '正在保存…';
+    state.fasError = null;
+    updateFasStatus();
     fasSaveTimer = global.setTimeout(function () {
-      api.saveFas(state.fas).then(function (result) {
+      var snapshot = { enabled: state.fas.enabled, packages: state.fas.packages.slice() };
+      api.saveFas(snapshot).then(function (result) {
+        if (revision !== state.fasEditRevision) return;
         state.fasSaving = false;
+        state.fasDirty = !!result.error;
         state.fasError = result.error;
-        state.fasNote = result.error ? '保存失败：' + humanizeError(result.error) : '已保存';
-        if (state.tab === 'fas') render();
+        state.fasNote = result.error ? '保存失败：' + humanizeError(result.error) : '侧车已保存并回读确认；尚未确认守护采纳，请查看运行状态与日志';
+        if (state.tab === 'fas') updateFasStatus();
       });
     }, 350);
   }
@@ -1833,8 +1864,59 @@
     });
   }
 
+  var overviewTimer = null;
+  var overviewInFlight = false;
+
+  function overviewVisible() {
+    return state.tab === 'overview' && !document.hidden && global.__AEGIS_FOREGROUND__ !== false;
+  }
+
+  function stopOverviewPolling() {
+    global.clearTimeout(overviewTimer);
+    overviewTimer = null;
+  }
+
+  function startOverviewPolling() {
+    stopOverviewPolling();
+    if (!overviewVisible()) return;
+    overviewTimer = global.setTimeout(function () {
+      if (!overviewVisible()) return;
+      if (state.loading || overviewInFlight || !state.data || !state.data.status) {
+        startOverviewPolling();
+        return;
+      }
+      var data = state.data;
+      var clusters = data.status.clusters || [];
+      overviewInFlight = true;
+      Promise.all([api.queryFrequencies(clusters), api.queryUsage(clusters)]).then(function (values) {
+        data.freqs = values[0];
+        data.usage = values[1].values;
+        data.usageWindowMs = values[1].windowMs;
+        data.usageError = values[1].error;
+        if (!overviewVisible() || state.data !== data) return;
+        var cards = document.querySelectorAll('.cluster');
+        for (var i = 0; i < cards.length; i += 1) {
+          var current = data.freqs[i];
+          var usage = data.usage[i];
+          var cluster = clusters[i];
+          var ratio = current > 0 ? clamp01((current - cluster.min_khz) / Math.max(1, cluster.max_khz - cluster.min_khz)) : 0;
+          cards[i].querySelector('.ring').style.setProperty('--pct', Math.max(ratio * 100, current > 0 ? 1.5 : 0) + '%');
+          cards[i].querySelector('.ring__inner b').textContent = formatGhz(current);
+          cards[i].querySelector('.bar--usage i').style.width = (typeof usage === 'number' ? formatPercent(usage) : '0%');
+          cards[i].querySelector('.bar--usage em').textContent = typeof usage === 'number' ? formatPercent(usage) : '--';
+        }
+        var title = document.querySelector('.section-title span');
+        if (title) title.textContent = clusters.length + ' 簇 · 实时 · ' + usageNote(data);
+      }).then(finish, finish);
+      function finish() {
+        overviewInFlight = false;
+        startOverviewPolling();
+      }
+    }, 5000);
+  }
+
   function refresh() {
-    if (state.loading) return;
+    if (state.loading || overviewInFlight) return;
     state.loading = true;
     render();
     api.loadOverview().then(function (data) {
@@ -1866,7 +1948,8 @@
     var action = target.dataset.action;
 
     if (action === 'refresh') {
-      refresh();
+      if (state.tab === 'fas') ensureApps(true);
+      else refresh();
       return;
     }
     if (action === 'logs-open') {
@@ -1884,9 +1967,15 @@
       return;
     }
     if (action === 'fas-toggle') {
+      if (!state.fasLoaded || state.fasLoading) return;
       state.fas.enabled = !state.fas.enabled;
       render();
       persistFas();
+      return;
+    }
+    if (action === 'fas-more') {
+      state.fasLimit += 60;
+      updateFasList();
       return;
     }
     if (action === 'fas-apps-retry') {
@@ -2001,8 +2090,8 @@
     if (target.dataset.tab && target.dataset.tab !== state.tab) {
       state.tab = target.dataset.tab;
       if (state.tab === 'fas') {
-        ensureApps();
-        ensureFasLoaded();
+        ensureApps(api.kind() !== 'app');
+        ensureFasLoaded(true);
       }
       if (state.tab === 'config') ensureConfig();
       if (state.tab === 'power') {
@@ -2013,6 +2102,7 @@
         stopPowerPolling();
       }
       render();
+      startOverviewPolling();
       global.scrollTo(0, 0);
     }
   }
@@ -2022,12 +2112,26 @@
     if (!target) return;
     if (target.id === 'fas-search') {
       state.fasQuery = target.value;
-      updateFasList();
+      global.clearTimeout(fasSearchTimer);
+      fasSearchTimer = global.setTimeout(function () {
+        state.fasLimit = 60;
+        if (state.tab === 'fas') updateFasList();
+      }, 180);
       return;
     }
     if (state.cfg.loaded && target.closest && target.closest('[data-field]')) {
       onCfgFieldInput(target);
     }
+  }
+
+  function onVisibilityChange() {
+    startOverviewPolling();
+    if (document.hidden || global.__AEGIS_FOREGROUND__ === false) {
+      stopPowerPolling();
+      return;
+    }
+    ensureFasLoaded(true);
+    if (state.tab === 'power') startPowerPolling();
   }
 
   function init() {
@@ -2053,16 +2157,15 @@
       }, 120);
     });
 
-    // 页面不可见时停止轮询，避免 APP 与 KernelSU 两个实例同时刷桥。
-    document.addEventListener('visibilitychange', function () {
-      if (document.hidden) {
-        stopPowerPolling();
-      } else if (state.tab === 'power') {
-        startPowerPolling();
-      }
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    global.addEventListener('aegisvisibilitychange', onVisibilityChange);
+    global.addEventListener('aegispackageschange', function () {
+      state.fasAppsLoaded = false;
+      if (state.tab === 'fas') ensureApps(true);
     });
 
     refresh();
+    startOverviewPolling();
   }
 
   // 参数/FAS 写入成功后调用 Tempo.App.refreshLogs()，确保日志不是旧内容。

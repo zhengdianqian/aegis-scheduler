@@ -58,9 +58,7 @@ pub fn snapshot(profile: &DeviceProfile) -> PowerSnapshot {
         .map(|cpu| {
             policy_dir(cpu)
                 .and_then(|dir| read_u32(&dir.join("scaling_cur_freq")))
-                .or_else(|| {
-                    policy_dir(cpu).and_then(|dir| read_u32(&dir.join("cpuinfo_cur_freq")))
-                })
+                .or_else(|| policy_dir(cpu).and_then(|dir| read_u32(&dir.join("cpuinfo_cur_freq"))))
                 .unwrap_or(0)
         })
         .collect();

@@ -202,13 +202,14 @@
     });
   };
 
-  /** 读取每簇实际频率（用户刷新时读一次，不做轮询）。 */
-  TempoApi.prototype.queryFrequencies = function () {
+  /** 读取每簇实际频率，由可见总览页低频调用。 */
+  TempoApi.prototype.queryFrequencies = function (clusters) {
+    var node = 'scaling_cur_freq';
     var command =
       'for d in /sys/devices/system/cpu/cpufreq/policy*; do ' +
       '[ -d "$d" ] || continue; ' +
       'n=${d##*policy}; ' +
-      '[ -r "$d/scaling_cur_freq" ] && echo "$n $(cat "$d/scaling_cur_freq")"; ' +
+      '[ -r "$d/' + node + '" ] && echo "$n $(cat "$d/' + node + '")"; ' +
       'done | sort -n';
 
     return this._exec(command, 6000).then(function (result) {
@@ -227,7 +228,14 @@
         }
       });
       pairs.sort(function (a, b) { return a.policy - b.policy; });
-      return pairs.map(function (pair) { return pair.khz; });
+      if (!clusters || !clusters.length) return pairs.map(function (pair) { return pair.khz; });
+      return clusters.map(function (cluster) {
+        var policy = cluster.policy;
+        if (typeof policy === 'string') policy = Number(policy.replace(/^.*policy/, ''));
+        if (policy == null && Array.isArray(cluster.cpus) && cluster.cpus.length) policy = Math.min.apply(null, cluster.cpus);
+        var match = pairs.filter(function (pair) { return pair.policy === policy; })[0];
+        return match ? match.khz : null;
+      });
     }).catch(function () {
       return [];
     });
@@ -235,7 +243,7 @@
 
   /**
    * 固定窗口采样每簇占用率：读两次 /proc/stat，按 CPU 的 idle 差值聚合到簇。
-   * 只在进入页面或用户刷新时调用一次，不做定时轮询；失败返回 null 数组，不伪造。
+   * 由可见总览页低频调用；失败返回 null 数组，不伪造。
    */
   TempoApi.prototype.queryUsage = function (clusters) {
     var self = this;
@@ -312,13 +320,13 @@
   /**
    * 读取已安装应用（用户应用 + 系统应用）。
    *
-   * APP 内优先走 PackageManager（有真实名称与图标）；
+   * APP 内优先走异步 PackageManager 元数据（真实名称与分类）；
    * KernelSU WebUI 里退回到 pm 列表，并带 user/system 分类。
    */
-  TempoApi.prototype.queryPackages = function () {
+  TempoApi.prototype.queryPackages = function (force) {
     var self = this;
     if (this.shell && typeof this.shell.apps === 'function') {
-      return this.shell.apps().then(function (result) {
+      return this.shell.apps(force).then(function (result) {
         return result || { apps: [], error: null };
       });
     }
@@ -373,7 +381,7 @@
         if (a.type !== b.type) return a.type === 'user' ? -1 : 1;
         return (a.name || a.package).localeCompare(b.name || b.package);
       });
-      return { apps: apps.slice(0, 800), error: null };
+      return { apps: apps, error: null };
     }).catch(function (error) {
       return { apps: [], error: shorten(error.message, 160) };
     });
@@ -448,21 +456,26 @@
 
   /** 写入 FAS 侧车文件；守护接入后可直接读取该文件生效。 */
   TempoApi.prototype.saveFas = function (fas) {
+    var packages = (fas.packages || []).slice().sort();
+    if (packages.length > 64 || packages.some(function (pkg) { return typeof pkg !== 'string' || !/^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/.test(pkg); })) {
+      return Promise.resolve({ ok: false, error: '最多选择 64 个有效应用包名' });
+    }
     var body = JSON.stringify({
-      enabled: !!fas.enabled,
-      packages: (fas.packages || []).slice().sort()
+      enabled: fas.enabled === true,
+      packages: packages
     }, null, 2) + '\n';
     if (/^AEGIS_FAS_EOF$/m.test(body)) {
       return Promise.resolve({ ok: false, error: '内容包含保留结束标记' });
     }
     var command =
-      'cat > "' + PATHS.fas + '" <<\'AEGIS_FAS_EOF\'\n' +
+      'tmp="' + PATHS.fas + '.tmp.$$"; umask 077; cat > "$tmp" <<\'AEGIS_FAS_EOF\'\n' +
       body +
       'AEGIS_FAS_EOF\n' +
-      '[ -s "' + PATHS.fas + '" ] && echo __FAS_OK__ || echo __FAS_EMPTY__';
+      '[ -s "$tmp" ] && mv -f "$tmp" "' + PATHS.fas + '" && cat "' + PATHS.fas + '"';
 
     return this._exec(command, 6000).then(function (result) {
-      if (result.code !== 0 || text(result.stdout).indexOf('__FAS_OK__') === -1) {
+      var readback = parseJsonObject(result.stdout);
+      if (result.code !== 0 || !readback || readback.enabled !== (fas.enabled === true) || JSON.stringify(readback.packages) !== JSON.stringify(packages)) {
         return { ok: false, error: shorten(result.stderr || result.stdout, 160) || '写入失败' };
       }
       return { ok: true, error: null };
@@ -674,17 +687,14 @@
 
   /** 恢复上一份备份配置。 */
   TempoApi.prototype.restoreConfig = function () {
-    var command =
-      'if [ ! -f "' + PATHS.configBak + '" ]; then echo __RESTORE_MISSING__; exit 0; fi; ' +
-      'cp -f "' + PATHS.configBak + '" "' + PATHS.config + '" && echo __RESTORE_OK__ || echo __RESTORE_FAIL__';
-
-    return this._exec(command, 8000).then(function (result) {
-      var output = text(result.stdout);
-      if (output.indexOf('__RESTORE_OK__') !== -1) return { ok: true, detail: null };
-      if (output.indexOf('__RESTORE_MISSING__') !== -1) {
-        return { ok: false, detail: '没有可恢复的上一份设置' };
-      }
-      return { ok: false, detail: shorten(result.stderr || output, 200) || '恢复失败' };
+    var self = this;
+    return self.resolveBinary().then(function (binary) {
+      return self._exec('"' + binary + '" apply --file "' + PATHS.configBak + '" --socket "' + PATHS.socket + '" 2>&1', 8000);
+    }).then(function (result) {
+      var response = parseJsonObject(result.stdout);
+      return { ok: result.code === 0 && !!response && response.ok === true,
+        restart_required: !!response && response.restart_required === true,
+        detail: response && response.ok === true ? null : shorten(result.stderr || result.stdout, 200) || '恢复失败' };
     }).catch(function (error) {
       return { ok: false, detail: shorten(error.message, 200) };
     });
@@ -712,20 +722,25 @@
         });
       }
       notify('commit');
-      return self.commitConfig().then(function () {
+      return self._exec('"' + binary + '" apply --file "' + PATHS.configNew + '" --socket "' + PATHS.socket + '" 2>&1', 8000).then(function (result) {
+        var response = parseJsonObject(result.stdout);
+        if (result.code !== 0 || !response || response.ok !== true) {
+          return { ok: false, step: 'apply', detail: response && (response.detail || response.error) || shorten(result.stderr || result.stdout, 240) || '守护未确认采纳配置' };
+        }
         notify('readback');
-        return self.loadConfig(binary);
-      }).then(function (readback) {
-        return {
-          ok: true,
-          step: 'readback',
-          doc: readback.doc,
-          model: readback.model,
-          toml: readback.toml,
-          degraded: readback.degraded,
-          degradeReason: readback.degradeReason,
-          error: readback.error || null
-        };
+        return self.loadConfig(binary).then(function (readback) {
+          return {
+            ok: true,
+            restart_required: response.restart_required === true,
+            step: 'readback',
+            doc: readback.doc,
+            model: readback.model,
+            toml: readback.toml,
+            degraded: readback.degraded,
+            degradeReason: readback.degradeReason,
+            error: readback.error || null
+          };
+        });
       });
     }).catch(function (error) {
       return { ok: false, step: 'write', detail: shorten(error.message, 240) };
@@ -756,9 +771,7 @@
         : null;
 
       return Promise.all([
-        actual ? Promise.resolve(actual) : self.queryFrequencies().then(function (freqs) {
-          return clusters.length ? freqs.slice(0, clusters.length) : freqs;
-        }),
+        actual ? Promise.resolve(actual) : self.queryFrequencies(clusters),
         self.queryUsage(clusters),
         self.queryModule()
       ]).then(function (rest) {

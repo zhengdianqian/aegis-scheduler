@@ -6,7 +6,7 @@ plugins {
     id("com.android.application")
 }
 
-// 正式签名凭据固定在 app/keystore/ 下，release 构建默认使用；debug 构建不受影响。
+// 正式签名配置位于 app/keystore/，密钥库可用相对或绝对路径指定；debug 构建不受影响。
 val keystorePropsFile = rootProject.file("keystore/keystore.properties")
 val keystoreProps = Properties()
 val releaseSigningReady = keystorePropsFile.exists()
@@ -23,14 +23,14 @@ android {
         applicationId = "com.aegis.scheduler"
         minSdk = 24
         targetSdk = 36
-        versionCode = 13
-        versionName = "3.0"
+        versionCode = 17
+        versionName = "3.4.0"
     }
 
     signingConfigs {
         if (releaseSigningReady) {
             create("release") {
-                storeFile = rootProject.file("keystore/" + keystoreProps.getProperty("storeFile"))
+                storeFile = keystorePropsFile.parentFile.resolve(keystoreProps.getProperty("storeFile"))
                 storePassword = keystoreProps.getProperty("storePassword")
                 keyAlias = keystoreProps.getProperty("keyAlias")
                 keyPassword = keystoreProps.getProperty("keyPassword")
@@ -62,7 +62,7 @@ gradle.taskGraph.whenReady {
     if (hasTask(":app:packageRelease") && !releaseSigningReady) {
         throw GradleException(
             "release 签名配置缺失：未找到 ${keystorePropsFile.absolutePath}。" +
-                "请确认 app/keystore/aegis-release.jks 与 keystore.properties 存在（参考 app/keystore/SIGNING.md）。"
+                "请确认 app/keystore/keystore.properties 存在并指向正式签名密钥库。"
         )
     }
 }

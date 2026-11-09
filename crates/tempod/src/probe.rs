@@ -104,6 +104,7 @@ pub struct ProbeSession {
     last_fg_event: u64,
     last_fg_ts_us: u64,
     last_reported_busy: Vec<f32>,
+    last_reported_foreground: Vec<f32>,
     last_reported_foreground_active: bool,
     foreground_error: Option<String>,
 }
@@ -176,6 +177,7 @@ impl ProbeSession {
             last_fg_event: 0,
             last_fg_ts_us: 0,
             last_reported_busy: Vec::new(),
+            last_reported_foreground: Vec::new(),
             last_reported_foreground_active: false,
             foreground_error,
         })
@@ -218,6 +220,7 @@ impl ProbeSession {
             last_fg_event,
             last_fg_ts_us,
             last_reported_busy,
+            last_reported_foreground,
             last_reported_foreground_active,
             foreground_error: _,
         } = self;
@@ -277,19 +280,16 @@ impl ProbeSession {
 
         let foreground_active = !foreground_pids.is_empty();
 
-        // Keep the counters baseline moving even when nothing is published, so
-        // a later report always covers a short window instead of a long one.
-        let significant = last_reported_busy.len() != cluster_busy.len()
-            || cluster_busy
-                .iter()
-                .zip(last_reported_busy.iter())
-                .any(|(now, before)| (now - before).abs() >= REPORT_DELTA)
+        // 总负载不变时，前后台负载互换也必须通知控制器。
+        let significant = demand_changed(&cluster_busy, last_reported_busy)
+            || demand_changed(&cluster_foreground, last_reported_foreground)
             || foreground_active != *last_reported_foreground_active
             || foreground_changed;
         if !significant {
             return None;
         }
         last_reported_busy.clone_from(&cluster_busy);
+        last_reported_foreground.clone_from(&cluster_foreground);
         *last_reported_foreground_active = foreground_active;
 
         Some(DemandSnapshot {
@@ -306,6 +306,27 @@ impl ProbeSession {
     }
 }
 
+fn demand_changed(current: &[f32], reported: &[f32]) -> bool {
+    current.len() != reported.len()
+        || current
+            .iter()
+            .zip(reported)
+            .any(|(now, before)| (now - before).abs() >= REPORT_DELTA)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreground_change_is_significant_even_when_total_busy_is_stable() {
+        assert!(!demand_changed(&[0.5, 0.4], &[0.5, 0.4]));
+        assert!(demand_changed(&[0.0, 0.4], &[0.5, 0.4]));
+        assert!(!demand_changed(&[0.501], &[0.5]));
+        assert!(demand_changed(&[0.5], &[]));
+    }
+}
+
 impl mio::event::Source for ProbeSession {
     fn register(
         &mut self,
@@ -313,7 +334,11 @@ impl mio::event::Source for ProbeSession {
         token: mio::Token,
         interests: mio::Interest,
     ) -> std::io::Result<()> {
-        registry.register(&mut mio::unix::SourceFd(&mut self.ring_fd), token, interests)
+        registry.register(
+            &mut mio::unix::SourceFd(&mut self.ring_fd),
+            token,
+            interests,
+        )
     }
 
     fn reregister(
@@ -322,7 +347,11 @@ impl mio::event::Source for ProbeSession {
         token: mio::Token,
         interests: mio::Interest,
     ) -> std::io::Result<()> {
-        registry.reregister(&mut mio::unix::SourceFd(&mut self.ring_fd), token, interests)
+        registry.reregister(
+            &mut mio::unix::SourceFd(&mut self.ring_fd),
+            token,
+            interests,
+        )
     }
 
     fn deregister(&mut self, registry: &mio::Registry) -> std::io::Result<()> {
@@ -332,11 +361,9 @@ impl mio::event::Source for ProbeSession {
 
 /// Publishes the device profile's CPU-to-cluster layout to the probe.
 fn map_clusters(ebpf: &mut Ebpf, shape: &[ClusterShape], cpu_count: usize) -> Result<(), String> {
-    let mut map: Array<_, u32> = Array::try_from(
-        ebpf.map_mut("CPU_CLUSTER")
-            .ok_or("cluster map missing")?,
-    )
-    .map_err(|error| format!("open cluster map: {error}"))?;
+    let mut map: Array<_, u32> =
+        Array::try_from(ebpf.map_mut("CPU_CLUSTER").ok_or("cluster map missing")?)
+            .map_err(|error| format!("open cluster map: {error}"))?;
     for cpu in 0..(cpu_count.min(MAX_CPUS as usize)) {
         map.set(cpu as u32, UNASSIGNED_CLUSTER, 0)
             .map_err(|error| format!("write cluster map: {error}"))?;
@@ -380,11 +407,9 @@ fn set_params(ebpf: &mut Ebpf, quantum_us: u64, step_bp: u32) -> Result<(), Stri
 /// Publishes the display state to the probe gate. With the screen off the
 /// probe stops emitting demand events, so the daemon can stay blocked.
 pub fn set_screen_on(ebpf: &mut Ebpf, on: bool) -> Result<(), String> {
-    let mut map: Array<_, u32> = Array::try_from(
-        ebpf.map_mut("SCREEN_ON")
-            .ok_or("screen gate map missing")?,
-    )
-    .map_err(|error| format!("open screen gate: {error}"))?;
+    let mut map: Array<_, u32> =
+        Array::try_from(ebpf.map_mut("SCREEN_ON").ok_or("screen gate map missing")?)
+            .map_err(|error| format!("open screen gate: {error}"))?;
     map.set(0, u32::from(on), 0)
         .map_err(|error| format!("write screen gate: {error}"))
 }

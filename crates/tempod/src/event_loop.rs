@@ -44,15 +44,60 @@ const CONFIG_WATCH: Token = Token(13);
 const VERIFY: Token = Token(14);
 const CEILING_TIMER: Token = Token(15);
 const WAKE: Token = Token(100);
-/// The writer stays read-only for this long after daemon start, so no cpufreq
-/// write can ever happen during boot or the first unlock (the two historical
-/// boot-hang triggers). After the guard the first ladder state is applied.
-const STARTUP_APPLY_DELAY_US: u64 = 25_000_000;
-/// 静默期只做低频率的安全校正。事件提交本身已经维护上限；15 秒一次只会
-/// 在厂商地板抖动时反复重写 scaling_max_freq（~1 次/秒，每次 ~10 ms 系统
-/// 时间），既耗 CPU 又制造周期性卡顿。
-const CEILING_INTERVAL_US: u64 = 15_000_000;
+const SIGNAL: Token = Token(101);
+/// 低频读回校验与有限退避配套；只有实际区间偏离目标时才写入。
+const CEILING_INTERVAL_US: u64 = 1_000_000;
 const FIRST_CONNECTION: usize = 16;
+
+fn write_clean_exit_marker(run_dir: &Path) -> io::Result<()> {
+    let temporary = run_dir.join(".clean-exit.tmp");
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(b"aegis-clean-exit-v1\nwriter_restored=1\n")?;
+    file.sync_all()?;
+    std::fs::rename(temporary, run_dir.join("clean-exit"))?;
+    std::fs::File::open(run_dir)?.sync_all()
+}
+
+struct ShutdownSignals {
+    file: std::fs::File,
+    previous: libc::sigset_t,
+}
+
+impl ShutdownSignals {
+    fn new() -> io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
+        unsafe {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            let mut previous: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGTERM);
+            libc::sigaddset(&mut mask, libc::SIGINT);
+            let code = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut previous);
+            if code != 0 {
+                return Err(io::Error::from_raw_os_error(code));
+            }
+            let fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+                return Err(error);
+            }
+            Ok(Self {
+                file: std::fs::File::from_raw_fd(fd),
+                previous,
+            })
+        }
+    }
+}
+
+impl Drop for ShutdownSignals {
+    fn drop(&mut self) {
+        // 此对象最早创建、最后析构，先让 writer 完成频率恢复。
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
 
 struct Connection {
     stream: UnixStream,
@@ -69,7 +114,10 @@ pub fn run(
     log_path: &Path,
     apply: bool,
 ) -> io::Result<()> {
+    // 在创建工作线程之前屏蔽退出信号，由主循环接收并正常析构 writer。
+    let mut signals = ShutdownSignals::new()?;
     std::fs::create_dir_all(run_dir).map_err(|error| context("create run dir", error))?;
+
     std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| context("chmod run dir", error))?;
 
@@ -81,6 +129,13 @@ pub fn run(
         return Ok(());
     }
 
+    // 获取实例锁后才清除旧标记，第二实例不能破坏当前实例的回执。
+    match std::fs::remove_file(run_dir.join("clean-exit")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(context("remove stale clean exit marker", error)),
+    }
+    let mut writer_restored = false;
     let socket_path = run_dir.join("control.sock");
     if socket_path.exists() {
         std::fs::remove_file(&socket_path).map_err(|error| context("remove old socket", error))?;
@@ -92,6 +147,12 @@ pub fn run(
 
     let mut poll = Poll::new().map_err(|error| context("create poll", error))?;
     let mut events = Events::with_capacity(64);
+    use std::os::unix::io::AsRawFd;
+    poll.registry().register(
+        &mut mio::unix::SourceFd(&signals.file.as_raw_fd()),
+        SIGNAL,
+        Interest::READABLE,
+    )?;
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)
         .map_err(|error| context("register listener", error))?;
@@ -125,40 +186,36 @@ pub fn run(
     }));
 
     let mut config = config;
-    let startup_profile_path = config.daemon.profile_path.clone();
-    let startup_log_level = config.daemon.log_level;
+    let startup_config = config.clone();
     let mut controller = Controller::new(profile.clone(), config.clone());
 
-    // The writer is the only component that touches cpufreq. Without the
-    // capability the daemon stays observe-only rather than writing blind.
-    let mut writer = if apply {
-        match CpufreqWriter::discover(&profile, config.control.safety_ceiling_ratio) {
-            Ok(writer) => {
-                let backup = writer.backup_json();
-                let _ = std::fs::write(run_dir.join("cpufreq-backup.json"), backup);
-                if let Ok(mut state) = status.lock() {
-                    state.write_enabled = !writer.is_empty();
+    // 探针成功附着之前不发现、不写入 cpufreq，避免降级后遗留已写频率。
+    let mut writer = None;
+    let discover_writer = |status: &Arc<Mutex<RuntimeStatus>>| {
+        if apply {
+            match CpufreqWriter::discover(&profile) {
+                Ok(writer) => {
+                    let backup = writer.backup_json();
+                    let _ = std::fs::write(run_dir.join("cpufreq-backup.json"), backup);
+                    if let Ok(mut state) = status.lock() {
+                        state.write_enabled = !writer.is_empty();
+                    }
+                    Some(writer)
                 }
-                Some(writer)
-            }
-            Err(error) => {
-                if let Ok(mut state) = status.lock() {
-                    state.write_enabled = false;
-                    state.write_error = Some(error.clone());
+                Err(error) => {
+                    if let Ok(mut state) = status.lock() {
+                        state.write_enabled = false;
+                        state.write_error = Some(error.clone());
+                    }
+                    tracing::error!(%error, "cpufreq writer unavailable; scheduling stays off");
+                    None
                 }
-                tracing::error!(%error, "cpufreq writer unavailable; scheduling stays off");
-                None
             }
+        } else {
+            None
         }
-    } else {
-        None
     };
 
-    // v3 has no floor pin. The writer opens with a read-only guard so the
-    // module can never write cpufreq during boot or the first unlock.
-    if let Some(writer) = writer.as_mut() {
-        writer.arm_guard(Duration::from_millis(config.control.startup_guard_ms));
-    }
     let mut wake = WakePipe::new().map_err(|error| context("create wake pipe", error))?;
     poll.registry()
         .register(&mut wake, WAKE, Interest::READABLE)
@@ -183,14 +240,9 @@ pub fn run(
             None
         }
     };
-    let screen_on = screen.as_ref().map(ScreenWatcher::is_on).unwrap_or(true);
+    let mut screen_on = screen.as_ref().map(ScreenWatcher::is_on).unwrap_or(true);
     let screen_decisions = controller.on_screen(now_us(), screen_on);
     commit(&screen_decisions, &mut writer, &status);
-    // One-shot re-assert after the guard expires. A vendor writer can move the
-    // nodes in the seconds after boot; re-evaluating once makes sure the live
-    // state matches the ladder. It is a single timer, never a periodic one.
-    let mut verify_retries = 0u8;
-    verify_timer.arm(now_us() + 25_000_000);
     ceiling_timer.arm(now_us() + CEILING_INTERVAL_US);
     if let Ok(mut state) = status.lock() {
         state.screen_on = screen_on;
@@ -227,6 +279,14 @@ pub fn run(
         }
     };
 
+    if probe.is_some() {
+        writer = discover_writer(&status);
+        if let Some(writer) = writer.as_mut() {
+            writer.arm_guard(Duration::from_millis(config.control.startup_guard_ms));
+            verify_timer.arm(now_us() + config.control.startup_guard_ms.saturating_mul(1000));
+        }
+    }
+
     let mut touches: Vec<TouchWatcher> = TouchWatcher::open_all();
     for (index, watcher) in touches.iter_mut().enumerate() {
         poll.registry()
@@ -257,8 +317,12 @@ pub fn run(
         }
     };
 
-    let mut fas_stamp: u64 = 0;
-    refresh_fas_sidecar(&mut config, &mut fas_stamp);
+    let fas_path = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("fas.json");
+    let mut fas_stamp = None;
+    refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path);
 
     // Charging control: netlink power-supply uevents drive the state machine;
     // the only timer is a one-shot reservation boundary. When no switch is
@@ -267,23 +331,31 @@ pub fn run(
     let data_dir = config_path
         .parent()
         .unwrap_or_else(|| Path::new("/data/adb/tempo"));
-    let mut charge = match ChargeWatcher::open(data_dir.join("charge_plan.json")) {
-        Ok(mut watcher) => {
-            poll.registry()
-                .register(&mut watcher, CHARGE, Interest::READABLE)
-                .map_err(|error| context("register charge uevents", error))?;
-            let decision = watcher.update(&config, now_us());
-            tracing::info!(
-                node = watcher.node().as_str(),
-                reasons = decision.reasons_joined().as_str(),
-                "charge control attached"
-            );
-            publish_charge(&watcher, &status);
-            Some(watcher)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "charge control unavailable");
-            None
+    // 真机隔离调度测试显式禁用充电控制，不打开 watcher，也不触碰充电节点。
+    let charge_disabled =
+        std::env::var_os("AEGIS_NO_CHARGE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let mut charge = if charge_disabled {
+        tracing::info!("charge control explicitly disabled by AEGIS_NO_CHARGE=1");
+        None
+    } else {
+        match ChargeWatcher::open(data_dir.join("charge_plan.json")) {
+            Ok(mut watcher) => {
+                poll.registry()
+                    .register(&mut watcher, CHARGE, Interest::READABLE)
+                    .map_err(|error| context("register charge uevents", error))?;
+                let decision = watcher.update(&config, now_us());
+                tracing::info!(
+                    node = watcher.node().as_str(),
+                    reasons = decision.reasons_joined().as_str(),
+                    "charge control attached"
+                );
+                publish_charge(&watcher, &status);
+                Some(watcher)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "charge control unavailable");
+                None
+            }
         }
     };
     let mut charge_timer =
@@ -292,7 +364,10 @@ pub fn run(
         .register(&mut charge_timer, CHARGE_TIMER, Interest::READABLE)
         .map_err(|error| context("register charge timer", error))?;
     arm_charge_timer(charge.as_ref(), &charge_timer);
-    let mut last_charge_latched = charge.as_ref().map(ChargeWatcher::is_latched).unwrap_or(false);
+    let mut last_charge_latched = charge
+        .as_ref()
+        .map(ChargeWatcher::is_latched)
+        .unwrap_or(false);
 
     // Atomic config replacement (WebUI `mv`) is picked up without polling.
     let mut config_watch = match ConfigWatcher::open(data_dir) {
@@ -310,8 +385,14 @@ pub fn run(
 
     if let Ok(mut state) = status.lock() {
         state.charge_node = charge.as_ref().map(ChargeWatcher::node);
-        state.charge_stopped = charge.as_ref().map(ChargeWatcher::is_stopped).unwrap_or(false);
-        state.charge_reasons = charge.as_ref().map(ChargeWatcher::reasons).unwrap_or_default();
+        state.charge_stopped = charge
+            .as_ref()
+            .map(ChargeWatcher::is_stopped)
+            .unwrap_or(false);
+        state.charge_reasons = charge
+            .as_ref()
+            .map(ChargeWatcher::reasons)
+            .unwrap_or_default();
         state.charge_plan_allowed = charge
             .as_ref()
             .map(ChargeWatcher::plan_allowed)
@@ -352,15 +433,8 @@ pub fn run(
     // Every sample is evaluated once; this is an event gate, not a timer.
     // Resolving the foreground package spawns a dumpsys-backed fallback and is
     // far more expensive than the probe itself. Coalesce real foreground
-    // changes to at most one resolution per 2 s, and skip it entirely during
-    // the 1.5 s after an app-start edge.
+    // changes to at most one resolution per 2 s.
     let mut last_foreground_us: u64 = 0;
-    // Debounce for the app-start edge lift: one launch boost per 800 ms.
-    let mut last_launch_us: u64 = 0;
-    // Launch lift stays until this timestamp; renewed while the foreground
-    // keeps producing work, so "draw shell first, load content later" apps
-    // are not decayed during their real compute phase.
-    let mut launch_until_us: u64 = 0;
     // Last activity start consumed by the launch logic, so one launch does not
     // reopen the same window on every wake.
     let mut last_start_us: u64 = 0;
@@ -377,11 +451,27 @@ pub fn run(
 
         for event in events.iter() {
             let token = event.token();
+            if token == SIGNAL {
+                let mut buffer = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+                signals.file.read_exact(&mut buffer)?;
+                if let Some(writer) = writer.as_mut() {
+                    if !writer_restored {
+                        writer
+                            .restore()
+                            .map_err(|problem| io::Error::new(io::ErrorKind::Other, problem))?;
+                    }
+                }
+                write_clean_exit_marker(run_dir)?;
+                return Ok(());
+            }
 
             if token == LISTENER {
                 loop {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            if next_token == WAKE.0 {
+                                next_token = SIGNAL.0 + 1;
+                            }
                             let connection_token = Token(next_token);
                             next_token += 1;
                             poll.registry().register(
@@ -410,22 +500,14 @@ pub fn run(
                         if let Some(sample) = session.drain() {
                             // 探针现在按 200 ms 出样本；静态页面里这些样本的
                             // busy/foreground 几乎不变，状态快照不需要每拍重写。
-                            let idle_now = !sample.foreground_active
-                                && sample.busy.iter().all(|busy| *busy < 0.05);
                             if sample.foreground_changed
                                 && sample.ts_us.saturating_sub(last_foreground_us) >= 2_000_000
-                                // A dumpsys-backed resolution spawns a process
-                                // and binds to system_server; doing that inside
-                                // the first frames of an app start adds jank.
-                                // The launch edge already has its own lift.
-                                && sample.ts_us.saturating_sub(last_launch_us) >= 1_500_000
                             {
                                 last_foreground_us = sample.ts_us;
                                 let ids = session.foreground_ids();
                                 let previous = foreground.package().map(str::to_owned);
                                 foreground.resolve(&ids);
-                                let package_changed =
-                                    foreground.package() != previous.as_deref();
+                                let package_changed = foreground.package() != previous.as_deref();
                                 if let Ok(mut state) = status.lock() {
                                     state.foreground_package =
                                         foreground.package().map(str::to_owned);
@@ -442,15 +524,13 @@ pub fn run(
                                         None => deadline_source.disarm(),
                                     }
                                 }
-                                if refresh_fas_sidecar(&mut config, &mut fas_stamp) {
+                                if refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path) {
                                     tracing::info!("fas configuration reloaded from sidecar");
                                 }
                                 refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
                                 if let Some(collector) = fas.as_mut() {
-                                    collector.request(
-                                        foreground.package().unwrap_or(""),
-                                        sample.ts_us,
-                                    );
+                                    collector
+                                        .request(foreground.package().unwrap_or(""), sample.ts_us);
                                 }
                                 // Workload class: reading / video / IME change
                                 // the floor and cap policy, not just the load.
@@ -467,61 +547,19 @@ pub fn run(
                                     }
                                 }
                             }
-                            let was_quiet = controller.is_quiet();
-                            let mut decisions = controller.on_demand(DemandSample {
+                            let decisions = controller.on_demand(DemandSample {
                                 ts_us: sample.ts_us,
                                 cluster_busy: sample.busy.clone(),
                                 foreground_busy: sample.foreground.clone(),
                                 foreground_active: sample.foreground_active,
                             });
-                            // Application start edge: the foreground app itself
-                            // jumped from idle to real work. Lift all clusters
-                            // (prime included) for the short launch window so
-                            // the first frames are not scheduled at minimum.
-                            let fg_peak = sample
-                                .foreground
-                                .iter()
-                                .copied()
-                                .fold(0.0f32, f32::max);
-                            let launch_edge = was_quiet
-                                && sample.foreground_active
-                                && fg_peak >= 0.30
-                                && sample.ts_us.saturating_sub(last_launch_us) >= 800_000;
-                            // Renewal: inside the launch window the foreground
-                            // still shows real work (frames / active threads),
-                            // so keep the lift alive instead of trusting a single
-                            // low instantaneous sample.
-                            let launch_renew = !was_quiet
-                                && sample.ts_us < launch_until_us
-                                && sample.foreground_active
-                                && fg_peak >= 0.30
-                                && sample.ts_us.saturating_sub(last_launch_us) >= 800_000;
-                            if launch_edge || launch_renew {
-                                last_launch_us = sample.ts_us;
-                                launch_until_us = sample
-                                    .ts_us
-                                    .saturating_add(config.control.launch_lift_ms * 1_000);
-                                // 100 ms 续期会把同一组 1.00 档反复提交、反复写
-                                // cpufreq 节点；800 ms 续期既保住启动窗口，又把
-                                // 节点读取/写入频率降到原来的 1/8。
-                                decisions = controller.on_app_launch(sample.ts_us);
-                                if launch_edge {
-                                    if let Ok(mut state) = status.lock() {
-                                        state.launch_lifts += 1;
-                                    }
-                                    tracing::debug!(fg_peak, "app launch edge: launch lift");
-                                }
-                            }
+                            // 负载突增交给需求换档；倍速播放和弹幕不是应用启动。
                             let quiet = controller.is_quiet();
                             // One lock for both the sample snapshot and the
                             // smoothed usage: the WebUI only needs the newest
                             // values, and a static page must not pay for a
                             // second mutex round trip per sample.
-                            record(
-                                &status,
-                                if idle_now { None } else { Some(&sample) },
-                                Some(quiet),
-                            );
+                            record(&status, Some(&sample), Some(quiet));
                             commit(&decisions, &mut writer, &status);
                             // Thermal guard is sampled on demand events only.
                             // A quiet, cool device stretches the interval to
@@ -537,13 +575,10 @@ pub fn run(
                                 let hot = temp
                                     .map(|value| value >= config.thermal.guard_c - 3.0)
                                     .unwrap_or(false);
-                                thermal_interval_us = if hot || !quiet {
-                                    1_500_000
-                                } else {
-                                    6_000_000
-                                };
-                                let cap = temp
-                                    .map(|value| thermal_cap(value, config.thermal.guard_c));
+                                thermal_interval_us =
+                                    if hot || !quiet { 1_500_000 } else { 6_000_000 };
+                                let cap =
+                                    temp.map(|value| thermal_cap(value, config.thermal.guard_c));
                                 let decisions = controller.on_thermal_cap(sample.ts_us, cap);
                                 commit(&decisions, &mut writer, &status);
                             }
@@ -562,6 +597,9 @@ pub fn run(
             if token == SCREEN {
                 if let Some(watcher) = screen.as_mut() {
                     while let Some(on) = watcher.refresh() {
+                        screen_on = on;
+                        refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path);
+                        refresh_fas(&config, &foreground, &mut fas, &status, on);
                         if let Some(session) = probe.as_mut() {
                             if let Err(error) = session.set_screen(on) {
                                 tracing::warn!(%error, "screen gate could not be applied");
@@ -594,6 +632,8 @@ pub fn run(
             }
 
             if token == FRAME {
+                refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path);
+                refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
                 if let Some(collector) = fas.as_mut() {
                     let reports = collector.drain();
                     for report in reports {
@@ -601,8 +641,11 @@ pub fn run(
                             tracing::warn!(%problem, package = report.package.as_str(), "fas probe failed");
                             continue;
                         }
+                        // 工作线程可能跨越关屏、禁用或切包；消费时重新核对资格。
                         if !controller.is_screen_on()
-                            || report.worst_ms <= config.fas.frame_budget_ms
+                            || !config.fas.enabled
+                            || foreground.package() != Some(report.package.as_str())
+                            || !config.fas.apps.iter().any(|app| app == &report.package)
                         {
                             continue;
                         }
@@ -684,22 +727,29 @@ pub fn run(
                     .map(ConfigWatcher::poll)
                     .unwrap_or(false);
                 if changed {
+                    refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path);
+                    refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
                     match read_valid_config(config_path) {
                         Ok(Some(parsed)) if parsed != config => {
-                            let restart_required = parsed.daemon.profile_path
-                                != startup_profile_path
-                                || parsed.daemon.log_level != startup_log_level;
+                            let restart_required = ipc::requires_restart(&startup_config, &parsed);
                             config = parsed;
-                            controller = Controller::new(profile.clone(), config.clone());
-                            let decisions = controller.on_screen(now_us(), screen_on);
+                            // 主配置替换后必须再次合并侧车，即使内容未发生变化。
+                            merge_fas_sidecar(&mut config, fas_stamp.as_deref());
+                            let decisions = reload_controller(
+                                &mut controller,
+                                &profile,
+                                &config,
+                                &foreground,
+                                screen_on,
+                                &status,
+                            );
                             commit(&decisions, &mut writer, &status);
                             match controller.next_deadline(now_us()) {
                                 Some(deadline) => deadline_source.arm(deadline.at_us),
                                 None => deadline_source.disarm(),
                             }
                             if let Ok(mut state) = status.lock() {
-                                state.config_generation =
-                                    state.config_generation.saturating_add(1);
+                                state.config_generation = state.config_generation.saturating_add(1);
                                 state.restart_required = restart_required;
                             }
                             refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
@@ -708,9 +758,9 @@ pub fn run(
                         Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(
-                                %error,
-                                "configuration change rejected; previous valid config kept"
-                              );
+                              %error,
+                              "configuration change rejected; previous valid config kept"
+                            );
                         }
                     }
                     // `charge_plan.json` may have changed without the main
@@ -740,7 +790,7 @@ pub fn run(
                     if batch.downs > 0 {
                         // A touch is the natural moment to pick up WebUI edits
                         // to the FAS sidecar; no polling, no timer.
-                        if refresh_fas_sidecar(&mut config, &mut fas_stamp) {
+                        if refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path) {
                             tracing::info!("fas configuration reloaded from sidecar");
                         }
                         refresh_fas(&config, &foreground, &mut fas, &status, true);
@@ -755,22 +805,20 @@ pub fn run(
                         if let Some(collector) = fas.as_mut() {
                             collector.request(foreground.package().unwrap_or(""), at_us);
                         }
-                        // The controller owns the staged lift; the writer only
-                        // publishes the resulting ceiling. No min pinning here.
-                        let decisions = controller.on_touch(at_us);
-                        commit(&decisions, &mut writer, &status);
-                        match controller.next_deadline(at_us) {
-                            Some(deadline) => deadline_source.arm(deadline.at_us),
-                            None => deadline_source.disarm(),
-                        }
                     }
-                    if batch.ups > 0 {
-                        let decisions = controller.on_touch_up(at_us);
+                    // 保留同批抬起→重新按下的顺序，不能先合并按下再统一抬起。
+                    for edge in batch.edges {
+                        let decisions = match edge {
+                            crate::touch::TouchEdge::Up => controller.on_touch_up(at_us),
+                            crate::touch::TouchEdge::Down | crate::touch::TouchEdge::Move => {
+                                controller.on_touch(at_us)
+                            }
+                        };
                         commit(&decisions, &mut writer, &status);
-                        match controller.next_deadline(at_us) {
-                            Some(deadline) => deadline_source.arm(deadline.at_us),
-                            None => deadline_source.disarm(),
-                        }
+                    }
+                    match controller.next_deadline(at_us) {
+                        Some(deadline) => deadline_source.arm(deadline.at_us),
+                        None => deadline_source.disarm(),
                     }
                 }
                 continue;
@@ -785,14 +833,6 @@ pub fn run(
                     Some(deadline) => deadline_source.arm(deadline.at_us),
                     None => deadline_source.disarm(),
                 }
-                // A late vendor write can still park a policy on its minimum.
-                // Re-check once more; this remains a bounded one-shot, not a
-                // periodic poll.
-                let locked = writer.as_ref().map(CpufreqWriter::is_locked).unwrap_or(false);
-                if locked && verify_retries < 2 {
-                    verify_retries += 1;
-                    verify_timer.arm(now_us() + 25_000_000);
-                }
                 continue;
             }
 
@@ -803,10 +843,7 @@ pub fn run(
                 }
                 if let Ok(mut state) = status.lock() {
                     state.writes = writer.as_ref().map(CpufreqWriter::applied).unwrap_or(0);
-                    state.cap_writes = writer
-                        .as_ref()
-                        .map(CpufreqWriter::cap_writes)
-                        .unwrap_or(0);
+                    state.cap_writes = writer.as_ref().map(CpufreqWriter::cap_writes).unwrap_or(0);
                     state.floor_writes = writer
                         .as_ref()
                         .map(CpufreqWriter::floor_writes)
@@ -815,6 +852,9 @@ pub fn run(
                         .as_ref()
                         .map(CpufreqWriter::rejected_floor)
                         .unwrap_or(0);
+                    if let Some(writer) = writer.as_ref() {
+                        state.write_error = writer.last_error.clone();
+                    }
                 }
                 ceiling_timer.arm(now_us() + CEILING_INTERVAL_US);
                 continue;
@@ -890,8 +930,15 @@ pub fn run(
                                 let (text, outcome) = ipc::handle(&mut context, &line);
                                 responses.push(text);
                                 if outcome == Outcome::Reloaded {
-                                    controller = Controller::new(profile.clone(), config.clone());
-                                    let decisions = controller.on_screen(now_us(), screen_on);
+                                    merge_fas_sidecar(&mut config, fas_stamp.as_deref());
+                                    let decisions = reload_controller(
+                                        &mut controller,
+                                        &profile,
+                                        &config,
+                                        &foreground,
+                                        screen_on,
+                                        &status,
+                                    );
                                     commit(&decisions, &mut writer, &status);
                                     match controller.next_deadline(now_us()) {
                                         Some(deadline) => deadline_source.arm(deadline.at_us),
@@ -901,16 +948,9 @@ pub fn run(
                                         state.config_generation =
                                             state.config_generation.saturating_add(1);
                                         state.restart_required =
-                                            config.daemon.profile_path != startup_profile_path
-                                                || config.daemon.log_level != startup_log_level;
+                                            ipc::requires_restart(&startup_config, &config);
                                     }
-                                    refresh_fas(
-                                        &config,
-                                        &foreground,
-                                        &mut fas,
-                                        &status,
-                                        screen_on,
-                                    );
+                                    refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
                                     if let Some(watcher) = charge.as_mut() {
                                         let decision = watcher.update(&config, now_us());
                                         tracing::info!(
@@ -921,6 +961,13 @@ pub fn run(
                                         publish_charge(watcher, &status);
                                     }
                                     arm_charge_timer(charge.as_ref(), &charge_timer);
+                                } else if outcome == Outcome::Restored {
+                                    writer_restored = true;
+                                    if let Ok(mut state) = status.lock() {
+                                        state.write_enabled = false;
+                                        state.guard_active = false;
+                                        state.write_error = None;
+                                    }
                                 }
                             }
                         }
@@ -949,27 +996,24 @@ pub fn run(
     }
 }
 
-/// The WebUI owns FAS selection in `/data/adb/tempo/fas.json`. It is sampled
-/// only when a foreground, touch or screen event arrives, so a UI change costs
-/// one metadata read and never introduces a timer.
-fn refresh_fas_sidecar(config: &mut Config, stamp: &mut u64) -> bool {
-    const PATH: &str = "/data/adb/tempo/fas.json";
-    let Ok(metadata) = std::fs::metadata(PATH) else {
+// 侧车很小，事件到来时直接比较内容，不依赖文件系统时间戳精度。
+fn refresh_fas_sidecar(config: &mut Config, stamp: &mut Option<String>, path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    if modified == *stamp {
+    if stamp.as_deref() == Some(text.as_str()) {
         return false;
     }
-    let Ok(text) = std::fs::read_to_string(PATH) else {
+    if !merge_fas_sidecar(config, Some(&text)) {
         return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+    }
+    *stamp = Some(text);
+    true
+}
+
+fn merge_fas_sidecar(config: &mut Config, text: Option<&str>) -> bool {
+    let Some(text) = text else { return false };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return false;
     };
     let enabled = value
@@ -989,7 +1033,6 @@ fn refresh_fas_sidecar(config: &mut Config, stamp: &mut u64) -> bool {
         .unwrap_or_default();
     config.fas.enabled = enabled;
     config.fas.apps = apps;
-    *stamp = modified;
     true
 }
 
@@ -1025,11 +1068,38 @@ pub(crate) fn scene_of(package: Option<&str>, config: &Config) -> Scene {
         Scene::Ime
     } else if config.scene.video_packages.iter().any(|app| app == package) {
         Scene::Video
-    } else if config.scene.reading_packages.iter().any(|app| app == package) {
+    } else if config
+        .scene
+        .reading_packages
+        .iter()
+        .any(|app| app == package)
+    {
         Scene::Reading
     } else {
         Scene::Default
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reload_controller(
+    controller: &mut Controller,
+    profile: &DeviceProfile,
+    config: &Config,
+    foreground: &ForegroundResolver,
+    screen_on: bool,
+    status: &Arc<Mutex<RuntimeStatus>>,
+) -> Vec<Decision> {
+    *controller = Controller::new(profile.clone(), config.clone());
+    let at_us = now_us();
+    let scene = scene_of(foreground.package(), config);
+    // 先恢复场景再恢复屏幕，只提交最终状态，避免短暂写入默认场景上限。
+    controller.on_scene(at_us, scene);
+    let decisions = controller.on_screen(at_us, screen_on);
+    if let Ok(mut state) = status.lock() {
+        state.scene = scene.as_str().to_owned();
+        state.quiet = controller.is_quiet();
+    }
+    decisions
 }
 
 fn commit(
@@ -1037,27 +1107,24 @@ fn commit(
     writer: &mut Option<CpufreqWriter>,
     status: &Arc<Mutex<RuntimeStatus>>,
 ) {
-    let mut error = None;
-    // Steady state: every decision still carries the same target/cap, so a
-    // write pass would only re-read the same nodes. Apply when a cluster moved,
-    // when the read-only startup guard just expired, or on the slow reconcile.
-    let initial = writer
-        .as_ref()
-        .is_some_and(CpufreqWriter::needs_initial_apply);
-    if initial || decisions.iter().any(|decision| decision.changed) {
-        if let Some(writer) = writer.as_mut() {
-            if let Err(problem) = writer.apply(decisions) {
-                error = Some(problem);
-            }
+    let bounds_changed = status.lock().ok().is_some_and(|state| {
+        state.decisions.len() != decisions.len()
+            || state.decisions.iter().zip(decisions).any(|(old, new)| {
+                old.cluster != new.cluster
+                    || old.ceiling_khz != new.ceiling_khz
+                    || old.cap_khz != new.cap_khz
+                    || old.idle != new.idle
+            })
+    });
+    if let Some(writer) = writer.as_mut() {
+        if bounds_changed || writer.needs_initial_apply() {
+            let _ = writer.apply(decisions);
         }
     }
     if let Ok(mut state) = status.lock() {
         state.decisions = decisions.to_vec();
         state.writes = writer.as_ref().map(CpufreqWriter::applied).unwrap_or(0);
-        state.cap_writes = writer
-            .as_ref()
-            .map(CpufreqWriter::cap_writes)
-            .unwrap_or(0);
+        state.cap_writes = writer.as_ref().map(CpufreqWriter::cap_writes).unwrap_or(0);
         state.floor_writes = writer
             .as_ref()
             .map(CpufreqWriter::floor_writes)
@@ -1067,7 +1134,9 @@ fn commit(
             .map(CpufreqWriter::rejected_floor)
             .unwrap_or(0);
         state.guard_active = writer.as_ref().is_some_and(CpufreqWriter::guard_active);
-        state.write_error = error;
+        if let Some(writer) = writer.as_ref() {
+            state.write_error = writer.last_error.clone();
+        }
     }
 }
 
@@ -1155,25 +1224,30 @@ fn publish_charge(watcher: &ChargeWatcher, status: &Arc<Mutex<RuntimeStatus>>) {
     }
 }
 
-/// Arms a single one-shot timer at the next reservation boundary. No timer is
-/// pending when the plan is disabled, so an idle device has no scheduled wakeup.
-/// 100% 涓流阶段例外：按 3 秒一拍读取真实电流/满充状态，凑满 9 秒证据后锁存；
-/// 锁存之后证据已经足够，继续 3 秒一拍只会白读电流并刷日志，改为 30 秒复查。
+/// 写入失败短时重试；预约复核本地时间，避免校时后仍等待旧的单调时钟期限。
 fn arm_charge_timer(watcher: Option<&ChargeWatcher>, timer: &OneShotTimer) {
-    if watcher.is_some_and(ChargeWatcher::is_trickling) {
-        let interval = if watcher.is_some_and(ChargeWatcher::is_latched) {
-            30_000_000
-        } else {
-            3_000_000
-        };
-        timer.arm(now_us() + interval);
+    let Some(watcher) = watcher else {
+        timer.disarm();
         return;
+    };
+    let mut delay = watcher
+        .next_boundary_secs()
+        .map(|seconds| seconds.max(1) as u64);
+    let review = if watcher.needs_retry() {
+        Some(3)
+    } else if watcher.is_trickling() {
+        Some(3)
+    } else if watcher.plan_enabled() || watcher.is_stopped() {
+        Some(30)
+    } else {
+        None
+    };
+    if let Some(review) = review {
+        delay = Some(delay.map_or(review, |boundary| boundary.min(review)));
     }
-    match watcher.and_then(ChargeWatcher::next_boundary_secs) {
-        Some(seconds) if seconds > 0 => {
-            timer.arm(now_us() + seconds as u64 * 1_000_000);
-        }
-        _ => timer.disarm(),
+    match delay {
+        Some(seconds) => timer.arm(now_us() + seconds * 1_000_000),
+        None => timer.disarm(),
     }
 }
 
@@ -1245,15 +1319,14 @@ impl ConfigWatcher {
             let mut offset = 0usize;
             let header = std::mem::size_of::<libc::inotify_event>();
             while offset + header <= count as usize {
-                let event = unsafe {
-                    &*(buffer.as_ptr().add(offset) as *const libc::inotify_event)
-                };
+                let event =
+                    unsafe { &*(buffer.as_ptr().add(offset) as *const libc::inotify_event) };
                 let name_start = offset + header;
                 let name_end = name_start + event.len as usize;
                 if name_end <= count as usize && event.len > 0 {
                     let name = String::from_utf8_lossy(&buffer[name_start..name_end]);
                     let name = name.trim_end_matches('\0');
-                    if name == "config.toml" || name == "charge_plan.json" {
+                    if name == "config.toml" || name == "charge_plan.json" || name == "fas.json" {
                         changed = true;
                     }
                 }
@@ -1386,4 +1459,101 @@ impl mio::event::Source for OneShotTimer {
 /// exactly which operation was refused.
 fn context(step: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{step}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_detects_back_to_back_changes_and_survives_reload() {
+        let path = std::env::temp_dir().join(format!("aegis-fas-{}.json", std::process::id()));
+        let mut config = Config::default();
+        assert!(!config.fas.enabled);
+        let mut stamp = None;
+        std::fs::write(&path, r#"{"enabled":true,"packages":["first"]}"#).unwrap();
+        assert!(refresh_fas_sidecar(&mut config, &mut stamp, &path));
+        std::fs::write(&path, r#"{"enabled":true,"packages":["other"]}"#).unwrap();
+        assert!(refresh_fas_sidecar(&mut config, &mut stamp, &path));
+        assert_eq!(config.fas.apps, vec!["other"]);
+        assert!(!refresh_fas_sidecar(&mut config, &mut stamp, &path));
+        config = Config::default();
+        assert!(merge_fas_sidecar(&mut config, stamp.as_deref()));
+        assert!(config.fas.enabled);
+        assert_eq!(config.fas.apps, vec!["other"]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn marker_is_complete_and_atomically_replaceable() {
+        let dir = std::env::temp_dir().join(format!("aegis-exit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_clean_exit_marker(&dir).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("clean-exit")).unwrap(),
+            b"aegis-clean-exit-v1\nwriter_restored=1\n"
+        );
+        assert!(!dir.join(".clean-exit.tmp").exists());
+        write_clean_exit_marker(&dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reload_preserves_current_screen_state() {
+        let profile: DeviceProfile = serde_json::from_value(serde_json::json!({
+            "schema": 1, "platform": "test", "sdk": 34,
+            "cluster": [{"cpus": [0], "role": "efficiency", "min_khz": 300,
+                "max_khz": 1200, "capacity": 256, "freq_khz": [300, 600, 1200]}]
+        }))
+        .unwrap();
+        let config = Config::default();
+        let mut controller = Controller::new(profile.clone(), config.clone());
+        let foreground = ForegroundResolver::new();
+        let status = Arc::new(Mutex::new(RuntimeStatus::default()));
+        reload_controller(
+            &mut controller,
+            &profile,
+            &config,
+            &foreground,
+            false,
+            &status,
+        );
+        assert!(!controller.is_screen_on());
+        reload_controller(
+            &mut controller,
+            &profile,
+            &config,
+            &foreground,
+            true,
+            &status,
+        );
+        assert!(controller.is_screen_on());
+    }
+
+    #[test]
+    fn shutdown_signal_wakes_poll() {
+        use std::os::unix::io::AsRawFd;
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            let mut source = ShutdownSignals::new().unwrap();
+            let mut poll = Poll::new().unwrap();
+            poll.registry()
+                .register(
+                    &mut mio::unix::SourceFd(&source.file.as_raw_fd()),
+                    SIGNAL,
+                    Interest::READABLE,
+                )
+                .unwrap();
+            // 仅投递给当前测试线程，避免影响并行测试和测试进程。
+            assert_eq!(
+                unsafe { libc::pthread_kill(libc::pthread_self(), signal) },
+                0
+            );
+            let mut events = Events::with_capacity(4);
+            poll.poll(&mut events, Some(Duration::from_secs(1)))
+                .unwrap();
+            assert!(events.iter().any(|event| event.token() == SIGNAL));
+            let mut data = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+            source.file.read_exact(&mut data).unwrap();
+        }
+    }
 }

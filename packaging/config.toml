@@ -1,5 +1,5 @@
-# Aegis v3 默认配置（自有字段，单一自适应模式）
-# 簇数量、频率表、capacity 全部在开机时从 sysfs 推导，不针对任何 SoC 写死。
+# Aegis v3.4.0 默认配置，schema=1，单一自适应模式。
+# 开机从 sysfs 推导拓扑；capacity 缺失时估算，频表缺失时仅保留端点。
 schema = 1
 
 [daemon]
@@ -7,18 +7,23 @@ log_level = "info"
 profile_path = "/data/adb/tempo/profile/device.toml"
 
 [events]
-# 50 ms 采样在静态页面里只是把守护唤醒 20 次/秒做一遍无事可做的决策；
-# 250 ms（4 次/秒）实测把静置空唤醒带来的 CPU 压到 0.4% 单核以内（目标 ≤0.4%），
-# 负载变化仍在一个刷新周期级别被发现，交互路径另有触摸/启动抬频兜底。
+# BPF 需求观察窗口为 250 ms；并非整个守护的轮询周期。
 runtime_quantum_us = 250000
 demand_step = 0.10
 screen_path = ""
+# frame_stride 保留于 schema，当前 gfxinfo FAS 不以它抽帧。
 frame_stride = 2
 quiet_decay_ms = 60
 
 [control]
+# 以下旧兼容字段仍解析、校验，但不参与当前分档控制：
+# quiet_ratio/quiet_cap、floor_exit_ms/fg_fast_ms/floor_residence_ms、
+# drop_ratio/drop_factor、touch_lift_level/touch_ramp_ms/touch_ramp_stages/touch_decay_ms、
+# launch_lift_level、prime_lift_level/prime_load_cap、ceiling_headroom、
+# reserve_ratio/step_hysteresis/parked_headroom，以及 control.role_cap。
 quiet_ratio = 0.50
 quiet_cap = 0.28
+# 静默按瞬时最大簇需求进入/退出；进入还需满足 settle 和交互窗口结束。
 floor_enter_ratio = 0.05
 floor_exit_ratio = 0.12
 floor_settle_ms = 60
@@ -26,70 +31,51 @@ floor_exit_ms = 60
 fg_fast_ms = 100
 floor_residence_ms = 0
 drop_ratio = 0.08
-# 回落时每一步最多减半（drop_factor=2），并至少间隔 touch_decay_ms，
-# 避免从高负载一步砸回最低频。
 drop_factor = 2.0
+# 同一接触会话固定抬频目标；触摸事件刷新此窗口，松手结束。
 touch_lift_ms = 150
-# 触摸抬频的目标档位：只抬到中等（约 0.77 / 1.36 / 1.63 GHz 起步），
-# 长按照压倍速、拖动进度条不会一按就冲高档；持续产帧/超预算再逐级上。
 touch_lift_level = 0.30
-# 三级抬频，60ms 内完成；每级 20ms，人眼不可感知，也不会一步顶到最高频。
 touch_ramp_ms = 60
 touch_ramp_stages = 3
-# 抬频结束后每 45ms 回落一级。
 touch_decay_ms = 45
-# 应用启动边沿（前台进程从空闲突然起负载）单独给 1000ms 全簇高地板，
-# 覆盖冷启动首帧、dex/IO；窗口内前台持续有帧/线程活跃会自动续期，
-# 确认空闲后才按 touch_decay_ms 正常回落。
+# 启动、前台切换和亮屏的启动窗口；不由单纯负载升高触发。
 launch_lift_ms = 1000
 launch_lift_level = 1.00
-# 事件抬频时超大核最多到中等档；持续负载由 load curve 负责。
 prime_lift_level = 0.45
-# 即使持续滑动，超大核也不常驻顶档；只有真正重载帧压力才逐级逼近上限。
 prime_load_cap = 0.78
-# 软上限：scaling_max_freq 只保留“地板 + 该比例 × 硬件跨度”的空间。
-# 静态/输入法界面下厂商 boost 或触摸提示无法再把簇拉到顶档；
-# 真实帧压力会先抬地板，软上限随之抬高。
 ceiling_headroom = 0.18
+# UI 帧耗时超过预算加 slack 时提供短时救援。
 frame_slack_ms = 3.0
 frame_burst_ms = 150
 frame_burst_level = 0.70
 reserve_ratio = 1.05
 step_hysteresis = 0.03
-# 空闲时保留的可用余量：ceiling 不会低于 floor + 该比例 × (硬件上限 - floor)。
-# 0.08 表示三簇静止时仍留有约 8% 的可调度空间，min 只是允许下探的目标，
-# 永远不会把三簇同时锁死在最低频。
 parked_headroom = 0.08
-flat_ceiling_bias = 0.02
-task_fit_margin = 0.22
-max_single_burst_us = 17000
-log_cooldown_us = 70000
-pose_swap_grace_us = 10000
 
-# ---- v3 分级档位 -------------------------------------------------------------
-# 每簇档位表长度（6~10）；档位从 scaling_available_frequencies 等距抽取。
+# 分档上限 6~10；按频表索引等距抽取，原始档位不足则使用现有档位。
 tier_table_max = 8
-# 负载升档需要持续多久确认；降档每 45ms 只退一级，绝不一步到底/到顶。
+# 负载升档确认时间、常规降档间隔、单次升档步数；启动可立即到目标。
 up_confirm_ms = 120
 down_step_ms = 45
 max_up_step = 2
-# 触摸只加一档，超大核不参与触摸抬频（输入法/长按/倍速不会冲顶）。
+# 触摸相对会话开始时的档位加档，prime 不参与触摸加档。
 touch_lift_tiers = 1
-# 启动/切换应用抬到档位表的 62%，不是顶档；期间上限放开到硬件最高。
+# 启动目标按档位比例计算；启动 cap 也分档受限，不保证放开至硬件最高。
 launch_tier_ratio = 0.62
+# prime 普通需求与 IME 场景的目标档位比例，不是独立硬件 cap。
 prime_cap_ratio = 0.70
 ime_cap_ratio = 0.45
-# 任何时刻至少保留 35% 的硬件频率跨度作为上限，避免应用启动撞顶。
+# cap 基线按档位索引计算；稀疏静默频表和温控可能使其更低。
 safety_ceiling_ratio = 0.35
 lookahead_tiers = 3
-# 守护启动后 20 秒内完全只读；开机阶段零写入。
+# 守护启动后的 cpufreq 只读保护窗口；不表示关闭充电控制。
 startup_guard_ms = 20000
 pressure_hold_ms = 1000
 demand_smooth_ms = 200
 
 [scene]
-# 场景地板（档位索引）。视频默认从最低档起步，出现超预算帧时自动 +1 档并
-# 保持整个会话；这就是"逐档下降直到零丢帧"的在线自动标定。
+# 场景地板为档位索引。阅读/视频连续至少 3 次有效超预算反馈才提高自适应地板；
+# 健康反馈重置连续计数，场景改变重置自适应地板；不保证解码或显示零掉帧。
 reading_floor_tier = 0
 video_floor_tier = 0
 default_floor_tier = 0
@@ -97,10 +83,10 @@ reading_packages = ["com.dragon.read", "com.tencent.weread", "com.qidian.QDReade
 video_packages = ["tv.danmaku.bili", "com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.lite", "com.phoenix.read", "com.qiyi.video", "com.tencent.qqlive", "com.youku.phone", "com.hunantv.imgo.activity", "com.google.android.youtube"]
 ime_packages = ["com.sohu.inputmethod.sogou", "com.baidu.input", "com.iflytek.inputmethod", "com.google.android.inputmethod.latin", "com.miui.inputmethod", "com.tencent.wetype"]
 
+# 旧兼容字段：当前分档控制不读取该组比例。
 [control.role_cap]
 efficiency = 1.00
 balanced = 1.00
-# 默认不限制超大核：只有显式改小该值才会收窄 ceiling。
 prime = 1.00
 
 [charge]
@@ -108,24 +94,25 @@ stop_at_percent = 80
 resume_at_percent = 70
 temp_stop_c = 45.0
 temp_resume_c = 40.0
-# 仅 100% 上限使用“插电会话内保持”；80/90 使用回差自动复充。
-# 守护按 stop_at_percent == 100 推导，此字段仅用于兼容旧配置。
+# 兼容字段；实际仅由 stop_at_percent == 100 推导插电会话锁存。
 latch_per_plug = false
-# 100% 涓流满充判定：电流（绝对值）连续低于 full_current_ma 达到
-# full_hold_seconds 秒，或驱动直接上报 status=Full，才停充并锁存。
+# 100% 涓流阶段需连续小电流满 full_hold_seconds，或驱动上报 Full，才锁存。
 full_current_ma = 100
 full_hold_seconds = 9
-# 可选电压阈值（mV）；留空注释即不参与判定。
+# 可选电压门槛（mV），用于小电流判定；默认不启用。
 # full_voltage_mv = 4300
 
 [thermal]
+# 基于电池温度的附加 CPU 档位限制，不关闭厂商 thermal。
 guard_c = 45.0
+# profile 保留于 schema，当前未实现按此名称选择温控曲线。
 profile = "auto"
 
 [ui]
 language = "zh"
 
 [fas]
+# 总开关开启且前台包被选中才采样；空列表不代表所有应用。
 enabled = false
 apps = []
 frame_budget_ms = 16.0

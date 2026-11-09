@@ -52,6 +52,8 @@ pub struct ChargeSample {
     /// Battery temperature in Celsius. `None` means "unreadable".
     pub temp_c: Option<f32>,
     pub plugged: bool,
+    /// The switch is stopped or its charging state has not been confirmed.
+    pub charging_suspended: bool,
     /// Battery current in mA (magnitude is used). Positive or negative depends
     /// on the driver sign convention, so only `abs()` participates.
     pub current_ma: Option<i32>,
@@ -303,9 +305,8 @@ impl ChargeGovernor {
         let full_hold_seconds = Some(cfg.full_hold_seconds.max(1));
         let full_voltage_mv = cfg.full_voltage_mv;
 
-        let first_run = self.stop_at.is_none()
-            && self.temp_stop.is_none()
-            && self.last_percent.is_none();
+        let first_run =
+            self.stop_at.is_none() && self.temp_stop.is_none() && self.last_percent.is_none();
         let config_changed = !first_run
             && (self.stop_at != stop_at
                 || self.resume_at != resume_at
@@ -389,11 +390,13 @@ impl ChargeGovernor {
                     let low_current = sample
                         .current_ma
                         .is_some_and(|value| value.unsigned_abs() <= cfg.full_current_ma);
-                    let high_voltage = cfg
+                    let voltage_ok = cfg
                         .full_voltage_mv
-                        .zip(sample.voltage_mv)
-                        .is_some_and(|(limit, value)| value >= limit);
-                    let blocked_by_other = self.temp_blocked || plan_blocked;
+                        .is_none_or(|limit| sample.voltage_mv.is_some_and(|value| value >= limit));
+                    let blocked_by_other = self.temp_blocked
+                        || plan_blocked
+                        || self.stopped
+                        || sample.charging_suspended;
                     if blocked_by_other {
                         // 被温度/预约强制停充时电流会自然下降，不能当成满充证据。
                         self.trickle_since_us = None;
@@ -401,7 +404,7 @@ impl ChargeGovernor {
                         self.upper_latched = true;
                         self.armed = false;
                         self.trickle_since_us = None;
-                    } else if low_current || high_voltage {
+                    } else if low_current && voltage_ok {
                         let since = *self.trickle_since_us.get_or_insert(sample.ts_us);
                         let hold = cfg.full_hold_seconds.max(1) as u64 * 1_000_000;
                         if sample.ts_us.saturating_sub(since) >= hold {
@@ -414,6 +417,8 @@ impl ChargeGovernor {
                         self.trickle_since_us = None;
                     }
                 }
+            } else {
+                self.trickle_since_us = None;
             }
         } else {
             self.upper_latched = false;
@@ -430,7 +435,9 @@ impl ChargeGovernor {
 
         self.trickle = latch
             && !self.upper_latched
-            && sample.percent.is_some_and(|percent| percent >= cfg.stop_at_percent)
+            && sample
+                .percent
+                .is_some_and(|percent| percent >= cfg.stop_at_percent)
             && !self.temp_blocked
             && !plan_blocked;
 
@@ -515,13 +522,19 @@ mod tests {
             percent: Some(percent),
             temp_c: Some(33.0),
             plugged: true,
+            charging_suspended: false,
             current_ma,
             voltage_mv: Some(4200),
             status_full: false,
         }
     }
 
-    fn step(gov: &mut ChargeGovernor, percent: u8, temp: f32, cfg: &ChargeConfig) -> ChargeDecision {
+    fn step(
+        gov: &mut ChargeGovernor,
+        percent: u8,
+        temp: f32,
+        cfg: &ChargeConfig,
+    ) -> ChargeDecision {
         gov.update(
             &ChargeSample {
                 ts_us: 0,
@@ -543,7 +556,10 @@ mod tests {
         assert_eq!(step(&mut gov, 80, 33.0, &config).action, ChargeAction::Stop);
         assert_eq!(step(&mut gov, 75, 33.0, &config).action, ChargeAction::Hold);
         assert_eq!(step(&mut gov, 71, 33.0, &config).action, ChargeAction::Hold);
-        assert_eq!(step(&mut gov, 70, 33.0, &config).action, ChargeAction::Resume);
+        assert_eq!(
+            step(&mut gov, 70, 33.0, &config).action,
+            ChargeAction::Resume
+        );
         assert_eq!(step(&mut gov, 69, 33.0, &config).action, ChargeAction::None);
     }
 
@@ -563,13 +579,18 @@ mod tests {
     fn trickle_current_holds_nine_seconds_then_latches() {
         let config = cfg(100, 90);
         let mut gov = ChargeGovernor::new();
-        assert!(gov.update(&sample(0, 100, Some(-90)), &config, None).trickle);
+        assert!(
+            gov.update(&sample(0, 100, Some(-90)), &config, None)
+                .trickle
+        );
         assert_eq!(
-            gov.update(&sample(3_000_000, 100, Some(-80)), &config, None).action,
+            gov.update(&sample(3_000_000, 100, Some(-80)), &config, None)
+                .action,
             ChargeAction::None
         );
         assert_eq!(
-            gov.update(&sample(8_900_000, 100, Some(-70)), &config, None).action,
+            gov.update(&sample(8_900_000, 100, Some(-70)), &config, None)
+                .action,
             ChargeAction::None
         );
         let decision = gov.update(&sample(9_100_000, 100, Some(-60)), &config, None);
@@ -578,7 +599,8 @@ mod tests {
         assert!(gov.is_latched());
         // Latched: further samples hold the stop instead of re-writing.
         assert_eq!(
-            gov.update(&sample(12_000_000, 100, Some(-40)), &config, None).action,
+            gov.update(&sample(12_000_000, 100, Some(-40)), &config, None)
+                .action,
             ChargeAction::Hold
         );
     }
@@ -592,20 +614,24 @@ mod tests {
             ChargeAction::None
         );
         assert_eq!(
-            gov.update(&sample(3_000_000, 100, Some(-300)), &config, None).action,
+            gov.update(&sample(3_000_000, 100, Some(-300)), &config, None)
+                .action,
             ChargeAction::None
         );
         assert_eq!(
-            gov.update(&sample(4_000_000, 100, Some(-90)), &config, None).action,
+            gov.update(&sample(4_000_000, 100, Some(-90)), &config, None)
+                .action,
             ChargeAction::None
         );
         // Only 8.5 s since the last restart: not full yet.
         assert_eq!(
-            gov.update(&sample(12_500_000, 100, Some(-90)), &config, None).action,
+            gov.update(&sample(12_500_000, 100, Some(-90)), &config, None)
+                .action,
             ChargeAction::None
         );
         assert_eq!(
-            gov.update(&sample(13_200_000, 100, Some(-90)), &config, None).action,
+            gov.update(&sample(13_200_000, 100, Some(-90)), &config, None)
+                .action,
             ChargeAction::Stop
         );
     }
@@ -630,7 +656,8 @@ mod tests {
         assert_eq!(decision.action, ChargeAction::None);
         assert!(decision.trickle);
         assert_eq!(
-            gov.update(&sample(12_000_000, 100, Some(-200)), &config, None).action,
+            gov.update(&sample(12_000_000, 100, Some(-200)), &config, None)
+                .action,
             ChargeAction::None
         );
     }
@@ -657,11 +684,20 @@ mod tests {
         let config100 = cfg(100, 90);
         let mut full = sample(0, 100, None);
         full.status_full = true;
-        assert_eq!(gov.update(&full, &config100, None).action, ChargeAction::Stop);
+        assert_eq!(
+            gov.update(&full, &config100, None).action,
+            ChargeAction::Stop
+        );
         let config80 = cfg(80, 70);
         // Still above the new 80% cap: the stop is kept (Hold, no rewrite).
-        assert_eq!(step(&mut gov, 100, 33.0, &config80).action, ChargeAction::Hold);
-        assert_eq!(step(&mut gov, 70, 33.0, &config80).action, ChargeAction::Resume);
+        assert_eq!(
+            step(&mut gov, 100, 33.0, &config80).action,
+            ChargeAction::Hold
+        );
+        assert_eq!(
+            step(&mut gov, 70, 33.0, &config80).action,
+            ChargeAction::Resume
+        );
     }
 
     #[test]
@@ -686,34 +722,106 @@ mod tests {
         assert_eq!(decision.action, ChargeAction::Resume);
         assert!(decision.trickle);
         assert_eq!(
-            gov.update(&sample(9_000_000, 100, Some(-90)), &config, None).action,
+            gov.update(&sample(9_000_000, 100, Some(-90)), &config, None)
+                .action,
             ChargeAction::None
         );
         assert_eq!(
-            gov.update(&sample(15_200_000, 100, Some(-90)), &config, None).action,
+            gov.update(&sample(15_200_000, 100, Some(-90)), &config, None)
+                .action,
+            ChargeAction::None
+        );
+        assert_eq!(
+            gov.update(&sample(18_000_000, 100, Some(-90)), &config, None)
+                .action,
             ChargeAction::Stop
         );
     }
 
     #[test]
-    fn voltage_criterion_when_configured() {
+    fn voltage_is_a_gate_not_standalone_full_evidence() {
         let mut config = cfg(100, 90);
         config.full_voltage_mv = Some(4300);
         let mut gov = ChargeGovernor::new();
         assert_eq!(
-            gov.update(&sample(0, 100, Some(-500)), &config, None).action,
+            gov.update(&sample(0, 100, Some(-500)), &config, None)
+                .action,
             ChargeAction::None
         );
         let mut high = sample(4_000_000, 100, Some(-500));
         high.voltage_mv = Some(4350);
-        assert_eq!(
-            gov.update(&high, &config, None).action,
-            ChargeAction::None
-        );
+        assert_eq!(gov.update(&high, &config, None).action, ChargeAction::None);
         let mut high_late = sample(13_100_000, 100, Some(-500));
         high_late.voltage_mv = Some(4350);
         assert_eq!(
             gov.update(&high_late, &config, None).action,
+            ChargeAction::None
+        );
+        high_late.current_ma = Some(80);
+        assert_eq!(
+            gov.update(&high_late, &config, None).action,
+            ChargeAction::None
+        );
+        high_late.ts_us += 9_000_000;
+        assert_eq!(
+            gov.update(&high_late, &config, None).action,
+            ChargeAction::Stop
+        );
+    }
+
+    #[test]
+    fn missing_samples_and_suspended_zero_current_reset_evidence() {
+        let config = cfg(100, 90);
+        for missing_percent in [false, true] {
+            let mut gov = ChargeGovernor::new();
+            gov.update(&sample(0, 100, Some(80)), &config, None);
+            let mut missing = sample(5_000_000, 100, None);
+            if missing_percent {
+                missing.percent = None;
+            }
+            gov.update(&missing, &config, None);
+            assert!(!gov.is_latched());
+            assert_eq!(
+                gov.update(&sample(10_000_000, 100, Some(80)), &config, None)
+                    .action,
+                ChargeAction::None
+            );
+            assert_eq!(
+                gov.update(&sample(19_000_000, 100, Some(80)), &config, None)
+                    .action,
+                ChargeAction::Stop
+            );
+        }
+        let mut gov = ChargeGovernor::new();
+        let mut suspended = sample(0, 100, Some(0));
+        suspended.charging_suspended = true;
+        gov.update(&suspended, &config, None);
+        suspended.ts_us = 20_000_000;
+        assert!(gov.update(&suspended, &config, None).allow_charge);
+        assert!(!gov.is_latched());
+    }
+
+    #[test]
+    fn plan_zero_current_cannot_latch_or_count_resume_sample() {
+        let config = cfg(100, 90);
+        let mut gov = ChargeGovernor::new();
+        gov.update(&sample(0, 100, Some(80)), &config, Some(true));
+        gov.update(&sample(4_000_000, 100, Some(0)), &config, Some(false));
+        gov.update(&sample(20_000_000, 100, Some(0)), &config, Some(false));
+        assert!(!gov.is_latched());
+        assert_eq!(
+            gov.update(&sample(30_000_000, 100, Some(0)), &config, Some(true))
+                .action,
+            ChargeAction::Resume
+        );
+        assert_eq!(
+            gov.update(&sample(40_000_000, 100, Some(80)), &config, Some(true))
+                .action,
+            ChargeAction::None
+        );
+        assert_eq!(
+            gov.update(&sample(49_000_000, 100, Some(80)), &config, Some(true))
+                .action,
             ChargeAction::Stop
         );
     }

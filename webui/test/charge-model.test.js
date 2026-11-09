@@ -204,6 +204,7 @@ simulate('预约 vs 100% 涓流锁存', [
   { label: '时段外拔出', input: full({ now: new Date(2026, 10, 3, 12, 0), percent: 100, plugged: false, plan: planOf() }), expect: { allow: true, action: 'none', primary: null } },
   { label: '时段外重新插电（100%）', input: full({ now: new Date(2026, 10, 3, 12, 0), percent: 100, currentMa: 1200, plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'plan_window' } },
   { label: '等到 23:30 进入时段', input: trickle({ now: new Date(2026, 10, 3, 23, 30), plan: planOf() }), expect: { allow: true, action: 'resume', primary: null, phase: 'trickle' } },
+  { label: '恢复后首个充电采样', input: trickle({ now: new Date(2026, 10, 3, 23, 30, 1), plan: planOf() }), expect: { allow: true, action: 'none', primary: null } },
   { label: '时段内涓流满 9s', input: trickle({ now: new Date(2026, 10, 3, 23, 30, 10), plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } }
 ]);
 
@@ -294,7 +295,8 @@ simulate('涓流中预约时段进出', [
   { label: '周二 07:00 退出时段', input: trickle({ now: new Date(2026, 10, 3, 7, 0, 0), plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'plan_window' } },
   { label: '时段外保持', input: trickle({ now: new Date(2026, 10, 3, 12, 0, 0), plan: planOf() }), expect: { allow: false, action: 'hold', primary: 'plan_window' } },
   { label: '周二 23:00 重新进入时段', input: trickle({ now: new Date(2026, 10, 3, 23, 0, 0), plan: planOf() }), expect: { allow: true, action: 'resume', primary: null, phase: 'trickle' } },
-  { label: '进入后涓流满 9s', input: trickle({ now: new Date(2026, 10, 3, 23, 0, 9), plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } }
+  { label: '进入后首个充电采样', input: trickle({ now: new Date(2026, 10, 3, 23, 0, 1), plan: planOf() }), expect: { allow: true, action: 'none', primary: null } },
+  { label: '进入后涓流满 9s', input: trickle({ now: new Date(2026, 10, 3, 23, 0, 10), plan: planOf() }), expect: { allow: false, action: 'stop', primary: 'full_latch', phase: 'stopped' } }
 ]);
 
 /* 12.5 涓流中把上限改成 90% */
@@ -352,6 +354,101 @@ check('派生规则', '字符串 100% 保持', 'true', String(C.deriveLatch('100
   check('计划规范化', '去重星期、丢弃无效时段', 'weekdays=1,3 windows=1', 'weekdays=' + plan.weekdays.join(',') + ' windows=' + plan.windows.length, pass);
 })();
 
+/* ---------- 配置字段契约：界面 → 模型 → TOML ---------- */
+(function () {
+  const assert = require('node:assert/strict');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const vm = require('node:vm');
+  const sandbox = { window: {} };
+  vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/toml.js'), 'utf8'), sandbox);
+  const T = sandbox.window.Tempo.Toml;
+  const app = fs.readFileSync(path.join(__dirname, '../src/app.js'), 'utf8');
+  const groups = app.slice(app.indexOf('  var LOG_LEVELS ='), app.indexOf('  function escapeHtml'));
+  const validation = app.slice(app.indexOf('  function validateConfigModel('), app.indexOf('  function firstErrorText('));
+  Object.assign(sandbox, { Tempo: { Toml: T }, cfgRangeText: () => 'range' });
+  vm.runInContext(groups + validation, sandbox);
+  const defaults = T.defaults();
+  const model = T.normalize({});
+  assert.equal(Object.keys(sandbox.validateConfigModel(model)).length, 0);
+  sandbox.CFG_FIELDS.forEach((def) => {
+    const value = T.readPath(model, def.path);
+    assert.notEqual(value, undefined, def.path + ' must survive normalization');
+    assert.equal(value, T.readPath(defaults, def.path));
+    if (def.kind !== 'select') {
+      assert.ok(Number.isFinite(value) && value >= def.min && value <= def.max, def.path);
+      const edited = T.clone(model);
+      T.writePath(edited, def.path, def.max);
+      const doc = T.applyModel({ control: { startup_guard_ms: 23000 } }, edited, sandbox.CFG_WRITE_PATHS);
+      const parsed = T.parse(T.stringify(doc));
+      assert.equal(T.readPath(T.normalize(parsed), def.path), def.max, def.path + ' roundtrip');
+      assert.equal(parsed.control.startup_guard_ms, 23000, 'preserve hidden parameters');
+      T.writePath(edited, def.path, def.max + 1);
+      assert.ok(sandbox.validateConfigModel(edited)[def.path], def.path + ' upper bound');
+      T.writePath(edited, def.path, def.min - 1);
+      assert.ok(sandbox.validateConfigModel(edited)[def.path], def.path + ' lower bound');
+      if (def.integer) {
+        T.writePath(edited, def.path, def.min + 0.5);
+        assert.ok(sandbox.validateConfigModel(edited)[def.path], def.path + ' integer');
+      }
+    }
+  });
+  const contracts = {
+    demand_smooth_ms: [200, 50, 1000], floor_exit_ratio: [0.12, 0.02, 0.40],
+    down_step_ms: [45, 15, 200], touch_lift_tiers: [1, 1, 3],
+    launch_tier_ratio: [0.62, 0.30, 0.90], tier_table_max: [8, 6, 10],
+    up_confirm_ms: [120, 40, 400], max_up_step: [2, 1, 4],
+    prime_cap_ratio: [0.70, 0.30, 0.90], ime_cap_ratio: [0.45, 0.25, 0.80]
+  };
+  const rust = fs.readFileSync(path.join(__dirname, '../../crates/tempo-core/src/config.rs'), 'utf8');
+  const rustDefaults = rust.slice(rust.indexOf('impl Default for ControlConfig'), rust.indexOf('impl Default for SceneConfig'));
+  Object.entries(contracts).forEach(([name, [value, min, max]]) => {
+    assert.equal(defaults.control[name], value, name + ' default');
+    assert.equal(Number(rustDefaults.match(new RegExp('\\b' + name + ': ([0-9._]+)'))[1].replace(/_/g, '')), value, name + ' Rust default');
+    const def = sandbox.CFG_FIELD_MAP['control.' + name];
+    assert.equal(def.min, min, name + ' min');
+    assert.equal(def.max, max, name + ' max');
+    const explicit = T.normalize({ control: { [name]: max } });
+    assert.equal(explicit.control[name], max, name + ' explicit value');
+  });
+  const quantum = sandbox.CFG_FIELD_MAP['events.runtime_quantum_us'];
+  assert.equal(quantum.min, 500);
+  assert.equal(quantum.max, 300000);
+  [500, 50000, 300000].forEach((value) => {
+    const edited = T.clone(model);
+    edited.events.runtime_quantum_us = value;
+    assert.equal(sandbox.validateConfigModel(edited)['events.runtime_quantum_us'], undefined);
+  });
+  [model.control.floor_enter_ratio, model.control.floor_enter_ratio - 0.01].forEach((value) => {
+    const edited = T.clone(model);
+    edited.control.floor_exit_ratio = value;
+    assert.ok(sandbox.validateConfigModel(edited)['control.floor_exit_ratio']);
+  });
+  check('配置契约', '字段默认值、边界、回写及交叉校验', '全部通过', '全部通过', true);
+})();
+
+for (const missingPercent of [false, true]) {
+  simulate('传感器缺失重置证据 ' + missingPercent, [
+    { input: trickle({ now: tick(0) }), expect: { allow: true, action: 'none' } },
+    { input: trickle({ now: tick(5), percent: missingPercent ? null : 100, currentMa: null }), expect: { allow: true, action: 'none' } },
+    { input: trickle({ now: tick(10) }), expect: { allow: true, action: 'none' } },
+    { input: trickle({ now: tick(19) }), expect: { allow: false, action: 'stop', primary: 'full_latch' } }
+  ]);
+}
+simulate('高电压不能独立满充', [
+  { input: trickle({ now: tick(0), currentMa: null, fullVoltageMv: 4300, voltageMv: 4400 }), expect: { allow: true, action: 'none' } },
+  { input: trickle({ now: tick(20), currentMa: 500, fullVoltageMv: 4300, voltageMv: 4400 }), expect: { allow: true, action: 'none' } },
+  { input: trickle({ now: tick(30), fullVoltageMv: 4300, voltageMv: 4400 }), expect: { allow: true, action: 'none' } },
+  { input: trickle({ now: tick(39), fullVoltageMv: 4300, voltageMv: 4400 }), expect: { allow: false, action: 'stop', primary: 'full_latch' } }
+]);
+simulate('实际开关停充零电流无效', [
+  { input: trickle({ now: tick(0), currentMa: 0, chargingSuspended: true }), expect: { allow: true, action: 'none' } },
+  { input: trickle({ now: tick(20), currentMa: 0, chargingSuspended: true }), expect: { allow: true, action: 'none' } },
+  { input: trickle({ now: tick(30) }), expect: { allow: true, action: 'none' } },
+  { input: trickle({ now: tick(39) }), expect: { allow: false, action: 'stop', primary: 'full_latch' } }
+]);
+
 /* ---------- 输出 ---------- */
 const columns = [
   { title: '场景', width: 24 },
@@ -378,6 +475,147 @@ rows.forEach((row) => {
 
 console.log(divider);
 console.log('总计 ' + rows.length + ' 项：通过 ' + passed + '，失败 ' + failed + '。');
+
+/* UI 行为回归：在无浏览器沙盒内驱动真实页面函数和异步桥。 */
+async function uiRegression() {
+  const assert = require('node:assert/strict');
+  const fs = require('node:fs');
+  const vm = require('node:vm');
+  const path = require('node:path');
+  const timers = new Map();
+  let sequence = 0;
+  let listWrites = 0;
+  const list = { set innerHTML(value) { listWrites += 1; this.html = value; } };
+  const row = { dataset: { pkg: 'test.app' }, classList: { toggle() {} }, setAttribute(key, value) { this[key] = value; } };
+  const fields = {};
+  const card = { querySelector(selector) {
+    return fields[selector] || (fields[selector] = { style: { setProperty(key, value) { this[key] = value; } } });
+  } };
+  const document = {
+    readyState: 'loading', hidden: false, addEventListener() {},
+    getElementById(id) { return id === 'fas-list' ? list : null; },
+    querySelector() { return null; },
+    querySelectorAll(selector) { return selector === '[data-pkg]' ? [row] : selector === '.cluster' ? [card] : []; }
+  };
+  const window = {
+    Tempo: { Charge: C }, JSON, location: { search: '' },
+    setTimeout(fn, delay) { const id = ++sequence; timers.set(id, { fn, delay }); return id; },
+    clearTimeout(id) { timers.delete(id); }, addEventListener() {}
+  };
+  const context = vm.createContext({ window, document, console, Promise, Date });
+  let source = fs.readFileSync(path.join(__dirname, '../src/app.js'), 'utf8');
+  source = source.replace('  if (document.readyState', '  window.testUi = { state: state, rows: renderAppRows, toggle: toggleApp, input: onInput, start: startOverviewPolling, stop: stopOverviewPolling, visible: onVisibilityChange, loadFas: ensureFasLoaded, setApi: function(value) { api = value; } };\n  if (document.readyState');
+  vm.runInContext(source, context);
+  const ui = window.testUi;
+  ui.state.tab = 'fas';
+  ui.state.fasLoaded = true;
+  ui.state.fas.enabled = true;
+  ui.state.fasApps = Array.from({ length: 1001 }, (_, i) => ({ package: 'test.app' + i }));
+  assert.equal((ui.rows().match(/data-pkg=/g) || []).length, 60);
+  ui.state.fasQuery = 'test.app1000';
+  assert.match(ui.rows(), /data-pkg="test.app1000"/);
+  ui.setApi({ saveFas: () => Promise.resolve({ error: null }) });
+  ui.toggle('test.app');
+  assert.equal(row['aria-pressed'], 'true');
+  assert.equal(listWrites, 0, '勾选不能重建应用列表');
+  ui.input({ target: { id: 'fas-search', value: 'first' } });
+  ui.input({ target: { id: 'fas-search', value: 'test.app1000' } });
+  assert.equal([...timers.values()].filter(t => t.delay === 180).length, 1);
+  const debounce = [...timers.values()].find(t => t.delay === 180);
+  debounce.fn();
+  assert.equal(listWrites, 1);
+  timers.clear();
+  ui.state.tab = 'overview';
+  ui.state.data = { status: { clusters: [{ min_khz: 300000, max_khz: 2000000 }] } };
+  let reads = 0;
+  let complete;
+  ui.setApi({ queryFrequencies() { reads += 1; return new Promise(resolve => { complete = resolve; }); }, queryUsage: () => Promise.resolve({ values: [], windowMs: 500 }) });
+  ui.start();
+  const poll = [...timers.values()].find(t => t.delay === 5000);
+  timers.clear();
+  poll.fn();
+  ui.start();
+  const busyPoll = [...timers.values()].find(t => t.delay === 5000);
+  timers.clear();
+  busyPoll.fn();
+  assert.equal(reads, 1, '总览采样必须单飞');
+  document.hidden = true;
+  ui.start();
+  assert.equal(timers.size, 0, '隐藏时必须停止总览计时器');
+  complete([]);
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(timers.size, 0, '后台采样完成后不能重新启动轮询');
+  document.hidden = false;
+  window.__AEGIS_FOREGROUND__ = false;
+  ui.start();
+  assert.equal(timers.size, 0, '原生后台状态同样停止轮询');
+
+  window.__AEGIS_FOREGROUND__ = true;
+  ui.setApi({ queryFrequencies: () => Promise.resolve([1200000]), queryUsage: () => Promise.resolve({ values: [0.42], windowMs: 500 }) });
+  ui.start();
+  const livePoll = [...timers.values()].find(t => t.delay === 5000);
+  timers.clear();
+  livePoll.fn();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(fields['.ring__inner b'].textContent, '1.20');
+  assert.equal(fields['.bar--usage em'].textContent, '42%');
+  assert.equal(listWrites, 1, '实时采样不能重建页面');
+  ui.stop();
+
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/shell.js'), 'utf8'), context);
+  let requested;
+  const shell = new window.Tempo.Shell.NativeShell({ apps(id, force) { requested = { id, force }; } });
+  const pending = shell.apps(true);
+  assert.equal(requested.force, true);
+  window.AegisShellResolve(requested.id, 0, JSON.stringify({ apps: [{ package: 'test.app' }] }), '');
+  assert.equal((await pending).apps[0].package, 'test.app');
+  assert.equal(Object.keys(shell.pending).length, 0);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/api.js'), 'utf8'), context);
+  const api = new window.Tempo.Api({ exec: () => Promise.resolve({ code: 0, stdout: Array.from({ length: 1001 }, (_, i) => '__USER__ test.app' + i).join('\n') }) });
+  assert.equal((await api.queryPackages()).apps.length, 1001, 'WebUI不能截断800个应用');
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/mock.js'), 'utf8'), context);
+  window.location.search = '?demo=1';
+  const demoApi = new window.Tempo.Api(window.Tempo.Shell.create());
+  timers.clear();
+  const demoFrequencies = demoApi.queryFrequencies(window.Tempo.Mock.status.clusters);
+  [...timers.values()].forEach(timer => timer.fn());
+  timers.clear();
+  assert.deepEqual(Array.from(await demoFrequencies), [307200, 499200, 595200], 'demo真实policy 0/3/7必须全部匹配');
+  const mappedApi = new window.Tempo.Api({ exec: () => Promise.resolve({ code: 0, stdout: '7 595200\n0 307200\n3 499200\n' }) });
+  assert.deepEqual(Array.from(await mappedApi.queryFrequencies([{ policy: 'policy7' }, { cpus: [0, 1, 2] }, { policy: 3 }, { cpus: [9] }])), [595200, 307200, 499200, null], '按policy而非位置匹配，缺失保留null');
+  const oldFixtureApi = new window.Tempo.Api({ exec: () => Promise.resolve({ code: 0, stdout: '0 307200\n1 499200\n2 595200\n' }) });
+  assert.deepEqual(Array.from(await oldFixtureApi.queryFrequencies(window.Tempo.Mock.status.clusters)), [307200, null, null], '不允许使用簇序号fallback掩盖不匹配');
+
+  ui.state.tab = 'overview';
+  ui.state.fasDirty = false;
+  ui.state.fasSaving = false;
+  let fasReads = 0;
+  let returnFas;
+  ui.setApi({ loadFas() { fasReads += 1; return new Promise(resolve => { returnFas = resolve; }); }, queryPackages() { throw new Error('恢复可见不应扫描应用'); } });
+  ui.visible();
+  assert.equal(fasReads, 1, '已缓存FAS恢复前台仍需重读');
+  returnFas({ enabled: false, packages: ['external.app'] });
+  await Promise.resolve();
+  assert.equal(ui.state.fas.packages[0], 'external.app');
+  ui.state.fasDirty = true;
+  ui.visible();
+  assert.equal(fasReads, 1, '未保存的编辑不能被恢复读取覆盖');
+  ui.state.fasDirty = false;
+  ui.state.fasSaving = true;
+  ui.visible();
+  assert.equal(fasReads, 1, '正在保存时不能重读');
+  ui.state.fasSaving = false;
+  ui.visible();
+  assert.equal(fasReads, 2);
+  ui.state.fasEditRevision += 1;
+  ui.state.fas.packages = ['local.edit'];
+  returnFas({ enabled: true, packages: ['stale.app'] });
+  await Promise.resolve();
+  assert.equal(ui.state.fas.packages[0], 'local.edit', '读取飞行期间的新编辑必须保留');
+  ui.stop();
+  console.log('UI 行为回归：既有UI行为、demo与真实policy映射、缺失频率保留null、FAS恢复重读及编辑竞态保护均通过。');
+}
+uiRegression().catch(error => { console.error(error); process.exitCode = 1; });
 
 if (failed > 0) {
   console.error('\n存在未通过用例，不能接入页面。');

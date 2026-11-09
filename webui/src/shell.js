@@ -178,27 +178,32 @@
     });
   };
 
-  /** APP 内用 PackageManager 提供真实应用名与图标；WebUI 回退到包名列表。 */
-  NativeShell.prototype.apps = function () {
-    if (!this.bridge || typeof this.bridge.apps !== 'function') {
-      return Promise.resolve(null);
-    }
-    try {
-      var raw = this.bridge.apps();
-      var parsed = global.JSON ? global.JSON.parse(raw || '[]') : [];
-      if (Array.isArray(parsed)) {
-        return Promise.resolve({ apps: parsed, error: null });
+  /** 应用元数据走异步回调，不阻塞 WebView 的桥接线程。 */
+  NativeShell.prototype.apps = function (force) {
+    var self = this;
+    if (!self.bridge || typeof self.bridge.apps !== 'function') return Promise.resolve(null);
+    return new Promise(function (resolve) {
+      var id = 'apps' + (self.seq += 1) + '_' + Date.now();
+      var timer = global.setTimeout(function () {
+        delete self.pending[id];
+        resolve({ apps: [], error: '读取应用列表超时，请重试' });
+      }, 30000);
+      self.pending[id] = { timer: timer, resolve: function (result) {
+        try {
+          var parsed = global.JSON.parse(result.stdout);
+          resolve({ apps: Array.isArray(parsed.apps) ? parsed.apps : [], error: parsed.error || null });
+        } catch (error) {
+          resolve({ apps: [], error: '应用列表返回格式无效' });
+        }
+      } };
+      try {
+        self.bridge.apps(id, !!force);
+      } catch (error) {
+        delete self.pending[id];
+        global.clearTimeout(timer);
+        resolve({ apps: [], error: '读取应用列表失败：' + String(error.message || error) });
       }
-      if (!parsed || typeof parsed !== 'object') {
-        return Promise.resolve({ apps: [], error: '应用列表返回格式无效' });
-      }
-      return Promise.resolve({
-        apps: Array.isArray(parsed.apps) ? parsed.apps : [],
-        error: parsed.error ? String(parsed.error) : null
-      });
-    } catch (error) {
-      return Promise.resolve({ apps: [], error: '读取应用列表失败：' + String((error && error.message) || error) });
-    }
+    });
   };
 
   /**
@@ -238,7 +243,7 @@
           var fasStart = command.indexOf('\n') + 1;
           var fasEnd = command.indexOf('AEGIS_FAS_EOF', fasStart);
           mock.fasJson = command.slice(fasStart, fasEnd);
-          resolve({ code: 0, stdout: '__FAS_OK__\n', stderr: '' });
+          resolve({ code: 0, stdout: mock.fasJson, stderr: '' });
           return;
         }
         if (command.indexOf('fas.json') !== -1) {
@@ -339,7 +344,11 @@
           return global.__TEMPO_SHELL_FACTORY__();
         }
       }
-      return new DemoShell(Tempo.Mock);
+      if (forcedDemo) return new DemoShell(Tempo.Mock);
+      return {
+        kind: 'unavailable',
+        exec: function () { return Promise.reject(new Error('控制通道不可用，请在已授权的 Aegis 或 KernelSU 中打开')); }
+      };
     },
     KsuShell: KsuShell,
     NativeShell: NativeShell,

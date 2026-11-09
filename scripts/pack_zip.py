@@ -30,5 +30,8 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
             full = os.path.join(root, name)
             arc = os.path.relpath(full, stage).replace("\\", "/")
             with open(full, "rb") as fh:
-                zf.writestr(info_for(arc, False), fh.read())
+                data = fh.read()
+            if arc.endswith((".sh", ".prop", ".toml")) or arc.endswith("/update-binary") or arc.endswith("/updater-script"):
+                data = data.replace(b"\r\n", b"\n").replace(b"\r", b"")
+            zf.writestr(info_for(arc, False), data)
 print(f"packed {out}")

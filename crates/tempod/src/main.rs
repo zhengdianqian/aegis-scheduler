@@ -16,13 +16,13 @@ mod charge;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod event_loop;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod foreground;
-#[cfg(any(target_os = "linux", target_os = "android"))]
 mod fas;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod foreground;
 mod ipc;
-mod power;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod launch;
+mod power;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod probe;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -34,7 +34,7 @@ mod writer;
 #[derive(Debug, Parser)]
 #[command(
     name = "Aegis",
-    about = "Aegis scheduling daemon (event driven, zero periodic polling)"
+    about = "Aegis scheduling daemon (event driven with bounded safety timers)"
 )]
 struct Args {
     #[arg(long, default_value = "/data/adb/tempo/config.toml")]

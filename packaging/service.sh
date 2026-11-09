@@ -4,17 +4,15 @@
 #
 # v3 boot sequence. Safety first:
 #   1. recover from a previous boot that never reached the healthy state;
-#   2. migrate away from the old module id and stop any legacy writer;
+#   2. disable the old module id and refuse to compete with an active writer;
 #   3. wait for boot_completed, the keyguard to be gone and 30 s of calm;
 #   4. generate the device profile from sysfs (no hard-coded SoC);
 #   5. capture the pristine governor/min/max;
 #   6. start exactly one Aegis daemon, which itself stays read-only for 20 s;
 #   7. only after the daemon survives 60 s is the boot guard cleared.
 #
-# No cpufreq node is written by the daemon before step 7. That is the
-# mechanism that makes "a control that did not finish booting" impossible to
-# repeat: if control.armed is still present at the next boot, this module
-# disables itself before touching anything.
+# If the daemon exits before the boot guard clears, the watchdog restores
+# cpufreq and the marker disables this module on the next boot.
 
 MODDIR=${0%/*}
 DATA=/data/adb/tempo
@@ -30,19 +28,85 @@ log() {
     echo "aegis: $*" >> "$LOG"
 }
 
+install_manager() {
+    umask 077
+    apk="$MODDIR/app/AegisManager.apk"
+    stamp="$DATA/run/manager-installed.sha256"
+    package=com.aegis.scheduler
+    waited=0
+    while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$waited" -lt 300 ]; do
+        waited=$((waited + 1))
+        sleep 1
+    done
+    if [ "$(getprop sys.boot_completed)" != "1" ]; then
+        log "manager install: boot timeout; will retry next start"
+        return 1
+    fi
+    if [ ! -f "$apk" ]; then
+        log "manager install: bundled APK missing; will retry next start"
+        return 1
+    fi
+    digest=$(sha256sum "$apk") || {
+        log "manager install: APK hash failed; will retry next start"
+        return 1
+    }
+    digest=${digest%% *}
+    installed_hash=
+    [ ! -f "$stamp" ] || read -r installed_hash < "$stamp"
+    installed_path=$(pm path "$package" 2>/dev/null)
+    case "$installed_path" in
+        package:*) [ "$installed_hash" != "$digest" ] || return 0 ;;
+    esac
+
+    stage=$(mktemp -d /data/local/tmp/aegis-manager.XXXXXX) || {
+        log "manager install: staging directory failed; will retry next start"
+        return 1
+    }
+    trap 'rm -rf "$stage"' EXIT
+    trap 'exit 1' HUP INT TERM
+    # Package Manager needs traversal/read access, not directory listing or writes.
+    if ! cp "$apk" "$stage/AegisManager.apk" ||
+        ! chmod 711 "$stage" || ! chmod 644 "$stage/AegisManager.apk"; then
+        log "manager install: staging APK failed; will retry next start"
+        return 1
+    fi
+    output=$(pm install -r "$stage/AegisManager.apk" 2>&1)
+    result=$?
+    log "manager install (exit $result): $output"
+    if [ "$result" -ne 0 ]; then
+        log "manager install failed; keeping existing app, will retry next start"
+        return 1
+    fi
+    case "$output" in
+        *Success*) ;;
+        *) log "manager install: no success confirmation; will retry next start"; return 1 ;;
+    esac
+    installed_path=$(pm path "$package" 2>/dev/null)
+    case "$installed_path" in
+        package:*) ;;
+        *) log "manager install: package not found after install; will retry next start"; return 1 ;;
+    esac
+    if ! printf '%s\n' "$digest" > "$stamp.tmp" || ! mv "$stamp.tmp" "$stamp"; then
+        rm -f "$stamp.tmp"
+        log "manager install: success hash not saved; will retry next start"
+        return 1
+    fi
+    log "manager install: installed bundled APK successfully"
+}
+
+if [ "$1" = "--install-manager" ]; then
+    install_manager
+    exit $?
+fi
+# Independent of all scheduler guards, unlock checks and daemon lifetime.
+nohup sh "$MODDIR/service.sh" --install-manager >> "$LOG" 2>&1 < /dev/null &
+
 # --- 1. boot guard -----------------------------------------------------------
 if [ -f "$ARMED" ]; then
-    # A previous boot armed the control but never confirmed a healthy start.
-    # Drop any legacy v2 floor mask, restore the pristine range and disable
-    # ourselves so the next boot is completely stock.
-    for d in /sys/devices/system/cpu/cpufreq/policy*; do
-        [ -e "$d/scaling_min_freq" ] || continue
-        if mount | grep -q " $d/scaling_min_freq "; then
-            umount "$d/scaling_min_freq" 2>/dev/null
-        fi
-    done
+    # A previous boot did not confirm a healthy start. Leave this boot's
+    # kernel and vendor policy untouched.
+    touch "$MODDIR/disable" || exit 1
     rm -f "$ARMED"
-    touch "$MODDIR/disable"
     log "boot guard: control.armed found; module disabled, cpufreq untouched"
     exit 0
 fi
@@ -55,12 +119,11 @@ for old in /data/adb/modules/tempo_sched; do
     fi
 done
 
-# A stale manual start must never share the policies with the service instance.
-killall Aegis 2>/dev/null
-pkill -f "bin/Aegis" 2>/dev/null
-sleep 1
-killall -9 Aegis 2>/dev/null
-pkill -9 -f "bin/Aegis" 2>/dev/null
+# Do not kill a manual test or race another instance's restore watchdog.
+if pidof Aegis tempod >/dev/null 2>&1; then
+    log "another scheduler instance is running; leaving cpufreq untouched"
+    exit 0
+fi
 
 # --- 3. boot + unlock gate ---------------------------------------------------
 waited=0
@@ -92,8 +155,7 @@ if [ ! -f "$DATA/config.toml" ]; then
     cp "$MODDIR/config/config.toml" "$DATA/config.toml"
 fi
 
-sh "$MODDIR/scripts/profile-gen.sh" > "$PROFILE.tmp" 2>> "$LOG"
-if [ ! -s "$PROFILE.tmp" ]; then
+if ! sh "$MODDIR/scripts/profile-gen.sh" > "$PROFILE.tmp" 2>> "$LOG" || [ ! -s "$PROFILE.tmp" ]; then
     rm -f "$PROFILE.tmp"
     log "device profile generation failed; leaving cpufreq untouched"
     exit 0
@@ -119,12 +181,16 @@ if ! "$BIN" --check --config "$DATA/config.toml" --profile "$PROFILE" > /dev/nul
 fi
 
 # --- 5. pristine backup (before any write) -----------------------------------
-sh "$MODDIR/scripts/cpufreq_backup.sh" >> "$LOG" 2>&1
+if ! sh "$MODDIR/scripts/cpufreq_backup.sh" >> "$LOG" 2>&1; then
+    log "cpufreq backup failed; refusing to start writer"
+    exit 1
+fi
 
 # --- 6. start the single writer ---------------------------------------------
 # The marker is written *before* the daemon may write anything. It is removed
 # only after the daemon survived 60 s (20 s internal guard + margin).
-date > "$ARMED" 2>/dev/null || touch "$ARMED"
+rm -f "$DATA/run/clean-exit" || exit 1
+date > "$ARMED" || exit 1
 cd "$DATA" || exit 1
 nohup "$BIN" \
     --config "$DATA/config.toml" \
@@ -133,12 +199,12 @@ nohup "$BIN" \
     --log-file "$LOG" \
     >> "$LOG" 2>&1 &
 pid=$!
+# Cover the startup/healthy interval too: a crash must not leave a low ceiling.
+nohup sh "$MODDIR/scripts/watchdog.sh" "$pid" >> "$LOG" 2>&1 &
 
 sleep 5
 if ! kill -0 "$pid" 2>/dev/null; then
-    log "Aegis failed to start; restoring original cpufreq"
-    sh "$MODDIR/scripts/restore.sh" >> "$LOG" 2>&1
-    rm -f "$ARMED"
+    log "Aegis failed to start; watchdog handles restoration, boot guard kept"
     exit 0
 fi
 log "Aegis started (pid $pid)"
@@ -153,9 +219,5 @@ else
     exit 0
 fi
 
-# --- 8. failure watchdog -----------------------------------------------------
-nohup sh "$MODDIR/scripts/watchdog.sh" "$pid" >> "$LOG" 2>&1 &
-
-# --- 9. charging resume and vendor shield -----------------------------------
-sh "$MODDIR/scripts/charge_resume.sh" >> "$DATA/charge.log" 2>&1
-sh "$MODDIR/scripts/shield.sh" apply >> "$DATA/shield.log" 2>&1
+# The failure watchdog remains active. Charging and vendor services are not
+# modified by the scheduler.

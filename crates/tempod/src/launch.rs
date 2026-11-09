@@ -122,11 +122,7 @@ impl WakePipe {
     pub fn wake(&self) {
         let byte = 1u8;
         unsafe {
-            libc::write(
-                self.write,
-                &byte as *const u8 as *const libc::c_void,
-                1,
-            );
+            libc::write(self.write, &byte as *const u8 as *const libc::c_void, 1);
         }
     }
 

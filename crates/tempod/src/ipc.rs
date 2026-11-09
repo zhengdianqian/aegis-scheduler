@@ -109,16 +109,28 @@ pub fn status_json(
                 &cluster.max_khz,
                 config.control.tier_table_max,
             );
+            let policy = cluster
+                .cpus
+                .first()
+                .and_then(|cpu| crate::writer::policy_dir(*cpu));
+            let effective_min = policy
+                .as_ref()
+                .and_then(|dir| crate::writer::read_u32(&dir.join("scaling_min_freq")));
+            let effective_max = policy
+                .as_ref()
+                .and_then(|dir| crate::writer::read_u32(&dir.join("scaling_max_freq")));
             json!({
+                "effective_min_khz": effective_min,
+                "effective_max_khz": effective_max,
                 "cpus": cluster.cpus,
                 "role": cluster.role,
                 "min_khz": cluster.min_khz,
                 "max_khz": cluster.max_khz,
                 "capacity": cluster.capacity,
-                "busy": runtime.busy.get(index).copied().unwrap_or(0.0),
-                "foreground": runtime.foreground.get(index).copied().unwrap_or(0.0),
-                "usage": runtime.usage.get(index).copied().unwrap_or(0.0),
-                "usage_sampled": true,
+                "busy": runtime.busy.get(index).copied(),
+                "foreground": runtime.foreground.get(index).copied(),
+                "usage": runtime.usage.get(index).copied(),
+                "usage_sampled": runtime.usage.get(index).is_some(),
                 "tier": decision.map(|value| value.tier).unwrap_or(0),
                 "tier_count": decision
                     .map(|value| value.tier_count)
@@ -323,6 +335,14 @@ pub fn handle(ctx: &mut ControlContext<'_>, line: &str) -> (String, Outcome) {
     (text, outcome)
 }
 
+pub(crate) fn requires_restart(startup: &Config, next: &Config) -> bool {
+    startup.daemon.profile_path != next.daemon.profile_path
+        || startup.daemon.log_level != next.daemon.log_level
+        || startup.events.runtime_quantum_us != next.events.runtime_quantum_us
+        || startup.events.demand_step != next.events.demand_step
+        || startup.control.startup_guard_ms != next.control.startup_guard_ms
+}
+
 fn apply_config(ctx: &mut ControlContext<'_>, request: &serde_json::Value) -> Result<bool, String> {
     let parsed = if let Some(text) = request.get("toml").and_then(|value| value.as_str()) {
         toml::from_str::<Config>(text).map_err(|error| format!("parse: {error}"))?
@@ -355,8 +375,7 @@ fn apply_config(ctx: &mut ControlContext<'_>, request: &serde_json::Value) -> Re
         return Err(format!("replace config: {error}"));
     }
 
-    let restart_required = parsed.daemon.profile_path != ctx.config.daemon.profile_path
-        || parsed.daemon.log_level != ctx.config.daemon.log_level;
+    let restart_required = ctx.runtime.restart_required || requires_restart(ctx.config, &parsed);
     *ctx.config = parsed;
     Ok(restart_required)
 }
@@ -370,4 +389,86 @@ fn response(value: serde_json::Value) -> String {
     let mut text = value.to_string();
     text.push('\n');
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile() -> DeviceProfile {
+        serde_json::from_value(json!({
+            "schema": 1, "platform": "test", "sdk": 34,
+            "cluster": [{ "cpus": [0], "role": "efficiency", "min_khz": 300,
+                "max_khz": 1200, "capacity": 256, "freq_khz": [300, 600, 1200] }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn missing_usage_is_null_not_idle() {
+        let config = Config::default();
+        let profile = profile();
+        let mut runtime = RuntimeStatus::default();
+        let status = status_json(&config, &profile, 0, &runtime);
+        assert!(status["clusters"][0]["usage"].is_null());
+        assert!(status["clusters"][0]["busy"].is_null());
+        assert_eq!(status["clusters"][0]["usage_sampled"], false);
+        if crate::writer::policy_dir(0).is_none() {
+            assert!(status["clusters"][0]["effective_min_khz"].is_null());
+            assert!(status["clusters"][0]["effective_max_khz"].is_null());
+        }
+        runtime.usage = vec![0.0];
+        let status = status_json(&config, &profile, 0, &runtime);
+        assert_eq!(status["clusters"][0]["usage"], 0.0);
+        assert_eq!(status["clusters"][0]["usage_sampled"], true);
+    }
+
+    #[test]
+    fn probe_and_guard_changes_require_restart() {
+        let startup = Config::default();
+        assert!(!requires_restart(&startup, &startup));
+        let mut next = startup.clone();
+        next.events.runtime_quantum_us += 1;
+        assert!(requires_restart(&startup, &next));
+        let mut next = startup.clone();
+        next.events.demand_step += 0.01;
+        assert!(requires_restart(&startup, &next));
+        let mut next = startup.clone();
+        next.control.startup_guard_ms += 1;
+        assert!(requires_restart(&startup, &next));
+    }
+
+    #[test]
+    fn apply_acknowledges_persisted_config() {
+        let dir = std::env::temp_dir().join(format!("aegis-ipc-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config::default();
+        let mut next = config.clone();
+        next.fas.enabled = true;
+        let profile = profile();
+        let runtime = RuntimeStatus::default();
+        let log = dir.join("log");
+        let mut ctx = ControlContext {
+            config: &mut config,
+            profile: &profile,
+            runtime: &runtime,
+            config_path: &path,
+            log_path: &log,
+            started: Instant::now(),
+            writer: None,
+        };
+        let request = json!({"cmd": "config.apply", "config": next}).to_string();
+        let (reply, outcome) = handle(&mut ctx, &request);
+        assert_eq!(outcome, Outcome::Reloaded);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap()["applied"]
+                .as_bool()
+                .unwrap()
+        );
+        let persisted: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted.fas.enabled);
+        assert!(ctx.config.fas.enabled);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

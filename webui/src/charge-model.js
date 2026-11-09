@@ -291,8 +291,8 @@
    * 原因优先级：温度 > 100% 满充锁存 > 普通上限 > 预约。
    *
    * 100% 策略：到达 100% 不停充，先进入涓流阶段；只有出现满充证据
-   * （status=Full，或电流持续低于阈值达到保持时长，或可选满充电压持续
-   * 达到保持时长）才锁存停充，直到重新插电。
+   * （status=Full，或电流持续低于阈值达到保持时长，且满足可选电压门槛）
+   * 才锁存停充，直到重新插电。
    */
   function step(prev, input) {
     var state = createState(prev || {});
@@ -424,8 +424,8 @@
         } else if (!state.upperLatched) {
           /* 已到 100%：进入涓流，只有确认真正充满才锁存停充。 */
           var lowCurrent = currentMa != null && Math.abs(currentMa) <= fullCurrentMa;
-          var highVoltage = fullVoltageMv != null && voltageMv != null && voltageMv >= fullVoltageMv;
-          var blockedByOther = state.tempBlocked || !planLive.allowed;
+          var voltageOk = fullVoltageMv == null || (voltageMv != null && voltageMv >= fullVoltageMv);
+          var blockedByOther = state.tempBlocked || !planLive.allowed || state.stopped || data.chargingSuspended === true;
           if (blockedByOther) {
             /* 被温度/预约强制停充时电流会自然下降，不能当成满充证据 */
             state.trickleSince = null;
@@ -433,7 +433,7 @@
             state.upperLatched = true;
             state.armed = false;
             state.trickleSince = null;
-          } else if (lowCurrent || highVoltage) {
+          } else if (lowCurrent && voltageOk) {
             if (state.trickleSince == null) state.trickleSince = nowMs;
             if (nowMs - state.trickleSince >= fullHoldSeconds * 1000) {
               state.upperLatched = true;
@@ -445,6 +445,8 @@
             state.trickleSince = null;
           }
         }
+      } else {
+        state.trickleSince = null;
       }
     } else {
       state.upperLatched = false;

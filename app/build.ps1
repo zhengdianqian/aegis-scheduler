@@ -19,7 +19,8 @@ $versionMatch = Select-String -Path $moduleGradle -Pattern 'versionName\s*=\s*"(
 if (-not $versionMatch) { throw "cannot read versionName from $moduleGradle" }
 $versionName = $versionMatch.Matches[0].Groups[1].Value
 
-$deliveryDir = 'D:\dev\tempo-build-android\tempo-app'
+$deliveryDir = $env:AEGIS_APK_OUTPUT_DIR
+if (-not $deliveryDir) { $deliveryDir = [System.IO.Path]::GetTempPath() }
 $deliveryApk = Join-Path $deliveryDir "Aegis-v$versionName.apk"
 
 # 1. Regenerate the static WebUI bundle from sources.
@@ -136,8 +137,10 @@ $apkVersionName = $packageLine[3].Value
 if ($packageName -ne 'com.aegis.scheduler') {
   throw "APK 包名 $packageName 与 com.aegis.scheduler 不一致"
 }
-if ($versionCode -ne '13') {
-  throw "APK versionCode=$versionCode 与 v3.0 约定的 13 不一致"
+$codeMatch = Select-String -Path $moduleGradle -Pattern 'versionCode\s*=\s*(\d+)'
+$expectedVersionCode = if ($codeMatch) { $codeMatch.Matches[0].Groups[1].Value } else { '' }
+if (-not $expectedVersionCode -or $versionCode -ne $expectedVersionCode) {
+  throw "APK versionCode=$versionCode 与 Gradle 配置 $expectedVersionCode 不一致"
 }
 if ($apkVersionName -ne $versionName) {
   throw "APK versionName=$apkVersionName 与 Gradle 配置 $versionName 不一致"

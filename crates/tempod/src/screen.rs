@@ -56,11 +56,7 @@ impl ScreenWatcher {
             | libc::IN_CREATE
             | libc::IN_DELETE;
         let watch = unsafe {
-            libc::inotify_add_watch(
-                fd,
-                c_path(&device).as_ptr(),
-                interest as libc::c_uint,
-            )
+            libc::inotify_add_watch(fd, c_path(&device).as_ptr(), interest as libc::c_uint)
         };
         if watch < 0 {
             let error = io::Error::last_os_error();

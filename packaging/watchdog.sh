@@ -14,8 +14,13 @@ PID=$1
 [ -n "$PID" ] || exit 0
 
 while [ -d "/proc/$PID" ]; do
-    sleep 60
+    sleep 2
 done
 
-echo "aegis: daemon $PID exited; restoring original cpufreq" >> "$DATA/Aegis.log"
-sh "$MODDIR/restore.sh" >> "$DATA/Aegis.log" 2>&1
+if [ "$(cat "$DATA/run/clean-exit" 2>/dev/null)" = "$(printf 'aegis-clean-exit-v1\nwriter_restored=1')" ]; then
+    exit 0
+fi
+
+# 主动双边控制异常退出后恢复本次启动备份，不修改温控服务或限制节点。
+echo "aegis: daemon $PID exited without confirming restore; restoring cpufreq bounds" >> "$DATA/Aegis.log"
+sh "$MODDIR/restore.sh" >> "$DATA/Aegis.log" 2>&1 || exit 1
