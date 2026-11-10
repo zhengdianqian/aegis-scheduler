@@ -27,4 +27,3 @@ else
 fi
 
 ui_print "- 请重启设备：开机完成后将自动安装或更新 Aegis 管理器。"
-ui_print "- 安装失败会保留原应用并在下次启动重试，详情见 /data/adb/tempo/Aegis.log。"
