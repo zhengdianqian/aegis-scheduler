@@ -13,11 +13,11 @@ use tempo_core::{Config, DeviceProfile};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+mod aegis_frame;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod charge;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod event_loop;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-mod fas;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod foreground;
 #[cfg(any(target_os = "linux", target_os = "android"))]

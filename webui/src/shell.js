@@ -239,15 +239,15 @@
           resolve({ code: 0, stdout: mock.chargePlanJson || '__EMPTY__', stderr: '' });
           return;
         }
-        if (command.indexOf("<<'AEGIS_FAS_EOF'") !== -1) {
-          var fasStart = command.indexOf('\n') + 1;
-          var fasEnd = command.indexOf('AEGIS_FAS_EOF', fasStart);
-          mock.fasJson = command.slice(fasStart, fasEnd);
-          resolve({ code: 0, stdout: mock.fasJson, stderr: '' });
+        if (command.indexOf("<<'AEGIS_FRAME_EOF'") !== -1) {
+          var frameStart = command.indexOf('\n') + 1;
+          var frameEnd = command.indexOf('AEGIS_FRAME_EOF', frameStart);
+          mock.frameJson = command.slice(frameStart, frameEnd);
+          resolve({ code: 0, stdout: mock.frameJson, stderr: '' });
           return;
         }
-        if (command.indexOf('fas.json') !== -1) {
-          resolve({ code: 0, stdout: mock.fasJson || '__EMPTY__', stderr: '' });
+        if (command.indexOf('aegis-frame.json') !== -1) {
+          resolve({ code: 0, stdout: mock.frameJson || '__EMPTY__', stderr: '' });
           return;
         }
         if (command.indexOf("<<'AEGIS_CONFIG_EOF'") !== -1) {

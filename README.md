@@ -1,12 +1,12 @@
 ﻿# Aegis
 
-**v3.6.5 · versionCode 23**｜Android arm64 CPU 分档自适应调频、可选 FAS UI 帧反馈、充电控制。
+**v3.6.5 · versionCode 23**｜Android arm64 CPU 分档自适应调频、可选帧反馈（Aegis Frame）、充电控制。
 模块 id：`aegis_scheduler`；APP 包名：`com.aegis.scheduler`；支持通过 KernelSU / Magisk 安装。
 作者：**默默的阿文**。本项目为独立编写与独立署名，不包含第三方模块源码，详见 [PROVENANCE.md](PROVENANCE.md)。
 
 模块根据设备实际 cpufreq policy 生成档案，**主动控制每簇 `scaling_min_freq` 和 `scaling_max_freq`**。本次改进自主控制，但不锁频；真实负载可达硬件允许的 max，仍受温控、驱动和外部约束。正常控制不改 governor，保留厂商温控及 thermal / perf HAL。**厂商 XML 覆盖 apply 仍为 `disabled_unverified_hal_timing`，不能声称已完全屏蔽官方调度。** 厂商 QoS、温控和其他写入者仍可能覆盖或限制结果，不能承诺所有手机兼容、零掉帧或固定省电幅度。
 
-默认不按场景或负载压低最高频率，也不会锁定最高频率；省电上限仅在用户为某簇选择小于 `1` 的比例时启用。复核退避、FAS 超时、启动日志退避和探针熄屏早退均不代表实测功耗或续航收益。厂商策略须校验机型及 OTA 指纹哈希；指纹哈希失配时跳过覆盖，未知机型回退，不强行套用其他机型策略。
+默认不按场景或负载压低最高频率，也不会锁定最高频率；省电上限仅在用户为某簇选择小于 `1` 的比例时启用。复核退避、帧反馈超时、启动日志退避和探针熄屏早退均不代表实测功耗或续航收益。厂商策略须校验机型及 OTA 指纹哈希；指纹哈希失配时跳过覆盖，未知机型回退，不强行套用其他机型策略。
 
 ## 安装、检查与跨机适配
 
@@ -41,13 +41,13 @@ $CTL logs --lines 80
 - 低负载下中核偶发顶频来自厂商 `walt`：`pl=1` 的预测会把短时唤醒放大成一次最高频，实测 10 秒轻滑命中 `2707200` 达 80 次。`[governor]` 段只写 `walt/pl` 与 `walt/{up,down}_rate_limit_us`（默认关预测、升频 40 ms 节流、降频不节流），**不设置任何频率上限、不改 min/max**；同场景命中降到 0、平均频率 1187→1038 MHz、顶频驻留 9~10 ms→0~1 ms，Settings 滑动 0 掉帧、冷启动耗时无回归。降频加节流会把高频“挂”住并抬高平均频率，故默认不给降频节流。
 - 阅读/视频/输入法场景按前台包分类。单次 UI 帧超预算提供短时救援；连续至少 3 次有效超预算反馈才提高阅读/视频自适应地板，健康反馈重置连续计数，反馈间隔过长重新计数。场景改变重置自适应地板；这不是视频解码质量检测。
 - 模块写两端并读回验证，必要时先降低 min 或先提高 max，避免上下限次序冲突。外部改写/驱动拒绝会报告错误并有限退避重试。观察到外部降低 max 后，floor/cap 不越过该约束；只有外部明确放宽才解除。该机制不是内核原子仲裁，无法保证捕获两次读取之间的瞬时限制。正常写入不改 thermal 节点；对 governor 的唯一写入是上述换档节奏（`walt/pl`、`walt/{up,down}_rate_limit_us`），不改档位表与 min/max。内核温控仍可能钳制频率。
-- **不是零轮询**：BPF 有需求观察窗口，探针增加熄屏早退；CPU 区间复核在稳定时退避，异常时仍需检查和重试，看门狗也保留周期检查。FAS 请求采用最新单槽与超时约束；启动日志读取失败采用指数退避。充电沙盒逻辑仍包含预约/停充复核、涓流及写失败重试，控制台在可见总览刷新状态。这些都是代码层面的唤醒与失败路径改进，不能据此声称真机省电。
+- **不是零轮询**：BPF 有需求观察窗口，探针增加熄屏早退；CPU 区间复核在稳定时退避，异常时仍需检查和重试，看门狗也保留周期检查。帧反馈请求采用最新单槽与超时约束；启动日志读取失败采用指数退避。充电沙盒逻辑仍包含预约/停充复核、涓流及写失败重试，控制台在可见总览刷新状态。这些都是代码层面的唤醒与失败路径改进，不能据此声称真机省电。
 
-### FAS 与控制界面
+### 帧反馈与控制界面
 
-APP / WebUI 共用控制服务和配置，提供状态、调度、FAS 选包、充电与日志。应用列表异步加载；包名是匹配依据，显示名称不参与调度。FAS 默认关闭，需打开总开关并选中应用；空列表不是“全部应用”。
+APP / WebUI 共用控制服务和配置，提供状态、调度、帧反馈选包、充电与日志。应用列表异步加载；包名是匹配依据，显示名称不参与调度。帧反馈默认关闭，需打开总开关并选中应用；空列表不是“全部应用”。
 
-FAS 在选中的前台应用上异步读取 `dumpsys gfxinfo <包名> framestats`，仅使用新增帧（最多最近 60 帧）的最慢耗时反馈。它测量的是 **Android UI 帧时间，不是视频解码帧、视频输出帧或全部 GPU 渲染路径**；没有有效新帧不能证明流畅，不能以此保证视频 0 掉帧。帧预算需匹配刷新率/场景，默认 16 ms 不适合所有应用。
+帧反馈在选中的前台应用上异步读取 `dumpsys gfxinfo <包名> framestats`，仅使用新增帧（最多最近 60 帧）的最慢耗时反馈。它测量的是 **Android UI 帧时间，不是视频解码帧、视频输出帧或全部 GPU 渲染路径**；没有有效新帧不能证明流畅，不能以此保证视频 0 掉帧。帧预算需匹配刷新率/场景，默认 16 ms 不适合所有应用。
 
 ### 充电控制
 
@@ -61,7 +61,7 @@ FAS 在选中的前台应用上异步读取 `dumpsys gfxinfo <包名> framestats
 
 ## 配置速查
 
-实际配置：`/data/adb/tempo/config.toml`；默认模板：[packaging/config.toml](packaging/config.toml)。`schema = 1`，未知字段会被拒绝；旧数据目录名 `tempo` 与程序名 `tempoctl` 仍沿用，不要自行改名。FAS 侧车 `fas.json`、预约 `charge_plan.json` 与主配置同目录，建议用界面维护，避免主配置与侧车互相覆盖。
+实际配置：`/data/adb/tempo/config.toml`；默认模板：[packaging/config.toml](packaging/config.toml)。`schema = 1`，未知字段会被拒绝；旧数据目录名 `tempo` 与程序名 `tempoctl` 仍沿用，不要自行改名。帧反馈侧车 `aegis-frame.json`、预约 `charge_plan.json` 与主配置同目录，建议用界面维护，避免主配置与侧车互相覆盖。
 
 下表默认值指**模块模板**，不是 Rust 内部缺省值；完整约束以 [config.rs](crates/tempo-core/src/config.rs) 的 `validate()` 为准。
 
@@ -76,8 +76,8 @@ FAS 在选中的前台应用上异步读取 `dumpsys gfxinfo <包名> framestats
 | 目标与可选上限 | `prime_cap_ratio=0.70`、`ime_cap_ratio=0.45` 约束调度目标档位，不是最高频率限制。`[control.cluster_cap_ratio]` 安装/开机时按真实簇拓扑自动生成（1 簇、2 簇、3 簇机型都各自适配，并清理不属于本机的旧键）；`1.0` 不施加省电上限，`0.5` 按硬件最高频率的 50% 向下贴档，不低于硬件最低频率。温控及外部限制仍有效。 |
 | 帧反馈 | `frame_slack_ms=3.0`、`frame_burst_ms=150`、`frame_burst_level=0.70`、`pressure_hold_ms=1000`：超预算余量、短时救援及持续压力保持 |
 | 启动保护 | `startup_guard_ms=20000`（5000–120000）：守护启动后的 cpufreq 只读期，不表示充电控制也暂停 |
-| `[scene]` | `reading_floor_tier` / `video_floor_tier` / `default_floor_tier` 默认 0，允许 0–5、按实际档位截断；`reading_packages` / `video_packages` / `ime_packages` 为分类包名列表，各最多 64 项，不等于 FAS 选包 |
-| `[fas]` | `enabled=false`、`apps=[]`（最多 64）、`frame_budget_ms=16.0`（6–40 ms）；侧车保存界面选包 |
+| `[aegis_app]` | `reading_floor_tier` / `video_floor_tier` / `default_floor_tier` 默认 0，允许 0–5、按实际档位截断；`reading_packages` / `video_packages` / `ime_packages` 为分类包名列表，各最多 64 项，不等于帧反馈选包 |
+| `[aegis_frame]` | `enabled=false`、`apps=[]`（最多 64）、`frame_budget_ms=16.0`（6–40 ms）；侧车保存界面选包 |
 | `[charge]` | `stop_at_percent=80`（50–100）、`resume_at_percent=70`（至少 20 且小于上限）；`temp_stop_c=45.0`、`temp_resume_c=40.0`（恢复温度必须低于停充温度） |
 | 满充证据 | `full_current_ma=100`（20–1000 mA）、`full_hold_seconds=9`（1–60 s）、可选 `full_voltage_mv`（3000–5000 mV，默认不配置） |
 | `[thermal]` | `guard_c=45.0`（20–80°C）：旧兼容字段；当前 daemon 不据此施加附加 CPU 上限，原厂硬件温控保持有效 |

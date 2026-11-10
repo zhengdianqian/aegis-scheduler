@@ -52,12 +52,12 @@
 - 守护无固定周期定时器；息屏后仅保留事件源（BPF ring、evdev、uevent、
   inotify），全部阻塞在 `epoll_wait`。
 
-## 5. FAS（帧感知，默认关闭）
+## 5. 帧反馈（Aegis Frame，默认关闭）
 
-- 默认 `[fas] enabled=false, apps=[]`：`status.fas.active=false`，不执行任何
+- 默认 `[aegis_frame] enabled=false, apps=[]`：`status.frame.active=false`，不执行任何
   `dumpsys gfxinfo`。
-- 将 `com.miui.notes` 写入 `/data/adb/tempo/fas.json` 并回到该应用：
-  `status.fas.active=true`，仅对白名单前台应用取帧。
+- 将 `com.miui.notes` 写入 `/data/adb/tempo/aegis-frame.json` 并回到该应用：
+  `status.frame.active=true`，仅对白名单前台应用取帧。
 - 清空白名单：下一次触摸事件重读 sidecar，`active=false`，即时关闭。
 - 白名单应用 `gfxinfo` 95th percentile 超过 16 ms 时抬频，2 s 事件节流。
 

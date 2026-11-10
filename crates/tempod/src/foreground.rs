@@ -7,7 +7,7 @@
 //! The probe already tracks the top-app task ids. On a foreground change (an
 //! event, never a clock) this resolver maps those ids to a process name by
 //! reading `/proc/<tid>/cmdline`, and caches the result. The package name feeds
-//! FAS eligibility and the runtime status; nothing here runs periodically.
+//! frame feedback eligibility and the runtime status; nothing here runs periodically.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -76,7 +76,7 @@ impl ForegroundResolver {
         let name = package.map(|name| name.split(':').next().unwrap_or(&name).to_owned());
         // An input method stealing the focused window is an overlay event, not
         // an app switch: keep the app behind it so IME show/hide cannot trigger
-        // foreground lifts or FAS churn.
+        // foreground lifts or frame feedback churn.
         if let Some(name) = name.as_deref() {
             if is_ime(name, self.imes.as_ref().unwrap()) {
                 return self.package.as_deref();

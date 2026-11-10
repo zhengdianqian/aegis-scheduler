@@ -2,7 +2,7 @@
 /* Copyright (C) 2026 默默的阿文 */
 
 /*
- * app.js —— 页面装配与渲染（总览 / 参数占位 / FAS / 充电占位 + 日志抽屉）。
+ * app.js —— 页面装配与渲染（总览 / 参数占位 / 帧反馈 / 充电占位 + 日志抽屉）。
  * 数据全部来自 Tempo.Api，页面不直接拼接 shell 命令。
  */
 (function (global) {
@@ -493,26 +493,26 @@
   }
 
   function renderAppRows() {
-    if (state.fasAppsLoading) {
+    if (state.frameAppsLoading) {
       return '<div class="applist__state"><span class="live-dot"></span>读取应用列表…</div>';
     }
-    if (state.fasAppsError) {
+    if (state.frameAppsError) {
       return '' +
         '<div class="applist__state applist__state--error">' +
-          '<span>' + escapeHtml(humanizeError(state.fasAppsError)) + '</span>' +
-          '<button class="ghost-btn ghost-btn--sm" data-action="fas-apps-retry">重试</button>' +
+          '<span>' + escapeHtml(humanizeError(state.frameAppsError)) + '</span>' +
+          '<button class="ghost-btn ghost-btn--sm" data-action="frame-apps-retry">重试</button>' +
         '</div>';
     }
-    if (!state.fasApps.length) {
+    if (!state.frameApps.length) {
       return '' +
         '<div class="applist__state applist__state--error">' +
           '<span>没有读取到任何已安装应用，请确认已授予应用列表权限。</span>' +
-          '<button class="ghost-btn ghost-btn--sm" data-action="fas-apps-retry">重新读取</button>' +
+          '<button class="ghost-btn ghost-btn--sm" data-action="frame-apps-retry">重新读取</button>' +
         '</div>';
     }
 
-    var query = state.fasQuery.trim().toLowerCase();
-    var apps = state.fasApps.filter(function (app) {
+    var query = state.frameQuery.trim().toLowerCase();
+    var apps = state.frameApps.filter(function (app) {
       if (!query) return true;
       return app.package.toLowerCase().indexOf(query) !== -1 ||
         appLabel(app).toLowerCase().indexOf(query) !== -1;
@@ -521,13 +521,13 @@
       return '<div class="applist__state">没有匹配的应用</div>';
     }
 
-    var more = apps.length > state.fasLimit;
-    return apps.slice(0, state.fasLimit).map(function (app) {
+    var more = apps.length > state.frameLimit;
+    return apps.slice(0, state.frameLimit).map(function (app) {
       var label = appLabel(app);
-      var selected = state.fas.packages.indexOf(app.package) !== -1;
+      var selected = state.frame.packages.indexOf(app.package) !== -1;
       var kind = app.type === 'system' ? '系统应用' : '用户应用';
       return '' +
-        '<button class="approw' + (selected ? ' is-selected' : '') + '" data-pkg="' + escapeHtml(app.package) + '" aria-pressed="' + selected + '"' + (state.fas.enabled ? '' : ' disabled') + '>' +
+        '<button class="approw' + (selected ? ' is-selected' : '') + '" data-pkg="' + escapeHtml(app.package) + '" aria-pressed="' + selected + '"' + (state.frame.enabled ? '' : ' disabled') + '>' +
           '<span class="appicon" style="--h:' + appHue(app.package) + '">' + escapeHtml(appInitial(app, label)) + '</span>' +
           '<span class="appmeta">' +
             '<b>' + escapeHtml(label) + '</b>' +
@@ -535,16 +535,16 @@
           '</span>' +
           '<span class="mini-switch" aria-hidden="true"><span></span></span>' +
         '</button>';
-    }).join('') + (more ? '<button class="ghost-btn" data-action="fas-more">显示更多（已显示 ' + state.fasLimit + ' / ' + apps.length + '）</button>' : '');
+    }).join('') + (more ? '<button class="ghost-btn" data-action="frame-more">显示更多（已显示 ' + state.frameLimit + ' / ' + apps.length + '）</button>' : '');
   }
 
-  function renderFas() {
-    var fas = state.fas;
-    var count = fas.packages.length;
+  function renderFrame() {
+    var frame = state.frame;
+    var count = frame.packages.length;
     var statusLine;
-    if (!state.fasLoaded) {
-      statusLine = state.fasLoading ? '正在读取 FAS 设置…' : 'FAS 设置不可用';
-    } else if (!fas.enabled) {
+    if (!state.frameLoaded) {
+      statusLine = state.frameLoading ? '正在读取帧反馈设置…' : '帧反馈设置不可用';
+    } else if (!frame.enabled) {
       statusLine = '总开关关闭';
     } else if (!count) {
       statusLine = '总开关开启，未选择应用';
@@ -553,39 +553,39 @@
     }
 
     return '' +
-      '<section class="card fas-hero">' +
-        '<div class="fas-hero__row">' +
-          '<div class="fas-hero__text">' +
-            '<h2>FAS 帧感知</h2>' +
+      '<section class="card frame-hero">' +
+        '<div class="frame-hero__row">' +
+          '<div class="frame-hero__text">' +
+            '<h2>Aegis 帧反馈</h2>' +
             '<p>帧感知会略微增加功耗，只对你选中的应用开启</p>' +
           '</div>' +
-          '<button class="switch' + (fas.enabled ? ' is-on' : '') + '" data-action="fas-toggle" role="switch" aria-checked="' + fas.enabled + '" aria-label="FAS 总开关"' + (state.fasLoaded && !state.fasLoading ? '' : ' disabled') + '><span></span></button>' +
+          '<button class="switch' + (frame.enabled ? ' is-on' : '') + '" data-action="frame-toggle" role="switch" aria-checked="' + frame.enabled + '" aria-label="帧反馈总开关"' + (state.frameLoaded && !state.frameLoading ? '' : ' disabled') + '><span></span></button>' +
         '</div>' +
-        '<div class="fas-hint' + (fas.enabled && !count ? ' fas-hint--warn' : '') + '">' + escapeHtml(statusLine) + '</div>' +
+        '<div class="frame-hint' + (frame.enabled && !count ? ' frame-hint--warn' : '') + '">' + escapeHtml(statusLine) + '</div>' +
       '</section>' +
-      '<section class="card fas-apps' + (fas.enabled ? '' : ' is-off') + '">' +
-        '<div class="fas-apps__head">' +
+      '<section class="card frame-apps' + (frame.enabled ? '' : ' is-off') + '">' +
+        '<div class="frame-apps__head">' +
           '<h2>应用选择</h2>' +
-          '<span id="fas-count">已选 ' + count + '</span>' +
+          '<span id="frame-count">已选 ' + count + '</span>' +
         '</div>' +
-        (state.fasLoadError
+        (state.frameLoadError
           ? '<div class="applist__state applist__state--error">' +
-              '<span>读取 FAS 设置失败：' + escapeHtml(humanizeError(state.fasLoadError)) + '</span>' +
-              '<button class="ghost-btn ghost-btn--sm" data-action="fas-reload">重试</button>' +
+              '<span>读取帧反馈设置失败：' + escapeHtml(humanizeError(state.frameLoadError)) + '</span>' +
+              '<button class="ghost-btn ghost-btn--sm" data-action="frame-reload">重试</button>' +
             '</div>'
           : '') +
         '<label class="searchbox">' +
           '<span class="searchbox__icon">' + ICONS.search + '</span>' +
-          '<input id="fas-search" type="search" placeholder="搜索应用或包名" autocomplete="off" spellcheck="false" value="' + escapeHtml(state.fasQuery) + '"' + (fas.enabled ? '' : ' disabled') + '>' +
+          '<input id="frame-search" type="search" placeholder="搜索应用或包名" autocomplete="off" spellcheck="false" value="' + escapeHtml(state.frameQuery) + '"' + (frame.enabled ? '' : ' disabled') + '>' +
         '</label>' +
-        '<div class="applist" id="fas-list">' + renderAppRows() + '</div>' +
-        '<div class="fas-note">没有勾选任何应用时，FAS 不产生任何帧感知开销。</div>' +
-        '<div class="fas-spec">' + escapeHtml(
-          state.fasError
-            ? '保存失败：' + humanizeError(state.fasError)
-            : state.fasSaving
+        '<div class="applist" id="frame-list">' + renderAppRows() + '</div>' +
+        '<div class="frame-note">没有勾选任何应用时，帧反馈不产生任何额外开销。</div>' +
+        '<div class="frame-spec">' + escapeHtml(
+          state.frameError
+            ? '保存失败：' + humanizeError(state.frameError)
+            : state.frameSaving
               ? '正在保存…'
-              : state.fasNote || '修改会保存并回读确认；守护是否采纳请查看运行状态与日志。'
+              : state.frameNote || '修改会保存并回读确认；守护是否采纳请查看运行状态与日志。'
         ) + '</div>' +
       '</section>';
   }
@@ -974,7 +974,7 @@
       .replace(/Java exception was raised during method invocation/gi, '控制通道调用失败')
       .replace(/^(?:java\.lang\.)?RuntimeException:\s*/i, '')
       .replace(/tempoctl/gi, '控制服务')
-      .replace(/config\.toml\.new|config\.toml|device\.toml|fas\.json|charge_plan\.json/gi, '设置数据')
+      .replace(/config\.toml\.new|config\.toml|device\.toml|aegis-frame.json|charge_plan\.json/gi, '设置数据')
       .replace(/schema\s*=\s*\d+/gi, '')
       .replace(/schema\s*\d+/gi, '');
   }
@@ -1645,7 +1645,7 @@
     var tabs = [
       { id: 'overview', label: '总览', icon: ICONS.gauge },
       { id: 'config', label: '参数', icon: ICONS.sliders },
-      { id: 'fas', label: 'FAS', icon: ICONS.flash },
+      { id: 'frame', label: '帧反馈', icon: ICONS.flash },
       { id: 'power', label: '充电', icon: ICONS.battery }
     ];
     return '' +
@@ -1674,21 +1674,21 @@
     logLines: [],
     logFile: null,
     logError: null,
-    fas: { enabled: false, packages: [] },
-    fasApps: [],
-    fasAppsLoaded: false,
-    fasAppsLoading: false,
-    fasAppsError: null,
-    fasLoaded: false,
-    fasLoading: false,
-    fasLoadError: null,
-    fasSaving: false,
-    fasDirty: false,
-    fasEditRevision: 0,
-    fasNote: null,
-    fasError: null,
-    fasQuery: '',
-    fasLimit: 60,
+    frame: { enabled: false, packages: [] },
+    frameApps: [],
+    frameAppsLoaded: false,
+    frameAppsLoading: false,
+    frameAppsError: null,
+    frameLoaded: false,
+    frameLoading: false,
+    frameLoadError: null,
+    frameSaving: false,
+    frameDirty: false,
+    frameEditRevision: 0,
+    frameNote: null,
+    frameError: null,
+    frameQuery: '',
+    frameLimit: 60,
     power: {
       snapshot: null,
       error: null,
@@ -1773,8 +1773,8 @@
           '</section>' +
           renderFooter({ module: null });
       }
-    } else if (state.tab === 'fas') {
-      body = renderFas();
+    } else if (state.tab === 'frame') {
+      body = renderFrame();
     } else if (state.tab === 'config') {
       body = renderConfigPage();
     } else if (state.tab === 'power') {
@@ -1795,26 +1795,26 @@
     layoutTabPill(!!state.pill);
   }
 
-  function updateFasList() {
-    var list = document.getElementById('fas-list');
+  function updateFrameList() {
+    var list = document.getElementById('frame-list');
     if (list) list.innerHTML = renderAppRows();
-    var count = document.getElementById('fas-count');
-    if (count) count.textContent = '已选 ' + state.fas.packages.length;
+    var count = document.getElementById('frame-count');
+    if (count) count.textContent = '已选 ' + state.frame.packages.length;
   }
 
   function ensureApps(force) {
-    if (state.fasAppsLoading) return;
-    if (state.fasAppsLoaded && !force) return;
-    state.fasAppsLoading = true;
-    state.fasAppsError = null;
-    if (state.tab === 'fas') updateFasList();
+    if (state.frameAppsLoading) return;
+    if (state.frameAppsLoaded && !force) return;
+    state.frameAppsLoading = true;
+    state.frameAppsError = null;
+    if (state.tab === 'frame') updateFrameList();
 
     var finish = function (error, apps) {
-      state.fasAppsLoading = false;
-      state.fasApps = apps || [];
-      state.fasAppsError = error || null;
-      state.fasAppsLoaded = !error;
-      if (state.tab === 'fas') updateFasList();
+      state.frameAppsLoading = false;
+      state.frameApps = apps || [];
+      state.frameAppsError = error || null;
+      state.frameAppsLoaded = !error;
+      if (state.tab === 'frame') updateFrameList();
     };
 
     api.queryPackages(force).then(function (result) {
@@ -1852,87 +1852,87 @@
   }
 
   function toggleApp(pkg) {
-    if (!state.fasLoaded || state.fasLoading || !state.fas.enabled) return;
-    var index = state.fas.packages.indexOf(pkg);
-    if (index === -1 && state.fas.packages.length >= 64) {
-      state.fasError = '最多选择 64 个应用';
-      updateFasStatus();
+    if (!state.frameLoaded || state.frameLoading || !state.frame.enabled) return;
+    var index = state.frame.packages.indexOf(pkg);
+    if (index === -1 && state.frame.packages.length >= 64) {
+      state.frameError = '最多选择 64 个应用';
+      updateFrameStatus();
       return;
     }
-    if (index === -1) state.fas.packages.push(pkg);
-    else state.fas.packages.splice(index, 1);
+    if (index === -1) state.frame.packages.push(pkg);
+    else state.frame.packages.splice(index, 1);
     var rows = document.querySelectorAll('[data-pkg]');
     for (var i = 0; i < rows.length; i += 1) {
       if (rows[i].dataset.pkg !== pkg) continue;
       rows[i].classList.toggle('is-selected', index === -1);
       rows[i].setAttribute('aria-pressed', String(index === -1));
     }
-    updateFasStatus();
-    persistFas();
+    updateFrameStatus();
+    persistFrame();
   }
 
-  function ensureFasLoaded(force) {
-    if (state.fasLoading || state.fasSaving || state.fasDirty) return;
-    if (state.fasLoaded && !force) return;
-    var revision = state.fasEditRevision;
-    state.fasLoading = true;
-    state.fasLoadError = null;
-    if (state.tab === 'fas') render();
-    api.loadFas().then(function (result) {
-      state.fasLoading = false;
-      if (state.fasDirty || state.fasSaving || revision !== state.fasEditRevision) return;
+  function ensureFrameLoaded(force) {
+    if (state.frameLoading || state.frameSaving || state.frameDirty) return;
+    if (state.frameLoaded && !force) return;
+    var revision = state.frameEditRevision;
+    state.frameLoading = true;
+    state.frameLoadError = null;
+    if (state.tab === 'frame') render();
+    api.loadFrame().then(function (result) {
+      state.frameLoading = false;
+      if (state.frameDirty || state.frameSaving || revision !== state.frameEditRevision) return;
       if (!result.error) {
-        state.fas.enabled = !!result.enabled;
-        state.fas.packages = result.packages || [];
-        state.fasLoaded = true;
+        state.frame.enabled = !!result.enabled;
+        state.frame.packages = result.packages || [];
+        state.frameLoaded = true;
       } else {
-        state.fasLoaded = false;
+        state.frameLoaded = false;
       }
-      state.fasLoadError = result.error || null;
-      if (state.tab === 'fas') render();
+      state.frameLoadError = result.error || null;
+      if (state.tab === 'frame') render();
     }).catch(function (error) {
-      state.fasLoading = false;
-      if (state.fasDirty || state.fasSaving || revision !== state.fasEditRevision) return;
-      state.fasLoaded = false;
-      state.fasLoadError = String((error && error.message) || error);
-      if (state.tab === 'fas') render();
+      state.frameLoading = false;
+      if (state.frameDirty || state.frameSaving || revision !== state.frameEditRevision) return;
+      state.frameLoaded = false;
+      state.frameLoadError = String((error && error.message) || error);
+      if (state.tab === 'frame') render();
     });
   }
 
-  function updateFasStatus() {
-    var count = document.getElementById('fas-count');
-    if (count) count.textContent = '已选 ' + state.fas.packages.length;
-    var hint = document.querySelector('.fas-hint');
+  function updateFrameStatus() {
+    var count = document.getElementById('frame-count');
+    if (count) count.textContent = '已选 ' + state.frame.packages.length;
+    var hint = document.querySelector('.frame-hint');
     if (hint) {
-      hint.textContent = !state.fas.enabled ? '总开关关闭' : '总开关开启，已选 ' + state.fas.packages.length + ' 个应用';
-      hint.classList.toggle('fas-hint--warn', state.fas.enabled && !state.fas.packages.length);
+      hint.textContent = !state.frame.enabled ? '总开关关闭' : '总开关开启，已选 ' + state.frame.packages.length + ' 个应用';
+      hint.classList.toggle('frame-hint--warn', state.frame.enabled && !state.frame.packages.length);
     }
-    var note = document.querySelector('.fas-spec');
-    if (note) note.textContent = state.fasError ? '保存失败：' + humanizeError(state.fasError) : state.fasSaving ? '正在保存…' : state.fasNote || '';
+    var note = document.querySelector('.frame-spec');
+    if (note) note.textContent = state.frameError ? '保存失败：' + humanizeError(state.frameError) : state.frameSaving ? '正在保存…' : state.frameNote || '';
   }
 
-  var fasSearchTimer = null;
-  var fasSaveTimer = null;
+  var frameSearchTimer = null;
+  var frameSaveTimer = null;
 
-  /** FAS 写入侧车文件，做了 350ms 合并，避免连续勾选反复写盘。 */
-  function persistFas() {
+  /** 帧反馈写入侧车文件，做了 350ms 合并，避免连续勾选反复写盘。 */
+  function persistFrame() {
     if (!api) return;
-    global.clearTimeout(fasSaveTimer);
-    state.fasSaving = true;
-    state.fasDirty = true;
-    var revision = ++state.fasEditRevision;
-    state.fasNote = '正在保存…';
-    state.fasError = null;
-    updateFasStatus();
-    fasSaveTimer = global.setTimeout(function () {
-      var snapshot = { enabled: state.fas.enabled, packages: state.fas.packages.slice() };
-      api.saveFas(snapshot).then(function (result) {
-        if (revision !== state.fasEditRevision) return;
-        state.fasSaving = false;
-        state.fasDirty = !!result.error;
-        state.fasError = result.error;
-        state.fasNote = result.error ? '保存失败：' + humanizeError(result.error) : '侧车已保存并回读确认；尚未确认守护采纳，请查看运行状态与日志';
-        if (state.tab === 'fas') updateFasStatus();
+    global.clearTimeout(frameSaveTimer);
+    state.frameSaving = true;
+    state.frameDirty = true;
+    var revision = ++state.frameEditRevision;
+    state.frameNote = '正在保存…';
+    state.frameError = null;
+    updateFrameStatus();
+    frameSaveTimer = global.setTimeout(function () {
+      var snapshot = { enabled: state.frame.enabled, packages: state.frame.packages.slice() };
+      api.saveFrame(snapshot).then(function (result) {
+        if (revision !== state.frameEditRevision) return;
+        state.frameSaving = false;
+        state.frameDirty = !!result.error;
+        state.frameError = result.error;
+        state.frameNote = result.error ? '保存失败：' + humanizeError(result.error) : '侧车已保存并回读确认；尚未确认守护采纳，请查看运行状态与日志';
+        if (state.tab === 'frame') updateFrameStatus();
       });
     }, 350);
   }
@@ -2144,7 +2144,7 @@
     var action = target.dataset.action;
 
     if (action === 'refresh') {
-      if (state.tab === 'fas') ensureApps(true);
+      if (state.tab === 'frame') ensureApps(true);
       else refresh();
       return;
     }
@@ -2162,24 +2162,24 @@
       fetchLogs();
       return;
     }
-    if (action === 'fas-toggle') {
-      if (!state.fasLoaded || state.fasLoading) return;
-      state.fas.enabled = !state.fas.enabled;
+    if (action === 'frame-toggle') {
+      if (!state.frameLoaded || state.frameLoading) return;
+      state.frame.enabled = !state.frame.enabled;
       render();
-      persistFas();
+      persistFrame();
       return;
     }
-    if (action === 'fas-more') {
-      state.fasLimit += 60;
-      updateFasList();
+    if (action === 'frame-more') {
+      state.frameLimit += 60;
+      updateFrameList();
       return;
     }
-    if (action === 'fas-apps-retry') {
+    if (action === 'frame-apps-retry') {
       ensureApps(true);
       return;
     }
-    if (action === 'fas-reload') {
-      ensureFasLoaded(true);
+    if (action === 'frame-reload') {
+      ensureFrameLoaded(true);
       return;
     }
     if (action === 'power-refresh') {
@@ -2285,9 +2285,9 @@
     }
     if (target.dataset.tab && target.dataset.tab !== state.tab) {
       state.tab = target.dataset.tab;
-      if (state.tab === 'fas') {
+      if (state.tab === 'frame') {
         ensureApps(api.kind() !== 'app');
-        ensureFasLoaded(true);
+        ensureFrameLoaded(true);
       }
       if (state.tab === 'config') ensureConfig();
       if (state.tab === 'power') {
@@ -2306,12 +2306,12 @@
   function onInput(event) {
     var target = event.target;
     if (!target) return;
-    if (target.id === 'fas-search') {
-      state.fasQuery = target.value;
-      global.clearTimeout(fasSearchTimer);
-      fasSearchTimer = global.setTimeout(function () {
-        state.fasLimit = 60;
-        if (state.tab === 'fas') updateFasList();
+    if (target.id === 'frame-search') {
+      state.frameQuery = target.value;
+      global.clearTimeout(frameSearchTimer);
+      frameSearchTimer = global.setTimeout(function () {
+        state.frameLimit = 60;
+        if (state.tab === 'frame') updateFrameList();
       }, 180);
       return;
     }
@@ -2327,7 +2327,7 @@
       stopPowerPolling();
       return;
     }
-    ensureFasLoaded(true);
+    ensureFrameLoaded(true);
     if (state.tab === 'power') startPowerPolling();
   }
 
@@ -2371,15 +2371,15 @@
     document.addEventListener('visibilitychange', onVisibilityChange);
     global.addEventListener('aegisvisibilitychange', onVisibilityChange);
     global.addEventListener('aegispackageschange', function () {
-      state.fasAppsLoaded = false;
-      if (state.tab === 'fas') ensureApps(true);
+      state.frameAppsLoaded = false;
+      if (state.tab === 'frame') ensureApps(true);
     });
 
     refresh();
     startOverviewPolling();
   }
 
-  // 参数/FAS 写入成功后调用 Tempo.App.refreshLogs()，确保日志不是旧内容。
+  // 参数/帧反馈写入成功后调用 Tempo.App.refreshLogs()，确保日志不是旧内容。
   Tempo.App = {
     refresh: refresh,
     refreshLogs: function () {

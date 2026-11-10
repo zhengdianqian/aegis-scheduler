@@ -17,11 +17,11 @@ function sandbox() {
     let source = fs.readFileSync(path.join(__dirname, '../src', name), 'utf8');
     if (name === 'app.js') {
       source = source.replace('  function render() {', '  function render() { return;');
-      source = source.replace('  // 参数/FAS 写入成功后调用', `
+      source = source.replace('  // 参数/帧反馈写入成功后调用', `
       global.testConfig = { state: state, fields: clusterCapFields, value: cfgFieldValue,
         validate: validateConfigModel, render: renderClusterCaps, input: onCfgFieldInput,
         reset: resetCfgGroup, sync: syncConfigInputs, paths: CFG_WRITE_PATHS };
-      // 参数/FAS 写入成功后调用`);
+      // 参数/帧反馈写入成功后调用`);
     }
     vm.runInContext(source, context, { filename: name });
   }
@@ -73,13 +73,13 @@ cpu0 = 0.5
 cpu99 = 0.375
 [control.role_cap]
 prime = 0.8
-[scene]
+[aegis_app]
 custom = [1, 2]
 [charge]
 full_current_ma = 123
 full_hold_seconds = 15
 full_voltage_mv = 4300
-[fas]
+[aegis_frame]
 enabled = true
 apps = ["example.app"]
 `);
@@ -92,8 +92,8 @@ apps = ["example.app"]
   assert.equal(saved.control.cluster_cap_ratio.cpu99, 0.375);
   assert.equal(saved.control.startup_guard_ms, 23456);
   assert.deepEqual(plain(saved.control.role_cap), plain(doc.control.role_cap));
-  assert.deepEqual(plain(saved.scene), plain(doc.scene));
-  assert.deepEqual(plain(saved.fas), plain(doc.fas));
+  assert.deepEqual(plain(saved.aegis_app), plain(doc.aegis_app));
+  assert.deepEqual(plain(saved.aegis_frame), plain(doc.aegis_frame));
   for (const key of ['full_current_ma', 'full_hold_seconds', 'full_voltage_mv']) assert.equal(saved.charge[key], doc.charge[key]);
   assert.deepEqual(plain(T.parse(T.stringify({ control: { cluster_cap_ratio: {} } }))), { control: { cluster_cap_ratio: {} } });
 });

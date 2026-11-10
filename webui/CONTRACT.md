@@ -160,7 +160,7 @@ tempoctl --config /data/adb/tempo/config.toml status --socket /data/adb/tempo/ru
 
 字段名与 `config.rs` 完全一致。守护对配置开启未知字段拒绝，因此客户端**不得凭空新增键**；
 但设备上已存在、而界面未暴露的合法字段（如 `floor_exit_ratio`、`fg_fast_ms`、`tier_table_max`、
-`startup_guard_ms`、`[scene]` 等）必须在写回时原样保留，不能因为保存一次参数就丢配置。
+`startup_guard_ms`、`[aegis_app]` 等）必须在写回时原样保留，不能因为保存一次参数就丢配置。
 所有数值均为“单一自适应模式”参数，不提供模式切换、不提供应用白名单。
 
 ### 4.1 分组、默认值、合法区间
@@ -199,12 +199,12 @@ tempoctl --config /data/adb/tempo/config.toml status --socket /data/adb/tempo/ru
 | thermal | `guard_c` | 45.0 | 20–80 | °C | 数字 |
 | thermal | `profile` | `auto` | 非空字符串 | — | 文本 |
 | ui | `language` | `zh` | 非空 | — | 下拉（zh/en） |
-| fas | `enabled` | false | bool | — | 总开关（默认关） |
-| fas | `packages` | `[]` | 包名数组 | — | 逐应用开关，仅勾选应用参与 |
+| frame | `enabled` | false | bool | — | 总开关（默认关） |
+| frame | `packages` | `[]` | 包名数组 | — | 逐应用开关，仅勾选应用参与 |
 | 顶层 | `schema` | 1 | 必须 1 | — | 只读 |
 | daemon | `profile_path` | `/data/adb/tempo/device.toml` | 非空 | 路径 | 只读 |
 
-`[fas]` 语义：默认关闭；关闭或 `packages` 为空时 FAS 完全不工作；仅对 `packages` 内应用启用帧感知；不提供 only/exclude 模式。字段名为提案，最终以 `behavior-spec.md` 为准。
+`[aegis_frame]` 语义：默认关闭；关闭或 `packages` 为空时帧反馈完全不工作；仅对 `packages` 内应用启用帧感知；不提供 only/exclude 模式。字段名为提案，最终以 `behavior-spec.md` 为准。
 
 #### 4.1.1 预约充电侧车（`/data/adb/tempo/charge_plan.json`）
 
@@ -344,13 +344,13 @@ UI 提供“恢复上一份配置”：`cp -f CFG_BAK CFG` + 回读。仅在 `CF
 技术：原生 JS（classic scripts）+ CSS，无构建依赖、无外部 CDN、无第三方 UI 框架，`file://` 直接可开；
 资源全部自绘（内联 SVG），配色与组件命名自有。
 
-导航：顶部标题 + 底部四页签（总览 / 参数 / FAS / 充电）+ 可关闭的日志抽屉。
+导航：顶部标题 + 底部四页签（总览 / 参数 / 帧反馈 / 充电）+ 可关闭的日志抽屉。
 
 | 页 | 内容 | 数据源 |
 |---|---|---|
 | 总览 | 运行状态卡（版本/平台/静默/运行时长）、按运行时实际簇数动态渲染的频率卡（角色、当前频率、上限、近 0.5s 采样占用、前台）、厂商调度屏蔽的中性提示、刷新按钮 | `status`（含 `clusters` / `actual_freq_khz`）+ `/proc/stat` + `module.prop` |
 | 参数 | 四组：静默与压缩、触摸与帧、换档与角色上限、事件采样；滑杆/数字框、即时校验、恢复默认（分组）、保存栏、回滚上一份 | `config.get` → TOML→JSON |
-| FAS | 总开关（默认关）、逐应用开关（名称/包名/图标/搜索）、未选应用即不工作的说明 | `pm list packages` + `config.get`（`[fas]`） |
+| 帧反馈 | 总开关（默认关）、逐应用开关（名称/包名/图标/搜索）、未选应用即不工作的说明 | `pm list packages` + `config.get`（`[aegis_frame]`） |
 | 充电 | 实时状态卡（电量、是否充电、是否被本模块停充、距上限、预约时段、电池温度）、充电上限与恢复阈值（选择 100% 时先涓流，真正充满后停充并保持，需重新插电恢复）、停充/恢复温度、预约时段编辑 | `config.get` + `power.get` + `charge_plan.json` |
 | 日志抽屉 | 运行日志开关、200 行尾部、上限 300 行滚动缓冲、切换参数后自动刷新；可完全关闭 | 日志文件 / `log.tail` |
 
@@ -365,7 +365,7 @@ UI 提供“恢复上一份配置”：`cp -f CFG_BAK CFG` + 回读。仅在 `CF
 |---|---|---|
 | 状态 | 模块状态/版本/静默、按运行时簇数动态展示的频率与上限、刷新、root 状态 | 增加 root 授权状态与“重新检测” |
 | 参数 | 同四组参数 + 滑杆 + 保存/回滚 | 保存前调用同一 `validate` |
-| FAS | 总开关 + 应用列表逐应用开关 | 使用 PackageManager 取真实名称与图标 |
+| 帧反馈 | 总开关 + 应用列表逐应用开关 | 使用 PackageManager 取真实名称与图标 |
 | 充电 | 阈值/温度/预约 | 同上 |
 | 日志 | 尾部日志 + 级别过滤 + 复制分享 | 增加“分享日志” |
 

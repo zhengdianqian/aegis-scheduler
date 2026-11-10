@@ -57,6 +57,27 @@ sync_cluster_caps() {
     mv "$tmp" "$cfg" && chmod 644 "$cfg"
 }
 
+# 历史数据迁移：旧版本使用 [scene] / [fas] 段名与 fas.json 侧车。升级后统一改写为
+# [aegis_app] / [aegis_frame] 与 aegis-frame.json；只在缺少新文件时迁移一次。
+migrate_legacy_layout() {
+    cfg=$1
+    dir=$2
+    if [ -f "$cfg" ] && grep -qE '^\[(scene|fas)\][[:space:]]*$' "$cfg"; then
+        tmp="$cfg.migrate.$$"
+        awk '
+            /^\[scene\][[:space:]]*$/ { print "[aegis_app]"; next }
+            /^\[fas\][[:space:]]*$/ { print "[aegis_frame]"; next }
+            { print }
+        ' "$cfg" > "$tmp" && mv "$tmp" "$cfg" && chmod 644 "$cfg"
+        rm -f "$tmp"
+        log "legacy config sections migrated to aegis_app / aegis_frame"
+    fi
+    if [ ! -f "$dir/aegis-frame.json" ] && [ -f "$dir/fas.json" ]; then
+        mv "$dir/fas.json" "$dir/aegis-frame.json" && chmod 644 "$dir/aegis-frame.json"
+        log "legacy frame sidecar migrated to aegis-frame.json"
+    fi
+}
+
 install_manager() {
     umask 077
     apk="$MODDIR/app/AegisManager.apk"
@@ -196,6 +217,9 @@ chmod 644 "$PROFILE"
 sync_cluster_caps "$DATA/config.toml" "$PROFILE"
 
 chmod 755 "$BIN" "$MODDIR/bin/tempoctl" 2>/dev/null
+
+# 升级兼容：把旧版本写下的段名与侧车改名到当前布局，必须在配置校验之前完成。
+migrate_legacy_layout "$DATA/config.toml" "$DATA"
 
 if ! "$BIN" --check --config "$DATA/config.toml" --profile "$PROFILE" > /dev/null 2>&1; then
     if [ -f "$DATA/config.toml.bak" ] && \

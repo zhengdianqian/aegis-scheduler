@@ -409,14 +409,14 @@ body::before {
 
 .bar--fg i { background: linear-gradient(90deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.55)); }
 
-/* ---------- FAS ---------- */
+/* ---------- 帧反馈 ---------- */
 
-.fas-hero { padding: 18px 17px 15px; }
+.frame-hero { padding: 18px 17px 15px; }
 
-.fas-hero__row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.frame-hero__row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 
-.fas-hero__text h2 { margin: 0; font-size: 16.5px; font-weight: 620; }
-.fas-hero__text p { margin: 4px 0 0; font-size: 11.8px; color: var(--muted); line-height: 1.55; }
+.frame-hero__text h2 { margin: 0; font-size: 16.5px; font-weight: 620; }
+.frame-hero__text p { margin: 4px 0 0; font-size: 11.8px; color: var(--muted); line-height: 1.55; }
 
 .switch {
   flex: none;
@@ -449,7 +449,7 @@ body::before {
 
 .switch.is-on span { transform: translateX(21px); background: #0c1824; }
 
-.fas-hint {
+.frame-hint {
   margin-top: 13px;
   padding-top: 12px;
   border-top: 1px solid var(--line);
@@ -457,15 +457,15 @@ body::before {
   color: var(--muted);
 }
 
-.fas-hint--warn { color: #ffdca8; }
+.frame-hint--warn { color: #ffdca8; }
 
-.fas-apps { padding: 15px 14px 14px; }
-.fas-apps.is-off .applist,
-.fas-apps.is-off .fas-note { opacity: 0.45; }
+.frame-apps { padding: 15px 14px 14px; }
+.frame-apps.is-off .applist,
+.frame-apps.is-off .frame-note { opacity: 0.45; }
 
-.fas-apps__head { display: flex; align-items: baseline; justify-content: space-between; padding: 0 2px; }
-.fas-apps__head h2 { margin: 0; font-size: 14px; font-weight: 600; }
-.fas-apps__head span { font-size: 11.5px; color: var(--faint); }
+.frame-apps__head { display: flex; align-items: baseline; justify-content: space-between; padding: 0 2px; }
+.frame-apps__head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.frame-apps__head span { font-size: 11.5px; color: var(--faint); }
 
 .searchbox {
   display: flex;
@@ -595,7 +595,7 @@ body::before {
 
 .approw.is-selected .mini-switch span { transform: translateX(16px); background: #c9fff5; }
 
-.fas-note {
+.frame-note {
   margin-top: 11px;
   padding-top: 11px;
   border-top: 1px solid var(--line);
@@ -604,7 +604,7 @@ body::before {
   line-height: 1.6;
 }
 
-.fas-spec {
+.frame-spec {
   margin-top: 6px;
   font-size: 10.5px;
   color: rgba(110, 130, 156, 0.75);

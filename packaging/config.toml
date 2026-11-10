@@ -12,7 +12,7 @@ profile_path = "/data/adb/tempo/profile/device.toml"
 runtime_quantum_us = 250000
 demand_step = 0.10
 screen_path = ""
-# frame_stride 保留于 schema，当前 gfxinfo FAS 不以它抽帧。
+# frame_stride 保留于 schema，当前 gfxinfo 帧反馈不以它抽帧。
 frame_stride = 2
 quiet_decay_ms = 60
 
@@ -80,7 +80,7 @@ demand_smooth_ms = 200
 # 比例需 >0 且 <=1。0.5 = 硬件最高频率的 50%，向下对齐 OPP；低于硬件最低频率时夹到最低频率。
 [control.cluster_cap_ratio]
 
-[scene]
+[aegis_app]
 # 场景地板为档位索引。阅读/视频连续至少 3 次有效超预算反馈才提高自适应地板；
 # 健康反馈重置连续计数，场景改变重置自适应地板；不保证解码或显示零掉帧。
 reading_floor_tier = 0
@@ -133,7 +133,7 @@ down_rate_limit_us = 0
 # 被厂商或其它模块改回默认时的补写周期；0 = 只在启动/重载时写一次。
 reapply_ms = 60000
 
-[fas]
+[aegis_frame]
 # 总开关开启且前台包被选中才采样；空列表不代表所有应用。
 enabled = false
 apps = []

@@ -53,8 +53,8 @@ pub struct Config {
     pub control: ControlConfig,
     pub charge: ChargeConfig,
     pub thermal: ThermalConfig,
-    pub fas: FasConfig,
-    pub scene: SceneConfig,
+    pub aegis_frame: AegisFrameConfig,
+    pub aegis_app: AegisAppConfig,
     pub governor: GovernorConfig,
     pub ui: UiConfig,
 }
@@ -78,11 +78,11 @@ pub struct GovernorConfig {
     pub reapply_ms: u64,
 }
 
-/// FAS is opt-in per application. The default is fully off: an empty list means
-/// FAS never runs, not "every application".
+/// Frame feedback is opt-in per application. The default is fully off: an empty
+/// list means frame feedback never runs, not "every application".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct FasConfig {
+pub struct AegisFrameConfig {
     pub enabled: bool,
     pub apps: Vec<String>,
     pub frame_budget_ms: f32,
@@ -178,12 +178,12 @@ pub struct ControlConfig {
     pub demand_smooth_ms: u64,
 }
 
-/// Per-scene floor calibration. Reading and video floors are tier indices into
-/// the per-cluster ladder; the controller raises a floor automatically if an
-/// over-budget frame is seen (the automatic form of "walk down to zero drops").
+/// Per-app-class floor calibration. Reading and video floors are tier indices
+/// into the per-cluster ladder; the controller raises a floor automatically if
+/// an over-budget frame is seen (the automatic form of "walk down to zero drops").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct SceneConfig {
+pub struct AegisAppConfig {
     pub reading_floor_tier: usize,
     pub video_floor_tier: usize,
     pub default_floor_tier: usize,
@@ -249,8 +249,8 @@ impl Default for Config {
             control: ControlConfig::default(),
             charge: ChargeConfig::default(),
             thermal: ThermalConfig::default(),
-            fas: FasConfig::default(),
-            scene: SceneConfig::default(),
+            aegis_frame: AegisFrameConfig::default(),
+            aegis_app: AegisAppConfig::default(),
             governor: GovernorConfig::default(),
             ui: UiConfig::default(),
         }
@@ -360,7 +360,7 @@ impl Default for ControlConfig {
     }
 }
 
-impl Default for SceneConfig {
+impl Default for AegisAppConfig {
     fn default() -> Self {
         Self {
             reading_floor_tier: 0,
@@ -409,7 +409,7 @@ impl Default for RoleCaps {
     }
 }
 
-impl Default for FasConfig {
+impl Default for AegisFrameConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -679,21 +679,23 @@ impl Config {
         }
 
         for (name, value) in [
-            ("reading_floor_tier", self.scene.reading_floor_tier),
-            ("video_floor_tier", self.scene.video_floor_tier),
-            ("default_floor_tier", self.scene.default_floor_tier),
+            ("reading_floor_tier", self.aegis_app.reading_floor_tier),
+            ("video_floor_tier", self.aegis_app.video_floor_tier),
+            ("default_floor_tier", self.aegis_app.default_floor_tier),
         ] {
             if value > 5 {
-                bad.push(format!("scene.{name} must be <= 5"));
+                bad.push(format!("aegis_app.{name} must be <= 5"));
             }
         }
         for (name, list) in [
-            ("reading_packages", &self.scene.reading_packages),
-            ("video_packages", &self.scene.video_packages),
-            ("ime_packages", &self.scene.ime_packages),
+            ("reading_packages", &self.aegis_app.reading_packages),
+            ("video_packages", &self.aegis_app.video_packages),
+            ("ime_packages", &self.aegis_app.ime_packages),
         ] {
             if list.len() > 64 {
-                bad.push(format!("scene.{name} must contain at most 64 entries"));
+                bad.push(format!(
+                    "aegis_app.{name} must contain at most 64 entries"
+                ));
             }
             for app in list {
                 let trimmed = app.trim();
@@ -702,7 +704,7 @@ impl Config {
                     || trimmed.split_whitespace().count() != 1
                 {
                     bad.push(format!(
-                        "scene.{name} entry {app:?} is not a valid package name"
+                        "aegis_app.{name} entry {app:?} is not a valid package name"
                     ));
                 }
             }
@@ -735,20 +737,20 @@ impl Config {
                 bad.push("charge.full_voltage_mv must be 3000..=5000".to_owned());
             }
         }
-        if self.fas.apps.len() > 64 {
-            bad.push("fas.apps must contain at most 64 entries".to_owned());
+        if self.aegis_frame.apps.len() > 64 {
+            bad.push("aegis_frame.apps must contain at most 64 entries".to_owned());
         }
-        for app in &self.fas.apps {
+        for app in &self.aegis_frame.apps {
             let trimmed = app.trim();
             if trimmed.is_empty() || trimmed.len() > 128 || trimmed.split_whitespace().count() != 1
             {
                 bad.push(format!(
-                    "fas.apps entry {app:?} is not a valid package name"
+                    "aegis_frame.apps entry {app:?} is not a valid package name"
                 ));
             }
         }
-        if !(6.0..=40.0).contains(&self.fas.frame_budget_ms) {
-            bad.push("fas.frame_budget_ms must be 6..=40".to_owned());
+        if !(6.0..=40.0).contains(&self.aegis_frame.frame_budget_ms) {
+            bad.push("aegis_frame.frame_budget_ms must be 6..=40".to_owned());
         }
 
         if !(20.0..=80.0).contains(&self.thermal.guard_c) {
@@ -774,11 +776,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn packaged_config_is_valid_and_fas_is_opt_in() {
+    fn packaged_config_is_valid_and_frame_feedback_is_opt_in() {
         let cfg: Config = toml::from_str(include_str!("../../../packaging/config.toml"))
             .expect("模块默认配置必须能被当前版本解析");
         cfg.validate().expect("模块默认配置必须有效");
-        assert!(!cfg.fas.enabled);
+        assert!(!cfg.aegis_frame.enabled);
     }
 
     #[test]

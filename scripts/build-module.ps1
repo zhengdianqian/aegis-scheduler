@@ -26,7 +26,7 @@ Copy-Item "$root\packaging\service.sh", "$root\packaging\uninstall.sh", "$root\p
 Copy-Item "$root\packaging\module.properties" "$stage\module.prop"
 Copy-Item "$root\LICENSE" "$stage\LICENSE"
 Copy-Item "$root\packaging\shield.sh", "$root\packaging\charge_resume.sh", "$root\packaging\watchdog.sh", "$root\packaging\cpufreq_backup.sh", "$root\packaging\restore.sh", "$root\packaging\profile-gen.sh" "$stage\scripts"
-Copy-Item "$root\packaging\config.toml", "$root\packaging\fas.json" "$stage\config"
+Copy-Item "$root\packaging\config.toml", "$root\packaging\aegis-frame.json" "$stage\config"
 # v3 derives the cluster layout from sysfs at boot; no SoC-specific profile is
 # shipped, so an unsupported device degrades to read-only instead of writing a
 # wrong frequency table.

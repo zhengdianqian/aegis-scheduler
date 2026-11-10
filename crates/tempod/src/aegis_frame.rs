@@ -2,7 +2,7 @@
 // Copyright (c) 2026 默默的阿文
 // Aegis is an independent implementation. No third-party module source is included.
 
-//! FAS frame probe.
+//! Aegis frame feedback probe.
 //!
 //! Only the applications the user selected are ever probed, and only while one
 //! of them owns the foreground. A probe is a single `dumpsys gfxinfo
@@ -20,14 +20,14 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use tempo_core::config::FasConfig;
+use tempo_core::config::AegisFrameConfig;
 
 const DUMPSYS: &str = "/system/bin/dumpsys";
 const REQUEST_INTERVAL_US: u64 = 2_000_000;
 const SAMPLE_FRAMES: usize = 60;
 
 #[derive(Debug, Clone)]
-pub struct FasReport {
+pub struct AegisFrameReport {
     pub package: String,
     pub worst_ms: f32,
     pub over_budget: usize,
@@ -38,7 +38,7 @@ pub struct FasReport {
 #[derive(Default)]
 struct ProbeState {
     pending: Option<String>,
-    report: Option<FasReport>,
+    report: Option<AegisFrameReport>,
     generation: u64,
     enabled: bool,
     available: bool,
@@ -54,7 +54,7 @@ impl ProbeState {
         self.available = false;
     }
 
-    fn publish(&mut self, generation: u64, report: FasReport) -> bool {
+    fn publish(&mut self, generation: u64, report: AegisFrameReport) -> bool {
         if !self.enabled || self.closed || generation != self.generation {
             return false;
         }
@@ -64,19 +64,19 @@ impl ProbeState {
     }
 }
 
-pub struct FasCollector {
+pub struct AegisFrameCollector {
     shared: Arc<(Mutex<ProbeState>, Condvar)>,
     last_request_us: u64,
     pub last_error: Option<String>,
 }
 
-impl FasCollector {
+impl AegisFrameCollector {
     pub fn new(registry: &mio::Registry, token: mio::Token) -> io::Result<Self> {
         let waker = mio::Waker::new(registry, token)?;
         let shared = Arc::new((Mutex::new(ProbeState::default()), Condvar::new()));
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
-            .name("fas-probe".to_owned())
+            .name("aegis-frame".to_owned())
             .spawn(move || {
                 let mut watermarks = std::collections::HashMap::new();
                 let mut last_generation = 0;
@@ -115,7 +115,7 @@ impl FasCollector {
         self.shared.0.lock().unwrap().available
     }
 
-    pub fn set_enabled(&mut self, enabled: bool, config: &FasConfig) {
+    pub fn set_enabled(&mut self, enabled: bool, config: &AegisFrameConfig) {
         let mut state = self.shared.0.lock().unwrap();
         if !enabled {
             state.disable();
@@ -144,7 +144,7 @@ impl FasCollector {
         self.shared.1.notify_one();
     }
 
-    pub fn drain(&mut self) -> Vec<FasReport> {
+    pub fn drain(&mut self) -> Vec<AegisFrameReport> {
         let report = self.shared.0.lock().unwrap().report.take();
         if let Some(problem) = report.as_ref().and_then(|report| report.error.clone()) {
             self.last_error = Some(problem);
@@ -153,7 +153,7 @@ impl FasCollector {
     }
 }
 
-impl Drop for FasCollector {
+impl Drop for AegisFrameCollector {
     fn drop(&mut self) {
         let mut state = self.shared.0.lock().unwrap();
         state.disable();
@@ -162,14 +162,14 @@ impl Drop for FasCollector {
     }
 }
 
-fn probe(package: &str, watermark: &mut u64) -> FasReport {
+fn probe(package: &str, watermark: &mut u64) -> AegisFrameReport {
     let output = command_output(
         Command::new(DUMPSYS).args(["-t", "2", "gfxinfo", package, "framestats"]),
         Duration::from_secs(3),
     );
     match output {
         Ok(output) => parse_new_framestats(package, &String::from_utf8_lossy(&output), watermark),
-        Err(error) => FasReport {
+        Err(error) => AegisFrameReport {
             package: package.to_owned(),
             worst_ms: 0.0,
             over_budget: 0,
@@ -231,11 +231,11 @@ fn command_output(command: &mut Command, timeout: Duration) -> io::Result<Vec<u8
 
 /// Parses the CSV block of `framestats`. Columns 1 and 13 are the intended
 /// vsync and the frame completion timestamp in nanoseconds.
-pub fn parse_framestats(package: &str, text: &str) -> FasReport {
+pub fn parse_framestats(package: &str, text: &str) -> AegisFrameReport {
     parse_new_framestats(package, text, &mut 0)
 }
 
-fn parse_new_framestats(package: &str, text: &str, watermark: &mut u64) -> FasReport {
+fn parse_new_framestats(package: &str, text: &str, watermark: &mut u64) -> AegisFrameReport {
     let previous = *watermark;
     let mut sample: Vec<f32> = Vec::new();
     let mut header_seen = false;
@@ -271,7 +271,7 @@ fn parse_new_framestats(package: &str, text: &str, watermark: &mut u64) -> FasRe
         sample.drain(..sample.len() - SAMPLE_FRAMES);
     }
     // 无时间戳的累计百分位无法去重，不将其作为新的慢帧再次提频。
-    FasReport {
+    AegisFrameReport {
         package: package.to_owned(),
         worst_ms: sample.iter().copied().fold(0.0, f32::max),
         over_budget: sample.iter().filter(|value| **value > 16.0).count(),
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn pending_requests_keep_only_latest() {
-        let mut collector = FasCollector {
+        let mut collector = AegisFrameCollector {
             shared: Arc::new((Mutex::new(ProbeState::default()), Condvar::new())),
             last_request_us: 0,
             last_error: None,

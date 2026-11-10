@@ -411,7 +411,7 @@ check('派生规则', '字符串 100% 保持', 'true', String(C.deriveLatch('100
     prime_cap_ratio: [0.70, 0.30, 0.90], ime_cap_ratio: [0.45, 0.25, 0.80]
   };
   const rust = fs.readFileSync(path.join(__dirname, '../../crates/tempo-core/src/config.rs'), 'utf8');
-  const rustDefaults = rust.slice(rust.indexOf('impl Default for ControlConfig'), rust.indexOf('impl Default for SceneConfig'));
+  const rustDefaults = rust.slice(rust.indexOf('impl Default for ControlConfig'), rust.indexOf('impl Default for AegisAppConfig'));
   Object.entries(contracts).forEach(([name, [value, min, max]]) => {
     assert.equal(defaults.control[name], value, name + ' default');
     assert.equal(Number(rustDefaults.match(new RegExp('\\b' + name + ': ([0-9._]+)'))[1].replace(/_/g, '')), value, name + ' Rust default');
@@ -502,7 +502,7 @@ async function uiRegression() {
   } };
   const document = {
     readyState: 'loading', hidden: false, addEventListener() {},
-    getElementById(id) { return id === 'fas-list' ? list : null; },
+    getElementById(id) { return id === 'frame-list' ? list : null; },
     querySelector() { return null; },
     querySelectorAll(selector) { return selector === '[data-pkg]' ? [row] : selector === '.cluster' ? [card] : []; }
   };
@@ -513,22 +513,22 @@ async function uiRegression() {
   };
   const context = vm.createContext({ window, document, console, Promise, Date });
   let source = fs.readFileSync(path.join(__dirname, '../src/app.js'), 'utf8');
-  source = source.replace('  if (document.readyState', '  window.testUi = { state: state, rows: renderAppRows, toggle: toggleApp, input: onInput, start: startOverviewPolling, stop: stopOverviewPolling, visible: onVisibilityChange, loadFas: ensureFasLoaded, setApi: function(value) { api = value; } };\n  if (document.readyState');
+  source = source.replace('  if (document.readyState', '  window.testUi = { state: state, rows: renderAppRows, toggle: toggleApp, input: onInput, start: startOverviewPolling, stop: stopOverviewPolling, visible: onVisibilityChange, loadFrame: ensureFrameLoaded, setApi: function(value) { api = value; } };\n  if (document.readyState');
   vm.runInContext(source, context);
   const ui = window.testUi;
-  ui.state.tab = 'fas';
-  ui.state.fasLoaded = true;
-  ui.state.fas.enabled = true;
-  ui.state.fasApps = Array.from({ length: 1001 }, (_, i) => ({ package: 'test.app' + i }));
+  ui.state.tab = 'frame';
+  ui.state.frameLoaded = true;
+  ui.state.frame.enabled = true;
+  ui.state.frameApps = Array.from({ length: 1001 }, (_, i) => ({ package: 'test.app' + i }));
   assert.equal((ui.rows().match(/data-pkg=/g) || []).length, 60);
-  ui.state.fasQuery = 'test.app1000';
+  ui.state.frameQuery = 'test.app1000';
   assert.match(ui.rows(), /data-pkg="test.app1000"/);
-  ui.setApi({ saveFas: () => Promise.resolve({ error: null }) });
+  ui.setApi({ saveFrame: () => Promise.resolve({ error: null }) });
   ui.toggle('test.app');
   assert.equal(row['aria-pressed'], 'true');
   assert.equal(listWrites, 0, '勾选不能重建应用列表');
-  ui.input({ target: { id: 'fas-search', value: 'first' } });
-  ui.input({ target: { id: 'fas-search', value: 'test.app1000' } });
+  ui.input({ target: { id: 'frame-search', value: 'first' } });
+  ui.input({ target: { id: 'frame-search', value: 'test.app1000' } });
   assert.equal([...timers.values()].filter(t => t.delay === 180).length, 1);
   const debounce = [...timers.values()].find(t => t.delay === 180);
   debounce.fn();
@@ -596,33 +596,33 @@ async function uiRegression() {
   assert.deepEqual(Array.from(await oldFixtureApi.queryFrequencies(window.Tempo.Mock.status.clusters)), [307200, null, null], '不允许使用簇序号fallback掩盖不匹配');
 
   ui.state.tab = 'overview';
-  ui.state.fasDirty = false;
-  ui.state.fasSaving = false;
-  let fasReads = 0;
-  let returnFas;
-  ui.setApi({ loadFas() { fasReads += 1; return new Promise(resolve => { returnFas = resolve; }); }, queryPackages() { throw new Error('恢复可见不应扫描应用'); } });
+  ui.state.frameDirty = false;
+  ui.state.frameSaving = false;
+  let frameReads = 0;
+  let returnFrame;
+  ui.setApi({ loadFrame() { frameReads += 1; return new Promise(resolve => { returnFrame = resolve; }); }, queryPackages() { throw new Error('恢复可见不应扫描应用'); } });
   ui.visible();
-  assert.equal(fasReads, 1, '已缓存FAS恢复前台仍需重读');
-  returnFas({ enabled: false, packages: ['external.app'] });
+  assert.equal(frameReads, 1, '已缓存帧反馈恢复前台仍需重读');
+  returnFrame({ enabled: false, packages: ['external.app'] });
   await Promise.resolve();
-  assert.equal(ui.state.fas.packages[0], 'external.app');
-  ui.state.fasDirty = true;
+  assert.equal(ui.state.frame.packages[0], 'external.app');
+  ui.state.frameDirty = true;
   ui.visible();
-  assert.equal(fasReads, 1, '未保存的编辑不能被恢复读取覆盖');
-  ui.state.fasDirty = false;
-  ui.state.fasSaving = true;
+  assert.equal(frameReads, 1, '未保存的编辑不能被恢复读取覆盖');
+  ui.state.frameDirty = false;
+  ui.state.frameSaving = true;
   ui.visible();
-  assert.equal(fasReads, 1, '正在保存时不能重读');
-  ui.state.fasSaving = false;
+  assert.equal(frameReads, 1, '正在保存时不能重读');
+  ui.state.frameSaving = false;
   ui.visible();
-  assert.equal(fasReads, 2);
-  ui.state.fasEditRevision += 1;
-  ui.state.fas.packages = ['local.edit'];
-  returnFas({ enabled: true, packages: ['stale.app'] });
+  assert.equal(frameReads, 2);
+  ui.state.frameEditRevision += 1;
+  ui.state.frame.packages = ['local.edit'];
+  returnFrame({ enabled: true, packages: ['stale.app'] });
   await Promise.resolve();
-  assert.equal(ui.state.fas.packages[0], 'local.edit', '读取飞行期间的新编辑必须保留');
+  assert.equal(ui.state.frame.packages[0], 'local.edit', '读取飞行期间的新编辑必须保留');
   ui.stop();
-  console.log('UI 行为回归：既有UI行为、demo与真实policy映射、缺失频率保留null、FAS恢复重读及编辑竞态保护均通过。');
+  console.log('UI 行为回归：既有UI行为、demo与真实policy映射、缺失频率保留null、帧反馈恢复重读及编辑竞态保护均通过。');
 }
 uiRegression().catch(error => { console.error(error); process.exitCode = 1; });
 

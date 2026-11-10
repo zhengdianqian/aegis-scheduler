@@ -14,7 +14,7 @@
     config: '/data/adb/tempo/config.toml',
     configNew: '/data/adb/tempo/config.toml.new',
     configBak: '/data/adb/tempo/config.toml.bak',
-    fas: '/data/adb/tempo/fas.json',
+    frame: '/data/adb/tempo/aegis-frame.json',
     chargePlan: '/data/adb/tempo/charge_plan.json',
     labels: '/data/adb/tempo/labels.json',
     profile: '/data/adb/tempo/profile/device.toml',
@@ -426,10 +426,10 @@
     });
   };
 
-  /** 读取 FAS 侧车文件；不存在时返回关闭 + 空列表。 */
-  TempoApi.prototype.loadFas = function () {
+  /** 读取帧反馈侧车文件；不存在时返回关闭 + 空列表。 */
+  TempoApi.prototype.loadFrame = function () {
     var self = this;
-    var command = 'cat "' + PATHS.fas + '" 2>/dev/null || echo __EMPTY__';
+    var command = 'cat "' + PATHS.frame + '" 2>/dev/null || echo __EMPTY__';
 
     return self._exec(command, 5000).then(function (result) {
       var output = text(result.stdout).trim();
@@ -454,28 +454,28 @@
     });
   };
 
-  /** 写入 FAS 侧车文件；守护接入后可直接读取该文件生效。 */
-  TempoApi.prototype.saveFas = function (fas) {
-    var packages = (fas.packages || []).slice().sort();
+  /** 写入帧反馈侧车文件；守护接入后可直接读取该文件生效。 */
+  TempoApi.prototype.saveFrame = function (frame) {
+    var packages = (frame.packages || []).slice().sort();
     if (packages.length > 64 || packages.some(function (pkg) { return typeof pkg !== 'string' || !/^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/.test(pkg); })) {
       return Promise.resolve({ ok: false, error: '最多选择 64 个有效应用包名' });
     }
     var body = JSON.stringify({
-      enabled: fas.enabled === true,
+      enabled: frame.enabled === true,
       packages: packages
     }, null, 2) + '\n';
-    if (/^AEGIS_FAS_EOF$/m.test(body)) {
+    if (/^AEGIS_FRAME_EOF$/m.test(body)) {
       return Promise.resolve({ ok: false, error: '内容包含保留结束标记' });
     }
     var command =
-      'tmp="' + PATHS.fas + '.tmp.$$"; umask 077; cat > "$tmp" <<\'AEGIS_FAS_EOF\'\n' +
+      'tmp="' + PATHS.frame + '.tmp.$$"; umask 077; cat > "$tmp" <<\'AEGIS_FRAME_EOF\'\n' +
       body +
-      'AEGIS_FAS_EOF\n' +
-      '[ -s "$tmp" ] && mv -f "$tmp" "' + PATHS.fas + '" && cat "' + PATHS.fas + '"';
+      'AEGIS_FRAME_EOF\n' +
+      '[ -s "$tmp" ] && mv -f "$tmp" "' + PATHS.frame + '" && cat "' + PATHS.frame + '"';
 
     return this._exec(command, 6000).then(function (result) {
       var readback = parseJsonObject(result.stdout);
-      if (result.code !== 0 || !readback || readback.enabled !== (fas.enabled === true) || JSON.stringify(readback.packages) !== JSON.stringify(packages)) {
+      if (result.code !== 0 || !readback || readback.enabled !== (frame.enabled === true) || JSON.stringify(readback.packages) !== JSON.stringify(packages)) {
         return { ok: false, error: shorten(result.stderr || result.stdout, 160) || '写入失败' };
       }
       return { ok: true, error: null };

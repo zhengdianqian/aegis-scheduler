@@ -12,7 +12,7 @@
 //!   driven (touch / launch / over-budget frame);
 //! * downward moves are rate limited to one tier per `down_step_ms`;
 //! * a one tier hysteresis keeps the ladder from flapping;
-//! * the scene floor (reading / video) anchors the operating point, so a video
+//! * the app-class floor (reading / video) anchors the operating point, so a video
 //!   does not run at the hardware minimum just because its CPU demand is low;
 //! * the writer's upper cap is independent of the target: only thermal limits
 //!   and explicitly configured per-cluster hardware-max ratios restrict it.
@@ -26,7 +26,7 @@ use crate::config::Config;
 use crate::profile::{DeviceProfile, Role};
 
 const US_PER_MS: u64 = 1_000;
-// FAS 每 2 秒反馈一次，额外留出 500 毫秒调度抖动余量。
+// 帧反馈每 2 秒反馈一次，额外留出 500 毫秒调度抖动余量。
 const OVER_BUDGET_SAMPLE_GAP_US: u64 = 2_500_000;
 // 单帧超预算只补 1 档，持续超预算补 2 档；都叠加在已确认负载之上，
 // 低占用时的偶发掉帧不再把整机抬到最高档。
@@ -50,14 +50,14 @@ pub enum DecisionReason {
 /// Workload class inferred from the foreground package name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Scene {
+pub enum AppClass {
     Default,
     Reading,
     Video,
     Ime,
 }
 
-impl Scene {
+impl AppClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -173,9 +173,9 @@ pub struct Controller {
     last_demand_us: Option<u64>,
     filter_updated_us: Option<u64>,
     thermal_cap: Option<f32>,
-    scene: Scene,
-    /// Raised when a video/reading scene still produces over-budget frames; it
-    /// is the automatic form of the "walk down until zero drops" calibration.
+    app_class: AppClass,
+    /// Raised when a video/reading app class still produces over-budget frames;
+    /// it is the automatic form of the "walk down until zero drops" calibration.
     adaptive_floor: usize,
 }
 
@@ -238,7 +238,7 @@ impl Controller {
             last_demand_us: None,
             filter_updated_us: None,
             thermal_cap: None,
-            scene: Scene::Default,
+            app_class: AppClass::Default,
             adaptive_floor: 0,
         }
     }
@@ -289,8 +289,8 @@ impl Controller {
         self.screen_on
     }
 
-    pub fn scene(&self) -> Scene {
-        self.scene
+    pub fn app_class(&self) -> AppClass {
+        self.app_class
     }
 
     pub fn on_screen(&mut self, ts_us: u64, on: bool) -> Vec<Decision> {
@@ -350,7 +350,7 @@ impl Controller {
                 .map(|index| {
                     let count = self.tiers[index].len();
                     self.load_tier(index)
-                        .max(self.scene_floor(count))
+                        .max(self.app_class_floor(count))
                         .saturating_add(steps)
                         .min(count - 1)
                 })
@@ -413,7 +413,7 @@ impl Controller {
         self.burst_until_us = Some(sample.ts_us + self.config.control.frame_burst_ms * US_PER_MS);
 
         // 单个弹幕或切页尖峰只给短时救援；持续超预算才提高会话地板。
-        if self.over_budget_hits >= 3 && matches!(self.scene, Scene::Video | Scene::Reading) {
+        if self.over_budget_hits >= 3 && matches!(self.app_class, AppClass::Video | AppClass::Reading) {
             let ceiling = self
                 .tiers
                 .iter()
@@ -468,11 +468,11 @@ impl Controller {
         self.evaluate(ts_us, DecisionReason::Load)
     }
 
-    pub fn on_scene(&mut self, ts_us: u64, scene: Scene) -> Vec<Decision> {
-        if scene == self.scene {
+    pub fn on_app_class(&mut self, ts_us: u64, app_class: AppClass) -> Vec<Decision> {
+        if app_class == self.app_class {
             return Vec::new();
         }
-        self.scene = scene;
+        self.app_class = app_class;
         self.adaptive_floor = 0;
         self.low_demand_since_us = None;
         for cluster in self.clusters.iter_mut() {
@@ -645,11 +645,11 @@ impl Controller {
         (ratio.clamp(0.0, 1.0) * (count - 1) as f32).round() as usize
     }
 
-    fn scene_floor(&self, count: usize) -> usize {
-        let configured = match self.scene {
-            Scene::Reading => self.config.scene.reading_floor_tier,
-            Scene::Video => self.config.scene.video_floor_tier,
-            _ => self.config.scene.default_floor_tier,
+    fn app_class_floor(&self, count: usize) -> usize {
+        let configured = match self.app_class {
+            AppClass::Reading => self.config.aegis_app.reading_floor_tier,
+            AppClass::Video => self.config.aegis_app.video_floor_tier,
+            _ => self.config.aegis_app.default_floor_tier,
         };
         configured
             .max(self.adaptive_floor)
@@ -747,7 +747,7 @@ impl Controller {
         }
         let cluster = &self.clusters[index];
         let thermal_limit = self.thermal_cap_tier(index);
-        let floor = self.scene_floor(count);
+        let floor = self.app_class_floor(count);
         if self.quiet {
             return floor.min(thermal_limit);
         }
@@ -780,7 +780,7 @@ impl Controller {
         {
             tier = tier.max(cluster.touch_target);
         }
-        if self.scene == Scene::Ime {
+        if self.app_class == AppClass::Ime {
             tier = tier.min(self.ratio_tier(self.config.control.ime_cap_ratio, count));
         }
         if self.profile.clusters[index].role == Role::Prime && !self.pressure_active(ts_us) {
@@ -1177,9 +1177,9 @@ mod tests {
     }
 
     #[test]
-    fn video_scene_follows_load_without_frame_feedback() {
+    fn video_app_class_follows_load_without_frame_feedback() {
         let mut c = controller();
-        c.on_scene(1000, Scene::Video);
+        c.on_app_class(1000, AppClass::Video);
         for ms in 1..10 {
             c.on_demand(demand(1000 + ms * 100, 0.45));
         }
@@ -1193,7 +1193,7 @@ mod tests {
     #[test]
     fn ime_caps_the_ladder_and_never_lifts_prime_on_touch() {
         let mut c = controller();
-        c.on_scene(100, Scene::Ime);
+        c.on_app_class(100, AppClass::Ime);
         for ms in 1..12 {
             c.on_demand(demand(100 + ms * 100, 0.9));
             c.on_touch(100 + ms * 100);
@@ -1247,7 +1247,7 @@ mod tests {
     #[test]
     fn page_turn_touch_lifts_one_tier_only() {
         let mut c = controller();
-        c.on_scene(0, Scene::Reading);
+        c.on_app_class(0, AppClass::Reading);
         for ms in 1..10 {
             c.on_demand(demand(ms * 200, 0.0));
         }

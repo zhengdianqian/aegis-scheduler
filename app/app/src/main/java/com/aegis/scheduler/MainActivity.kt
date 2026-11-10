@@ -146,7 +146,7 @@ class MainActivity : Activity() {
             if (!rooted) {
                 runOnUiThread { showRootDialog() }
             } else {
-                // 启动时导出一次应用名映射，供 KernelSU WebUI 的 FAS 页使用。
+                // 启动时导出一次应用名映射，供 KernelSU WebUI 的帧反馈页使用。
                 scheduleLabelsExport(force = true)
             }
         }
@@ -264,7 +264,7 @@ class MainActivity : Activity() {
     /* ---------- labels ---------- */
 
     /**
-     * 导出 `包名 → 应用名` 映射到模块配置目录，供 KernelSU WebUI 的 FAS 页读取。
+     * 导出 `包名 → 应用名` 映射到模块配置目录，供 KernelSU WebUI 的帧反馈页读取。
      * 只包含包名和应用名，不写路径、账号或其他信息。
      */
     private fun scheduleLabelsExport(force: Boolean = false) {

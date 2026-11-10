@@ -35,8 +35,8 @@ pub struct RuntimeStatus {
     pub touch_sources: usize,
     pub touch_events: u64,
     pub launch_lifts: u64,
-    pub fas_available: bool,
-    pub fas_active: bool,
+    pub frame_available: bool,
+    pub frame_active: bool,
     pub charge_node: Option<String>,
     pub charge_stopped: bool,
     pub charge_reasons: String,
@@ -49,7 +49,7 @@ pub struct RuntimeStatus {
     pub thermal_available: bool,
     pub write_enabled: bool,
     pub guard_active: bool,
-    pub scene: String,
+    pub app_class: String,
     pub usage: Vec<f32>,
     pub usage_sampled_us: u64,
     pub writes: u64,
@@ -154,7 +154,7 @@ pub fn status_json(
         "guard": {
             "active": runtime.guard_active,
         },
-        "scene": runtime.scene,
+        "app_class": runtime.app_class,
         "usage_sampled_us": runtime.usage_sampled_us,
         "schema": config.schema,
         "platform": profile.platform,
@@ -189,7 +189,7 @@ pub fn status_json(
             "scheduler_write": writing,
             "probe": runtime.probe == "ready",
             "touch": runtime.touch_sources > 0,
-            "fas": runtime.fas_available,
+            "frame": runtime.frame_available,
             "charge_control": runtime.charge_node.is_some(),
             "thermal_guard": runtime.thermal_available,
             "doze_safe": true,
@@ -213,11 +213,11 @@ pub fn status_json(
             "on": runtime.screen_on,
             "source": runtime.screen_source,
         },
-        "fas": {
-            "available": runtime.fas_available,
-            "active": runtime.fas_active,
-            "enabled": config.fas.enabled,
-            "apps": config.fas.apps,
+        "frame": {
+            "available": runtime.frame_available,
+            "active": runtime.frame_active,
+            "enabled": config.aegis_frame.enabled,
+            "apps": config.aegis_frame.apps,
         },
         "touch": {
             "sources": runtime.touch_sources,
@@ -445,7 +445,7 @@ mod tests {
         let path = dir.join("config.toml");
         let mut config = Config::default();
         let mut next = config.clone();
-        next.fas.enabled = true;
+        next.aegis_frame.enabled = true;
         let profile = profile();
         let runtime = RuntimeStatus::default();
         let log = dir.join("log");
@@ -467,8 +467,8 @@ mod tests {
                 .unwrap()
         );
         let persisted: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(persisted.fas.enabled);
-        assert!(ctx.config.fas.enabled);
+        assert!(persisted.aegis_frame.enabled);
+        assert!(ctx.config.aegis_frame.enabled);
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -141,7 +141,7 @@
       'version=3.0',
       'versionCode=13',
       'author=默默的阿文',
-      'description=自适应 CPU 调度+FAS + 充电控制'
+      'description=自适应 CPU 调度+帧反馈 + 充电控制'
     ].join('\n'),
     configToml: [
       '# Aegis 调度配置（控制台生成）',
@@ -195,7 +195,7 @@
     ].join('\n') + '\n',
     configDraft: null,
     configBak: null,
-    fasJson: '{"enabled":false,"packages":[]}\n'
+    frameJson: '{"enabled":false,"packages":[]}\n'
   };
 
   // 兼容 CONTRACT 中的命名

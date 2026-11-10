@@ -83,7 +83,7 @@ pub struct DemandSnapshot {
     pub events: u64,
     pub active_events: u64,
     /// True when the top-app task set changed during this batch. The control
-    /// loop resolves the package and re-arms FAS only on this edge.
+    /// loop resolves the package and re-arms frame feedback only on this edge.
     pub foreground_changed: bool,
 }
 

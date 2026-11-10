@@ -5,7 +5,7 @@
 //! Event loop.
 //!
 //! Every source registers in one epoll set: the BPF probe ring, the backlight
-//! inotify descriptor, the evdev touch nodes and the FAS trace pipe. There is a
+//! inotify descriptor, the evdev touch nodes and the frame feedback pipe. There is a
 //! one-shot `timerfd` for controller deadlines, plus bounded safety readbacks
 //! and charging reservation/retry timers. Safety polling backs off while stable.
 
@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 
 use mio::net::{UnixListener, UnixStream};
 use mio::{Events, Interest, Poll, Token};
-use tempo_core::controller::{Controller, Decision, DemandSample, FrameSample, Scene};
+use tempo_core::controller::{AppClass, Controller, Decision, DemandSample, FrameSample};
 use tempo_core::{Config, DeviceProfile};
 
+use crate::aegis_frame::AegisFrameCollector;
 use crate::charge::ChargeWatcher;
-use crate::fas::FasCollector;
 use crate::foreground::ForegroundResolver;
 use crate::governor;
 use crate::ipc::{self, ControlContext, Outcome, RuntimeStatus};
@@ -309,31 +309,31 @@ pub fn run(
         state.touch_sources = touches.len();
     }
 
-    let mut fas = match FasCollector::new(poll.registry(), FRAME) {
+    let mut frame = match AegisFrameCollector::new(poll.registry(), FRAME) {
         Ok(collector) => {
             if let Ok(mut state) = status.lock() {
-                state.fas_available = true;
-                state.fas_active = false;
+                state.frame_available = true;
+                state.frame_active = false;
             }
-            tracing::info!("fas frame probe ready");
+            tracing::info!("frame feedback probe ready");
             Some(collector)
         }
         Err(error) => {
-            tracing::warn!(%error, "fas frame probe unavailable");
+            tracing::warn!(%error, "frame feedback probe unavailable");
             if let Ok(mut state) = status.lock() {
-                state.fas_available = false;
-                state.fas_active = false;
+                state.frame_available = false;
+                state.frame_active = false;
             }
             None
         }
     };
 
-    let fas_path = config_path
+    let frame_path = config_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("fas.json");
-    let mut fas_stamp = None;
-    refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path);
+        .join("aegis-frame.json");
+    let mut frame_stamp = None;
+    refresh_frame_sidecar(&mut config, &mut frame_stamp, &frame_path);
 
     // Charging control: netlink power-supply uevents drive the state machine;
     // the only timer is a one-shot reservation boundary. When no switch is
@@ -423,13 +423,13 @@ pub fn run(
             state.foreground_package = foreground.package().map(str::to_owned);
         }
     }
-    refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
+    refresh_frame(&config, &foreground, &mut frame, &status, screen_on);
 
     tracing::info!(
         path = %socket_path.display(),
         clusters = profile.clusters.len(),
         touches = touches.len(),
-        fas = fas.is_some(),
+        frame = frame.is_some(),
         apply,
         "Aegis event loop ready"
     );
@@ -542,23 +542,23 @@ pub fn run(
                                         None => deadline_source.disarm(),
                                     }
                                 }
-                                if refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path) {
-                                    tracing::info!("fas configuration reloaded from sidecar");
+                                if refresh_frame_sidecar(&mut config, &mut frame_stamp, &frame_path) {
+                                    tracing::info!("frame feedback configuration reloaded from sidecar");
                                 }
-                                refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
-                                if let Some(collector) = fas.as_mut() {
+                                refresh_frame(&config, &foreground, &mut frame, &status, screen_on);
+                                if let Some(collector) = frame.as_mut() {
                                     collector
                                         .request(foreground.package().unwrap_or(""), sample.ts_us);
                                 }
                                 // Workload class: reading / video / IME change
                                 // the floor and cap policy, not just the load.
-                                let scene = scene_of(foreground.package(), &config);
+                                let app_class = app_class_of(foreground.package(), &config);
                                 if let Ok(mut state) = status.lock() {
-                                    state.scene = scene.as_str().to_owned();
+                                    state.app_class = app_class.as_str().to_owned();
                                 }
-                                let scene_decisions = controller.on_scene(sample.ts_us, scene);
-                                if !scene_decisions.is_empty() {
-                                    commit(&scene_decisions, &mut writer, &status);
+                                let app_class_decisions = controller.on_app_class(sample.ts_us, app_class);
+                                if !app_class_decisions.is_empty() {
+                                    commit(&app_class_decisions, &mut writer, &status);
                                     match controller.next_deadline(sample.ts_us) {
                                         Some(deadline) => deadline_source.arm(deadline.at_us),
                                         None => deadline_source.disarm(),
@@ -596,8 +596,8 @@ pub fn run(
                     while let Some(on) = watcher.refresh() {
                         screen_on = on;
                         ceiling_timer.arm(now_us() + ceiling_backoff.reset());
-                        refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path);
-                        refresh_fas(&config, &foreground, &mut fas, &status, on);
+                        refresh_frame_sidecar(&mut config, &mut frame_stamp, &frame_path);
+                        refresh_frame(&config, &foreground, &mut frame, &status, on);
                         if let Some(session) = probe.as_mut() {
                             if let Err(error) = session.set_screen(on) {
                                 tracing::warn!(%error, "screen gate could not be applied");
@@ -610,14 +610,14 @@ pub fn run(
                         if let Ok(mut state) = status.lock() {
                             state.screen_on = on;
                             state.quiet = controller.is_quiet();
-                            state.fas_active = false;
+                            state.frame_active = false;
                         }
                         commit(&decisions, &mut writer, &status);
                         if on {
                             // Unlock animation and the first screen after wake
                             // need the vendor's boost just like a launch.
-                            refresh_fas(&config, &foreground, &mut fas, &status, true);
-                            if let Some(collector) = fas.as_mut() {
+                            refresh_frame(&config, &foreground, &mut frame, &status, true);
+                            if let Some(collector) = frame.as_mut() {
                                 collector.request(foreground.package().unwrap_or(""), at_us);
                             }
                         }
@@ -632,27 +632,27 @@ pub fn run(
             }
 
             if token == FRAME {
-                refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path);
-                refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
-                if let Some(collector) = fas.as_mut() {
+                refresh_frame_sidecar(&mut config, &mut frame_stamp, &frame_path);
+                refresh_frame(&config, &foreground, &mut frame, &status, screen_on);
+                if let Some(collector) = frame.as_mut() {
                     let reports = collector.drain();
                     for report in reports {
                         if let Some(problem) = &report.error {
-                            tracing::warn!(%problem, package = report.package.as_str(), "fas probe failed");
+                            tracing::warn!(%problem, package = report.package.as_str(), "frame feedback probe failed");
                             continue;
                         }
                         // 工作线程可能跨越关屏、禁用或切包；消费时重新核对资格。
                         if !controller.is_screen_on()
-                            || !config.fas.enabled
+                            || !config.aegis_frame.enabled
                             || foreground.package() != Some(report.package.as_str())
-                            || !config.fas.apps.iter().any(|app| app == &report.package)
+                            || !config.aegis_frame.apps.iter().any(|app| app == &report.package)
                         {
                             continue;
                         }
                         let decisions = controller.on_frame(FrameSample {
                             ts_us: now_us(),
                             render_ms: report.worst_ms,
-                            budget_ms: config.fas.frame_budget_ms,
+                            budget_ms: config.aegis_frame.frame_budget_ms,
                             foreground: true,
                         });
                         commit(&decisions, &mut writer, &status);
@@ -727,14 +727,14 @@ pub fn run(
                     .map(ConfigWatcher::poll)
                     .unwrap_or(false);
                 if changed {
-                    refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path);
-                    refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
+                    refresh_frame_sidecar(&mut config, &mut frame_stamp, &frame_path);
+                    refresh_frame(&config, &foreground, &mut frame, &status, screen_on);
                     match read_valid_config(config_path) {
                         Ok(Some(parsed)) if parsed != config => {
                             let restart_required = ipc::requires_restart(&startup_config, &parsed);
                             config = parsed;
                             // 主配置替换后必须再次合并侧车，即使内容未发生变化。
-                            merge_fas_sidecar(&mut config, fas_stamp.as_deref());
+                            merge_frame_sidecar(&mut config, frame_stamp.as_deref());
                             if apply {
                                 if config.governor.smooth {
                                     if governor_snapshot.is_none() {
@@ -765,7 +765,7 @@ pub fn run(
                                 state.config_generation = state.config_generation.saturating_add(1);
                                 state.restart_required = restart_required;
                             }
-                            refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
+                            refresh_frame(&config, &foreground, &mut frame, &status, screen_on);
                             tracing::info!("configuration reloaded from disk");
                         }
                         Ok(_) => {}
@@ -802,20 +802,20 @@ pub fn run(
                     }
                     if batch.downs > 0 {
                         // A touch is the natural moment to pick up WebUI edits
-                        // to the FAS sidecar; no polling, no timer.
-                        if refresh_fas_sidecar(&mut config, &mut fas_stamp, &fas_path) {
-                            tracing::info!("fas configuration reloaded from sidecar");
+                        // to the frame feedback sidecar; no polling, no timer.
+                        if refresh_frame_sidecar(&mut config, &mut frame_stamp, &frame_path) {
+                            tracing::info!("frame feedback configuration reloaded from sidecar");
                         }
-                        refresh_fas(&config, &foreground, &mut fas, &status, true);
+                        refresh_frame(&config, &foreground, &mut frame, &status, true);
                     }
                     if batch.downs > 0 || batch.moves > 0 {
                         // A touch is the earliest visible sign that the user
                         // needs a lift; the controller adds exactly one tier.
-                        // Pick up a WebUI change to the FAS list immediately:
+                        // Pick up a WebUI change to the frame feedback list immediately:
                         // the user toggling the switch should not have to switch
                         // apps before the probe starts.
-                        refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
-                        if let Some(collector) = fas.as_mut() {
+                        refresh_frame(&config, &foreground, &mut frame, &status, screen_on);
+                        if let Some(collector) = frame.as_mut() {
                             collector.request(foreground.package().unwrap_or(""), at_us);
                         }
                     }
@@ -976,7 +976,7 @@ pub fn run(
                                 let (text, outcome) = ipc::handle(&mut context, &line);
                                 responses.push(text);
                                 if outcome == Outcome::Reloaded {
-                                    merge_fas_sidecar(&mut config, fas_stamp.as_deref());
+                                    merge_frame_sidecar(&mut config, frame_stamp.as_deref());
                                     let decisions = reload_controller(
                                         &mut controller,
                                         &profile,
@@ -996,7 +996,7 @@ pub fn run(
                                         state.restart_required =
                                             ipc::requires_restart(&startup_config, &config);
                                     }
-                                    refresh_fas(&config, &foreground, &mut fas, &status, screen_on);
+                                    refresh_frame(&config, &foreground, &mut frame, &status, screen_on);
                                     if let Some(watcher) = charge.as_mut() {
                                         let decision = watcher.update(&config, now_us());
                                         tracing::info!(
@@ -1043,21 +1043,21 @@ pub fn run(
 }
 
 // 侧车很小，事件到来时直接比较内容，不依赖文件系统时间戳精度。
-fn refresh_fas_sidecar(config: &mut Config, stamp: &mut Option<String>, path: &Path) -> bool {
+fn refresh_frame_sidecar(config: &mut Config, stamp: &mut Option<String>, path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
     if stamp.as_deref() == Some(text.as_str()) {
         return false;
     }
-    if !merge_fas_sidecar(config, Some(&text)) {
+    if !merge_frame_sidecar(config, Some(&text)) {
         return false;
     }
     *stamp = Some(text);
     true
 }
 
-fn merge_fas_sidecar(config: &mut Config, text: Option<&str>) -> bool {
+fn merge_frame_sidecar(config: &mut Config, text: Option<&str>) -> bool {
     let Some(text) = text else { return false };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return false;
@@ -1077,52 +1077,52 @@ fn merge_fas_sidecar(config: &mut Config, text: Option<&str>) -> bool {
                 .collect()
         })
         .unwrap_or_default();
-    config.fas.enabled = enabled;
-    config.fas.apps = apps;
+    config.aegis_frame.enabled = enabled;
+    config.aegis_frame.apps = apps;
     true
 }
 
-fn refresh_fas(
+fn refresh_frame(
     config: &Config,
     foreground: &ForegroundResolver,
-    fas: &mut Option<FasCollector>,
+    frame: &mut Option<AegisFrameCollector>,
     status: &Arc<Mutex<RuntimeStatus>>,
     screen_on: bool,
 ) {
     let package = foreground.package().unwrap_or("");
     let eligible = screen_on
-        && config.fas.enabled
-        && !config.fas.apps.is_empty()
-        && config.fas.apps.iter().any(|app| app == package);
-    if let Some(collector) = fas.as_mut() {
-        collector.set_enabled(eligible, &config.fas);
+        && config.aegis_frame.enabled
+        && !config.aegis_frame.apps.is_empty()
+        && config.aegis_frame.apps.iter().any(|app| app == package);
+    if let Some(collector) = frame.as_mut() {
+        collector.set_enabled(eligible, &config.aegis_frame);
     }
     if let Ok(mut state) = status.lock() {
-        state.fas_active = eligible && fas.is_some();
-        state.fas_available = fas.is_some();
+        state.frame_active = eligible && frame.is_some();
+        state.frame_available = frame.is_some();
     }
-    tracing::debug!(package, eligible, "fas eligibility updated");
+    tracing::debug!(package, eligible, "frame feedback eligibility updated");
 }
 
 /// Maps the foreground package to a workload class. Unknown packages are
 /// `Default`, which never lowers a floor and never caps a cluster.
-pub(crate) fn scene_of(package: Option<&str>, config: &Config) -> Scene {
+pub(crate) fn app_class_of(package: Option<&str>, config: &Config) -> AppClass {
     let Some(package) = package else {
-        return Scene::Default;
+        return AppClass::Default;
     };
-    if config.scene.ime_packages.iter().any(|app| app == package) {
-        Scene::Ime
-    } else if config.scene.video_packages.iter().any(|app| app == package) {
-        Scene::Video
+    if config.aegis_app.ime_packages.iter().any(|app| app == package) {
+        AppClass::Ime
+    } else if config.aegis_app.video_packages.iter().any(|app| app == package) {
+        AppClass::Video
     } else if config
-        .scene
+        .aegis_app
         .reading_packages
         .iter()
         .any(|app| app == package)
     {
-        Scene::Reading
+        AppClass::Reading
     } else {
-        Scene::Default
+        AppClass::Default
     }
 }
 
@@ -1137,12 +1137,12 @@ fn reload_controller(
 ) -> Vec<Decision> {
     *controller = Controller::new(profile.clone(), config.clone());
     let at_us = now_us();
-    let scene = scene_of(foreground.package(), config);
+    let app_class = app_class_of(foreground.package(), config);
     // 先恢复场景再恢复屏幕，只提交最终状态，避免短暂写入默认场景上限。
-    controller.on_scene(at_us, scene);
+    controller.on_app_class(at_us, app_class);
     let decisions = controller.restore_screen_state(at_us, screen_on);
     if let Ok(mut state) = status.lock() {
-        state.scene = scene.as_str().to_owned();
+        state.app_class = app_class.as_str().to_owned();
         state.quiet = controller.is_quiet();
     }
     decisions
@@ -1287,7 +1287,7 @@ fn arm_charge_timer(watcher: Option<&ChargeWatcher>, timer: &OneShotTimer) {
 /// truncated file is rejected instead of silently turning into defaults.
 fn read_valid_config(path: &Path) -> Result<Option<Config>, String> {
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    // Sections the console always writes. Optional tables ([fas], [ui]) fall
+    // Sections the console always writes. Optional tables ([aegis_frame], [ui]) fall
     // back to defaults and are not required here.
     for section in ["[daemon]", "[events]", "[control]", "[charge]", "[thermal]"] {
         if !text.contains(section) {
@@ -1358,7 +1358,7 @@ impl ConfigWatcher {
                 if name_end <= count as usize && event.len > 0 {
                     let name = String::from_utf8_lossy(&buffer[name_start..name_end]);
                     let name = name.trim_end_matches('\0');
-                    if name == "config.toml" || name == "charge_plan.json" || name == "fas.json" {
+                    if name == "config.toml" || name == "charge_plan.json" || name == "aegis-frame.json" {
                         changed = true;
                     }
                 }
@@ -1499,20 +1499,20 @@ mod tests {
 
     #[test]
     fn sidecar_detects_back_to_back_changes_and_survives_reload() {
-        let path = std::env::temp_dir().join(format!("aegis-fas-{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!("aegis-frame-{}.json", std::process::id()));
         let mut config = Config::default();
-        assert!(!config.fas.enabled);
+        assert!(!config.aegis_frame.enabled);
         let mut stamp = None;
         std::fs::write(&path, r#"{"enabled":true,"packages":["first"]}"#).unwrap();
-        assert!(refresh_fas_sidecar(&mut config, &mut stamp, &path));
+        assert!(refresh_frame_sidecar(&mut config, &mut stamp, &path));
         std::fs::write(&path, r#"{"enabled":true,"packages":["other"]}"#).unwrap();
-        assert!(refresh_fas_sidecar(&mut config, &mut stamp, &path));
-        assert_eq!(config.fas.apps, vec!["other"]);
-        assert!(!refresh_fas_sidecar(&mut config, &mut stamp, &path));
+        assert!(refresh_frame_sidecar(&mut config, &mut stamp, &path));
+        assert_eq!(config.aegis_frame.apps, vec!["other"]);
+        assert!(!refresh_frame_sidecar(&mut config, &mut stamp, &path));
         config = Config::default();
-        assert!(merge_fas_sidecar(&mut config, stamp.as_deref()));
-        assert!(config.fas.enabled);
-        assert_eq!(config.fas.apps, vec!["other"]);
+        assert!(merge_frame_sidecar(&mut config, stamp.as_deref()));
+        assert!(config.aegis_frame.enabled);
+        assert_eq!(config.aegis_frame.apps, vec!["other"]);
         std::fs::remove_file(path).unwrap();
     }
 

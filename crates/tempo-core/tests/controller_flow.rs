@@ -5,7 +5,7 @@
 //! Controller integration tests for frequency bounds, workload events and deadlines.
 
 use tempo_core::config::Config;
-use tempo_core::controller::{Controller, DemandSample, FrameSample, Scene};
+use tempo_core::controller::{AppClass, Controller, DemandSample, FrameSample};
 use tempo_core::profile::{CapacitySource, ClusterProfile, DeviceProfile, Role};
 
 const MS: u64 = 1_000;
@@ -56,7 +56,7 @@ fn demand(ts_ms: u64, busy: f32) -> DemandSample {
 }
 
 #[test]
-fn default_caps_stay_at_hardware_max_in_every_scene_and_event() {
+fn default_caps_stay_at_hardware_max_in_every_app_class_and_event() {
     let check = |controller: &Controller, decisions: Vec<tempo_core::controller::Decision>| {
         for decision in decisions {
             let index = decision.cluster;
@@ -68,9 +68,14 @@ fn default_caps_stay_at_hardware_max_in_every_scene_and_event() {
             assert!(decision.ceiling_khz <= decision.cap_khz);
         }
     };
-    for scene in [Scene::Default, Scene::Reading, Scene::Video, Scene::Ime] {
+    for app_class in [
+        AppClass::Default,
+        AppClass::Reading,
+        AppClass::Video,
+        AppClass::Ime,
+    ] {
         let mut controller = Controller::new(profile(), Config::default());
-        controller.on_scene(0, scene);
+        controller.on_app_class(0, app_class);
         for ts in (100..2_000).step_by(200) {
             let decisions = controller.on_demand(demand(ts, 0.0));
             check(&controller, decisions);
@@ -295,11 +300,11 @@ fn touch_and_isolated_load_noise_do_not_unlock_prime() {
 }
 
 #[test]
-fn prime_cpu_demand_does_not_remove_ime_scene_limit() {
+fn prime_cpu_demand_does_not_remove_ime_app_class_limit() {
     let config = Config::default();
     let ratio = config.control.ime_cap_ratio;
     let mut controller = Controller::new(profile(), config);
-    controller.on_scene(100 * MS, Scene::Ime);
+    controller.on_app_class(100 * MS, AppClass::Ime);
     for ts in (200..3_000).step_by(160) {
         controller.on_demand(demand(ts, 0.95));
     }
@@ -410,7 +415,7 @@ fn app_launch_foreground_change_and_wake_share_the_warm_start_band() {
 #[test]
 fn thermal_limit_overrides_launch_pressure_quiet_and_screen_off() {
     let mut config = Config::default();
-    config.scene.video_floor_tier = 2;
+    config.aegis_app.video_floor_tier = 2;
     let mut controller = Controller::new(profile(), config);
     controller.on_app_launch(100 * MS);
     let throttled = controller.on_thermal_cap(101 * MS, Some(0.25));
@@ -434,7 +439,7 @@ fn thermal_limit_overrides_launch_pressure_quiet_and_screen_off() {
     controller.on_screen(4_300 * MS, false);
     check(&controller);
     controller.on_screen(4_400 * MS, true);
-    controller.on_scene(4_500 * MS, Scene::Video);
+    controller.on_app_class(4_500 * MS, AppClass::Video);
     controller.on_demand(demand(4_600, 0.0));
     controller.on_deadline(6_000 * MS);
     assert!(controller.is_quiet());
@@ -447,9 +452,9 @@ fn thermal_limit_overrides_launch_pressure_quiet_and_screen_off() {
 }
 
 #[test]
-fn reading_scene_stays_low_and_page_turn_is_one_tier() {
+fn reading_app_class_stays_low_and_page_turn_is_one_tier() {
     let mut controller = Controller::new(profile(), Config::default());
-    controller.on_scene(0, Scene::Reading);
+    controller.on_app_class(0, AppClass::Reading);
     let mut ts = 0;
     for _ in 0..20 {
         ts += 200;
@@ -595,7 +600,7 @@ fn frame(ts_ms: u64, render_ms: f32) -> FrameSample {
 }
 
 #[test]
-fn slow_fas_samples_two_seconds_apart_trigger_pressure() {
+fn slow_frame_samples_two_seconds_apart_trigger_pressure() {
     let mut config = Config::default();
     // 一次只升一档，区分短时突发与持续压力的目标。
     config.control.max_up_step = 1;
@@ -675,7 +680,7 @@ fn healthy_or_stale_frame_samples_reset_pressure_confirmation() {
 #[test]
 fn isolated_video_noise_does_not_raise_session_floor() {
     let mut controller = Controller::new(profile(), Config::default());
-    controller.on_scene(0, Scene::Video);
+    controller.on_app_class(0, AppClass::Video);
     controller.on_frame(frame(100, 30.0));
     controller.on_frame(frame(2_100, 10.0));
     controller.on_frame(frame(4_100, 30.0));
@@ -696,7 +701,7 @@ fn isolated_video_noise_does_not_raise_session_floor() {
 fn video_tracks_cpu_demand_without_any_frame_events() {
     let mut video = Controller::new(profile(), Config::default());
     let mut normal = Controller::new(profile(), Config::default());
-    video.on_scene(0, Scene::Video);
+    video.on_app_class(0, AppClass::Video);
     for ts in (100..2_000).step_by(200) {
         video.on_demand(demand(ts, 0.45));
         normal.on_demand(demand(ts, 0.45));
