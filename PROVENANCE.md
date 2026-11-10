@@ -1,7 +1,7 @@
 # 来源与独立实现记录（PROVENANCE）
 
 - 项目：Aegis（模块 id `aegis_scheduler`）
-- 版本：3.8.0
+- 版本：3.8.1
 - 日期：2026-11-10
 - 许可证：GPL-3.0-or-later
 - 署名主体：默默的阿文

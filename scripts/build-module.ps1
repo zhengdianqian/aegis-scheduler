@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "3.8.0",
+    [string]$Version = "3.8.1",
     [string]$BuildDir = $env:TEMPO_ANDROID_TARGET_DIR,
     [string]$Apk,
     [string]$OutputDir
@@ -23,6 +23,9 @@ New-Item -ItemType Directory -Force "$stage\bin", "$stage\scripts", "$stage\conf
 
 Copy-Item "$bin\Aegis", "$bin\tempoctl" "$stage\bin"
 Copy-Item "$root\packaging\service.sh", "$root\packaging\uninstall.sh", "$root\packaging\customize.sh" $stage
+# module.prop 必须不带 BOM：BOM 会让 ksud 把 id 解析成 "\ufeffaegis_scheduler"，
+# 从而在 /data/adb/modules/ 下生成一个非法目录，KernelSU 管理器主页会因此打不开。
+# 源文件本身已无 BOM，pack_zip.py 打包时再做一次兜底剥离。
 Copy-Item "$root\packaging\module.properties" "$stage\module.prop"
 Copy-Item "$root\LICENSE" "$stage\LICENSE"
 Copy-Item "$root\packaging\shield.sh", "$root\packaging\charge_resume.sh", "$root\packaging\watchdog.sh", "$root\packaging\cpufreq_backup.sh", "$root\packaging\restore.sh", "$root\packaging\profile-gen.sh" "$stage\scripts"

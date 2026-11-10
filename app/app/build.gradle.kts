@@ -1,4 +1,4 @@
-﻿import java.io.StringReader
+import java.io.StringReader
 import java.util.Properties
 
 // Copyright (C) 2026 默默的阿文
@@ -23,8 +23,8 @@ android {
         applicationId = "com.aegis.scheduler"
         minSdk = 24
         targetSdk = 36
-        versionCode = 24
-        versionName = "3.8.0"
+        versionCode = 25
+        versionName = "3.8.1"
     }
 
     signingConfigs {

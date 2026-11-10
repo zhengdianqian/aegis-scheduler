@@ -33,5 +33,10 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
                 data = fh.read()
             if arc.endswith((".sh", ".prop", ".toml")) or arc.endswith("/update-binary") or arc.endswith("/updater-script"):
                 data = data.replace(b"\r\n", b"\n").replace(b"\r", b"")
+                # 兜底：任何 .prop/.sh/.toml 都不允许带 BOM。module.prop 带 BOM 会让
+                # ksud 把 id 解析成 "\ufeff<id>"，在 /data/adb/modules 下生成非法目录，
+                # KernelSU 管理器主页会因此加载失败。
+                if data.startswith(b"\xef\xbb\xbf"):
+                    data = data[3:]
             zf.writestr(info_for(arc, False), data)
 print(f"packed {out}")

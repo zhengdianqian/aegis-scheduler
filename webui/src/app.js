@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '3.8.0';
+  var APP_VERSION = '3.8.1';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
