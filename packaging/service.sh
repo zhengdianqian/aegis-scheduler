@@ -28,6 +28,35 @@ log() {
     echo "aegis: $*" >> "$LOG"
 }
 
+# 按本机真实簇拓扑同步“每簇自愿省电”配置：保留用户已设的比例，补齐缺失的簇，
+# 删除不属于本机的簇键。这样同一个 ZIP 刷到 1/2/3 簇机型都自动适配，而不是套模板。
+sync_cluster_caps() {
+    cfg=$1
+    prof=$2
+    [ -f "$cfg" ] && [ -f "$prof" ] || return 0
+    keys=$(awk -F'[][]' '/^cpus *= */{ split($2, a, ","); gsub(/[[:space:]]/, "", a[1]); print "cpu" a[1] }' "$prof")
+    [ -n "$keys" ] || return 0
+    tmp="$cfg.caps.$$"
+    awk '
+        /^\[control\.cluster_cap_ratio\]/ { skip = 1; next }
+        /^\[/ { skip = 0 }
+        !skip { print }
+    ' "$cfg" > "$tmp" || { rm -f "$tmp"; return 0; }
+    {
+        echo
+        echo "[control.cluster_cap_ratio]"
+        for key in $keys; do
+            value=$(awk -v want="$key" '
+                /^\[control\.cluster_cap_ratio\]/ { inside = 1; next }
+                /^\[/ { inside = 0 }
+                inside && $1 == want { print $3 }
+            ' "$cfg")
+            echo "$key = ${value:-1.0}"
+        done
+    } >> "$tmp"
+    mv "$tmp" "$cfg" && chmod 644 "$cfg"
+}
+
 install_manager() {
     umask 077
     apk="$MODDIR/app/AegisManager.apk"
@@ -162,6 +191,9 @@ if ! sh "$MODDIR/scripts/profile-gen.sh" > "$PROFILE.tmp" 2>> "$LOG" || [ ! -s "
 fi
 mv "$PROFILE.tmp" "$PROFILE"
 chmod 644 "$PROFILE"
+
+# 装/开机时按真实拓扑生成每簇省电键；比例 1.0 表示不限制。
+sync_cluster_caps "$DATA/config.toml" "$PROFILE"
 
 chmod 755 "$BIN" "$MODDIR/bin/tempoctl" 2>/dev/null
 

@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use tempo_core::config::LogLevel;
 use tempo_core::{Config, DeviceProfile};
 use tracing_subscriber::EnvFilter;
 
@@ -231,21 +232,24 @@ fn main() -> ExitCode {
         Err(error) => eprintln!("Aegis: config normalization skipped: {error}"),
     }
 
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(config.daemon.log_level.as_str()))
-        .with_ansi(false);
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&args.log_file)
-    {
-        Ok(file) => {
-            let _ = builder
-                .with_writer(move || file.try_clone().expect("log file"))
-                .try_init();
-        }
-        Err(_) => {
-            let _ = builder.try_init();
+    // 默认关闭日志：不创建、不打开日志文件，也不注册订阅者，避免无意义的写盘与唤醒。
+    if config.daemon.log_level != LogLevel::Off {
+        let builder = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(config.daemon.log_level.as_str()))
+            .with_ansi(false);
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&args.log_file)
+        {
+            Ok(file) => {
+                let _ = builder
+                    .with_writer(move || file.try_clone().expect("log file"))
+                    .try_init();
+            }
+            Err(_) => {
+                let _ = builder.try_init();
+            }
         }
     }
 

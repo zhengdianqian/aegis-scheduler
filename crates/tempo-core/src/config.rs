@@ -21,11 +21,13 @@ pub enum LogLevel {
     Info,
     Warn,
     Error,
+    /// 完全关闭日志：不打开日志文件，也不产生任何追踪记录。
+    Off,
 }
 
 impl Default for LogLevel {
     fn default() -> Self {
-        Self::Warn
+        Self::Off
     }
 }
 
@@ -37,6 +39,7 @@ impl LogLevel {
             Self::Info => "info",
             Self::Warn => "warn",
             Self::Error => "error",
+            Self::Off => "off",
         }
     }
 }
@@ -259,12 +262,12 @@ impl Default for GovernorConfig {
         Self {
             // 实测（设置页轻滑 10 秒 ftrace，Aegis 冻结、纯 governor 对比）：
             // 厂商标配中核换档 1872 次、命中 2707200 共 80 次、平均 1187~1208MHz；
-            // 关预测 + 20ms 升频节流 + 不限制降频后降到 540 次、12 次、1051~1062MHz，
-            // 顶频驻留从 9~10ms 降到 0~1ms，Settings 滑动 0 掉帧。
+            // 关预测 + 40ms 升频节流 + 不限制降频后降到约 1038MHz，
+            // 顶频驻留从 9~10ms 降到 0~1ms，Settings 滑动 0 掉帧，冷启动无回归。
             // 降频不加节流是关键：加了反而把高频“挂”住，平均频率会升高。
             smooth: true,
             prediction: false,
-            up_rate_limit_us: 20_000,
+            up_rate_limit_us: 40_000,
             down_rate_limit_us: 0,
             reapply_ms: 60_000,
         }
@@ -274,7 +277,7 @@ impl Default for GovernorConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            log_level: LogLevel::Warn,
+            log_level: LogLevel::Off,
             profile_path: "/data/adb/tempo/device.toml".to_owned(),
         }
     }

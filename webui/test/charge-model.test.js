@@ -376,6 +376,15 @@ check('派生规则', '字符串 100% 保持', 'true', String(C.deriveLatch('100
     const value = T.readPath(model, def.path);
     assert.notEqual(value, undefined, def.path + ' must survive normalization');
     assert.equal(value, T.readPath(defaults, def.path));
+    if (def.kind === 'bool') {
+      assert.equal(typeof value, 'boolean', def.path);
+      const toggled = T.clone(model);
+      T.writePath(toggled, def.path, !value);
+      const doc = T.applyModel({ control: { startup_guard_ms: 23000 } }, toggled, sandbox.CFG_WRITE_PATHS);
+      const parsed = T.parse(T.stringify(doc));
+      assert.equal(T.readPath(T.normalize(parsed), def.path), !value, def.path + ' roundtrip');
+      return;
+    }
     if (def.kind !== 'select') {
       assert.ok(Number.isFinite(value) && value >= def.min && value <= def.max, def.path);
       const edited = T.clone(model);

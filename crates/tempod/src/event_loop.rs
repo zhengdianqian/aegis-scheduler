@@ -289,14 +289,13 @@ pub fn run(
 
     // walt 换档节奏只改 pl / rate limit，不涉及 min/max，因此不依赖探针是否附着。
     let mut governor_last_us = 0u64;
-    if apply {
+    // 关闭接管时必须写回厂商原值，否则会残留上一次写入的节流参数。
+    let mut governor_snapshot = None;
+    if apply && config.governor.smooth {
+        governor_snapshot = Some(governor::capture(&profile));
         let nodes = governor::apply(&profile, &config.governor);
         governor_last_us = now_us();
-        tracing::info!(
-            nodes,
-            smooth = config.governor.smooth,
-            "governor pacing applied"
-        );
+        tracing::info!(nodes, "governor pacing applied");
     }
 
     let mut touches: Vec<TouchWatcher> = TouchWatcher::open_all();
@@ -737,9 +736,17 @@ pub fn run(
                             // 主配置替换后必须再次合并侧车，即使内容未发生变化。
                             merge_fas_sidecar(&mut config, fas_stamp.as_deref());
                             if apply {
-                                let nodes = governor::apply(&profile, &config.governor);
-                                governor_last_us = now_us();
-                                tracing::info!(nodes, "governor pacing reloaded");
+                                if config.governor.smooth {
+                                    if governor_snapshot.is_none() {
+                                        governor_snapshot = Some(governor::capture(&profile));
+                                    }
+                                    let nodes = governor::apply(&profile, &config.governor);
+                                    governor_last_us = now_us();
+                                    tracing::info!(nodes, "governor pacing reloaded");
+                                } else if let Some(snapshot) = governor_snapshot.take() {
+                                    let nodes = governor::restore(&snapshot);
+                                    tracing::info!(nodes, "governor pacing restored");
+                                }
                             }
                             let decisions = reload_controller(
                                 &mut controller,

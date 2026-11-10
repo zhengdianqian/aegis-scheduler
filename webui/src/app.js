@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '3.6.0';
+  var APP_VERSION = '3.6.5';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -87,7 +87,7 @@
       '</svg>'
   };
 
-  var LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'];
+  var LOG_LEVELS = ['off', 'error', 'warn', 'info', 'debug', 'trace'];
 
   /*
    * 参数分组。区间与 config.rs 的 validate() 一一对应，
@@ -131,6 +131,18 @@
       ]
     },
     {
+      id: 'governor',
+      title: '变频节流（walt）',
+      desc: '接管厂商 walt 的换档节奏：只改“多久允许换一次档”，不设置任何频率上限，也不锁最高频。',
+      fields: [
+        { path: 'governor.smooth', label: '启用换档接管', kind: 'bool', tip: '关闭后完全保持厂商原始 walt 行为，下面四项同时失效。' },
+        { path: 'governor.prediction', label: '预测换档', kind: 'bool', tip: 'walt 的 pl。开启会放大短时唤醒，是顶频尖峰的主要来源；建议关闭。' },
+        { path: 'governor.up_rate_limit_us', label: '升频最小间隔', min: 0, max: 100000, step: 1000, integer: true, unit: 'µs', tip: '两次升频之间的最小间隔。0 = 不限制；越大平均频率越低，但过大可能拖慢重载响应。保存后立即生效。' },
+        { path: 'governor.down_rate_limit_us', label: '降频最小间隔', min: 0, max: 200000, step: 1000, integer: true, unit: 'µs', tip: '两次降频之间的最小间隔。0 = 负载一落就立刻降档；实测加降频节流反而把高频挂住、平均频率更高。保存后立即生效。' },
+        { path: 'governor.reapply_ms', label: '参数补写周期', min: 0, max: 600000, step: 5000, integer: true, unit: 'ms', tip: '被厂商或其它模块改回默认时的重写周期。0 = 只在启动/保存时写一次。保存后立即生效。' }
+      ]
+    },
+    {
       id: 'sample',
       title: '采样与确认',
       desc: '事件采样密度与静默确认时间；采样越稀，自身唤醒越少。',
@@ -139,7 +151,7 @@
         { path: 'events.demand_step', label: '需求上报步长', min: 0.01, max: 0.20, step: 0.01, decimals: 2, tip: '需求变化达到该步长才上报，越大越省唤醒；修改后需重启服务。' },
         { path: 'events.quiet_decay_ms', label: '静默延迟', min: 20, max: 2000, step: 10, integer: true, unit: 'ms', tip: '最后一次触摸后至少经过该时间才允许进入静默。' },
         { path: 'control.floor_settle_ms', label: '静默确认时间', min: 10, max: 1000, step: 10, integer: true, unit: 'ms', tip: '前台负载持续低于进入阈值多久才确认静默。' },
-        { path: 'daemon.log_level', label: '日志级别', kind: 'select', options: LOG_LEVELS, tip: '日志级别越高写入越少；排查问题时可临时调低，修改后需重启服务。' }
+        { path: 'daemon.log_level', label: '日志级别', kind: 'select', options: LOG_LEVELS, tip: 'off = 完全不写日志（默认，最省电）；error/warn 只记异常；info 及以上用于排查。修改后需重启服务。' }
       ]
     }
   ];
@@ -189,6 +201,19 @@
         tip: '硬件范围 ' + formatGhz(cluster.min_khz) + '–' + formatGhz(cluster.max_khz) +
           ' GHz；1 不主动限制。0.5 按硬件最高频率的 50% 向下对齐 OPP，低于最低频率时夹到最低频率；实际频点由守护计算。'
       };
+    });
+  }
+
+  /* 保存前按本机真实拓扑裁剪省电键：换机或不同簇数机型不会残留旧模板。 */
+  function pruneClusterCaps(model) {
+    var caps = model.control && model.control.cluster_cap_ratio;
+    if (!caps || typeof caps !== 'object' || Array.isArray(caps)) return;
+    var fields = clusterCapFields();
+    if (!fields.length) return;
+    var allowed = {};
+    fields.forEach(function (def) { allowed[def.path.split('.').pop()] = true; });
+    Object.keys(caps).forEach(function (key) {
+      if (!allowed[key]) delete caps[key];
     });
   }
 
@@ -642,6 +667,7 @@
   /* ---------- 参数页 ---------- */
 
   function cfgNumberText(def, value) {
+    if (def.kind === 'bool') return value === true || value === 'true' ? '开启' : '关闭';
     if (def.kind === 'select') return String(value == null ? '' : value);
     var number = Number(value);
     if (!isFinite(number)) return '--';
@@ -651,6 +677,7 @@
   }
 
   function cfgRangeText(def) {
+    if (def.kind === 'bool') return '开启 / 关闭';
     if (def.kind === 'select') return def.options.join(' / ');
     if (def.clusterCap) return '>0 且 ≤1';
     return cfgNumberText(def, def.min) + '–' + cfgNumberText(def, def.max);
@@ -670,7 +697,14 @@
       '</div>';
 
     var control;
-    if (def.kind === 'select') {
+    if (def.kind === 'bool') {
+      var enabled = cfgFieldValue(model, def) === true || cfgFieldValue(model, def) === 'true';
+      control =
+        '<select id="' + inputId + '" class="cfg-select" data-field="' + def.path + '">' +
+          '<option value="true"' + (enabled ? ' selected' : '') + '>开启</option>' +
+          '<option value="false"' + (enabled ? '' : ' selected') + '>关闭</option>' +
+        '</select>';
+    } else if (def.kind === 'select') {
       control =
         '<select id="' + inputId + '" class="cfg-select" data-field="' + def.path + '">' +
           def.options.map(function (option) {
@@ -706,6 +740,12 @@
     var errors = {};
     configFields().forEach(function (def) {
       var value = cfgFieldValue(model, def);
+      if (def.kind === 'bool') {
+        if (value !== true && value !== false && value !== 'true' && value !== 'false') {
+          errors[def.path] = '取值只能是开启或关闭';
+        }
+        return;
+      }
       if (def.kind === 'select') {
         if (def.options.indexOf(String(value)) === -1) errors[def.path] = '取值不在允许范围';
         return;
@@ -1321,7 +1361,13 @@
       var number = row.querySelector('input[type="number"]');
       if (number) number.value = text;
       var select = row.querySelector('select');
-      if (select) select.value = text;
+      if (select) {
+        if (def.kind === 'bool') {
+          select.value = (value === true || value === 'true') ? 'true' : 'false';
+        } else {
+          select.value = text;
+        }
+      }
     });
   }
 
@@ -1349,6 +1395,7 @@
     };
 
     var run = function (binary) {
+      pruneClusterCaps(state.cfg.draft);
       var doc = Tempo.Toml.applyModel(state.cfg.doc, state.cfg.draft, CFG_WRITE_PATHS);
       api.applyConfig(binary, doc, function (step) {
         state.cfg.saveMessage = stepText[step] || '保存中…';
@@ -1465,6 +1512,79 @@
     render();
   }
 
+  /*
+   * 防误触滑块：只有按住“小圆圈”拖动才算修改，点轨道其它位置不会跳变。
+   * 拖动过程中只预览数值，松手（change）后才写入配置草稿。
+   */
+  var cfgDrag = { active: false, blocked: false };
+
+  function cfgFieldDef(path) {
+    if (CFG_FIELD_MAP[path]) return CFG_FIELD_MAP[path];
+    var caps = clusterCapFields();
+    for (var i = 0; i < caps.length; i += 1) {
+      if (caps[i].path === path) return caps[i];
+    }
+    return null;
+  }
+
+  function previewCfgValue(def, value) {
+    var row = document.querySelector('.cfgrow[data-key="' + def.path + '"]');
+    if (!row) return;
+    var label = row.querySelector('[data-value-for="' + def.path + '"]');
+    if (label) label.textContent = cfgNumberText(def, value);
+    var number = row.querySelector('input[type="number"]');
+    if (number) number.value = String(value);
+  }
+
+  function onRangePointerDown(event, field) {
+    var def = cfgFieldDef(field.dataset.field);
+    if (!def) return;
+    var value = Number(cfgFieldValue(state.cfg.draft, def));
+    if (!isFinite(value)) value = Number(def.min);
+    var min = Number(def.min);
+    var max = Number(def.max);
+    var ratio = max > min ? (value - min) / (max - min) : 0;
+    ratio = Math.min(1, Math.max(0, ratio));
+    var rect = field.getBoundingClientRect();
+    var thumb = Math.min(22, Math.max(12, rect.height / 2));
+    var center = rect.left + thumb + ratio * Math.max(1, rect.width - thumb * 2);
+    // 按到轨道其它位置时直接拦下，既不改值也不进入拖动。
+    if (Math.abs(event.clientX - center) > 28) {
+      cfgDrag.blocked = true;
+      cfgDrag.active = false;
+      if (event.cancelable) event.preventDefault();
+      return;
+    }
+    cfgDrag.blocked = false;
+    cfgDrag.active = true;
+  }
+
+  function onCfgRangeInput(field) {
+    var def = cfgFieldDef(field.dataset.field);
+    if (!def) return;
+    if (cfgDrag.blocked) {
+      // 兜底：某些内核仍会先改值，这里立刻还原为当前配置。
+      field.value = cfgNumberText(def, cfgFieldValue(state.cfg.draft, def));
+      return;
+    }
+    var value = Number(field.value);
+    if (!isFinite(value)) return;
+    previewCfgValue(def, value);
+  }
+
+  function onCfgRangeCommit(field) {
+    var def = cfgFieldDef(field.dataset.field);
+    if (!def) return;
+    var blocked = cfgDrag.blocked;
+    cfgDrag.blocked = false;
+    cfgDrag.active = false;
+    if (blocked) {
+      field.value = cfgNumberText(def, cfgFieldValue(state.cfg.draft, def));
+      return;
+    }
+    onCfgFieldInput(field);
+  }
+
   function onCfgFieldInput(target) {
     var field = target.closest('[data-field]');
     if (!field) return;
@@ -1475,7 +1595,9 @@
 
     var raw = field.value;
     var value;
-    if (def.kind === 'select') {
+    if (def.kind === 'bool') {
+      value = raw === 'true';
+    } else if (def.kind === 'select') {
       value = raw;
     } else {
       if (raw === '' || raw === '-' || raw === '.') {
@@ -1498,7 +1620,7 @@
     Tempo.Toml.writePath(state.cfg.draft, def.path, value);
     if (def.path === 'charge.stop_at_percent') deriveChargeLatch(state.cfg.draft);
 
-    if (def.kind !== 'select' && field.type === 'number') {
+    if (!def.kind && field.type === 'number') {
       var slider = field.closest('.cfgrow').querySelector('input[type="range"]');
       if (slider) slider.value = String(Math.min(def.max, Math.max(def.min, value)));
     }
@@ -2194,7 +2316,8 @@
       return;
     }
     if (state.cfg.loaded && target.closest && target.closest('[data-field]')) {
-      onCfgFieldInput(target);
+      if (target.type === 'range') onCfgRangeInput(target);
+      else onCfgFieldInput(target);
     }
   }
 
@@ -2213,6 +2336,16 @@
     state.source = api.kind();
     document.getElementById('app').addEventListener('click', onClick);
     document.getElementById('app').addEventListener('input', onInput);
+    document.getElementById('app').addEventListener('pointerdown', function (event) {
+      var field = event.target && event.target.closest
+        ? event.target.closest('input[type="range"][data-field]')
+        : null;
+      if (field && state.cfg.loaded) onRangePointerDown(event, field);
+    }, true);
+    document.getElementById('app').addEventListener('pointercancel', function () {
+      cfgDrag.active = false;
+      cfgDrag.blocked = false;
+    }, true);
     document.getElementById('app').addEventListener('change', function (event) {
       var element = event.target;
       if (!element) return;
@@ -2220,7 +2353,11 @@
         onPlanTimeChange(element);
         return;
       }
-      if (element.tagName === 'SELECT') onInput(event);
+      if (element.tagName === 'SELECT') {
+        onInput(event);
+        return;
+      }
+      if (element.type === 'range' && state.cfg.loaded) onCfgRangeCommit(element);
     });
 
     var resizeTimer = null;

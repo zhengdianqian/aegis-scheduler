@@ -1,7 +1,8 @@
 ﻿# Aegis
 
-**v3.6.2 · versionCode 22**｜Android arm64 CPU 分档自适应调频、可选 FAS UI 帧反馈、充电控制。
+**v3.6.5 · versionCode 23**｜Android arm64 CPU 分档自适应调频、可选 FAS UI 帧反馈、充电控制。
 模块 id：`aegis_scheduler`；APP 包名：`com.aegis.scheduler`；支持通过 KernelSU / Magisk 安装。
+作者：**默默的阿文**。本项目为独立编写与独立署名，不包含第三方模块源码，详见 [PROVENANCE.md](PROVENANCE.md)。
 
 模块根据设备实际 cpufreq policy 生成档案，**主动控制每簇 `scaling_min_freq` 和 `scaling_max_freq`**。本次改进自主控制，但不锁频；真实负载可达硬件允许的 max，仍受温控、驱动和外部约束。正常控制不改 governor，保留厂商温控及 thermal / perf HAL。**厂商 XML 覆盖 apply 仍为 `disabled_unverified_hal_timing`，不能声称已完全屏蔽官方调度。** 厂商 QoS、温控和其他写入者仍可能覆盖或限制结果，不能承诺所有手机兼容、零掉帧或固定省电幅度。
 
@@ -11,7 +12,7 @@
 
 1. 确认设备已 root，保留可用的模块禁用/救砖途径。先禁用其他调频及充电控制模块并重启，避免备份到其限制值；仅自动迁移旧 `tempo_sched`，不会自动识别所有竞争模块。
 2. 首次安装前保存现有 CPU policy、充电状态及旧配置；升级前备份 `/data/adb/tempo/`。**不要把另一台手机的 `profile/` 或 `orig/` 拷到本机使用。**
-3. 在模块管理器刷入 `Aegis-v3.6.2.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v3.6.2.apk`。已有不同签名 APP 可能无法覆盖安装。
+3. 在模块管理器刷入 `Aegis-v3.6.5.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v3.6.5.apk`。已有不同签名 APP 可能无法覆盖安装。
 4. 打开 Aegis，在 root 管理器中为 APP **单独授权超级用户权限**。随模块安装不等于已获 root；也可使用模块管理器支持的 WebUI。
 5. 服务等待开机完成（最多 180 秒）、解锁检查（最多 120 秒）及额外 30 秒，再生成档案、校验配置、备份并启动守护；默认还有 20 秒 cpufreq 只读保护。不要把启动保护期当成调频失效。
 6. 检查状态、探针、频表和读回错误，再逐项检查触摸/长按、冷启动、前台切换、阅读、视频和息屏；充电只允许隔离假节点的沙盒测试，禁止真机充电控制测试。每次只改一类参数，保留原配置和同条件对照记录。
@@ -37,7 +38,7 @@ $CTL logs --lines 80
 
 - 每簇从实际频表按索引抽取档位；默认最多 8 档，可设 6–10，原始频点不足时保留现有档位。负载经 EMA 平滑，升档需确认，常规降档一次一档；亮屏、前台切换、应用启动有独立短窗口。**单纯负载上升不作为应用启动事件。**
 - 同一触摸接触会话固定一次加档目标，不因持续移动或长按叠加；静态长按不重复续 boost；prime 角色不参与触摸加档，但仍可响应负载、启动和帧压力。
-- 低负载下中核偶发顶频来自厂商 `walt`：`pl=1` 的预测会把短时唤醒放大成一次最高频，实测 10 秒轻滑命中 `2707200` 达 80 次。`[governor]` 段只写 `walt/pl` 与 `walt/{up,down}_rate_limit_us`（默认关预测、升频 20 ms 节流、降频不节流），**不设置任何频率上限、不改 min/max**；同场景命中降到 12 次、平均频率 1187→1051 MHz、顶频驻留 9~10 ms→0~1 ms，Settings 滑动 0 掉帧、冷启动耗时不变。降频加节流会把高频“挂”住并抬高平均频率，故默认不给降频节流。
+- 低负载下中核偶发顶频来自厂商 `walt`：`pl=1` 的预测会把短时唤醒放大成一次最高频，实测 10 秒轻滑命中 `2707200` 达 80 次。`[governor]` 段只写 `walt/pl` 与 `walt/{up,down}_rate_limit_us`（默认关预测、升频 40 ms 节流、降频不节流），**不设置任何频率上限、不改 min/max**；同场景命中降到 0、平均频率 1187→1038 MHz、顶频驻留 9~10 ms→0~1 ms，Settings 滑动 0 掉帧、冷启动耗时无回归。降频加节流会把高频“挂”住并抬高平均频率，故默认不给降频节流。
 - 阅读/视频/输入法场景按前台包分类。单次 UI 帧超预算提供短时救援；连续至少 3 次有效超预算反馈才提高阅读/视频自适应地板，健康反馈重置连续计数，反馈间隔过长重新计数。场景改变重置自适应地板；这不是视频解码质量检测。
 - 模块写两端并读回验证，必要时先降低 min 或先提高 max，避免上下限次序冲突。外部改写/驱动拒绝会报告错误并有限退避重试。观察到外部降低 max 后，floor/cap 不越过该约束；只有外部明确放宽才解除。该机制不是内核原子仲裁，无法保证捕获两次读取之间的瞬时限制。正常写入不改 thermal 节点；对 governor 的唯一写入是上述换档节奏（`walt/pl`、`walt/{up,down}_rate_limit_us`），不改档位表与 min/max。内核温控仍可能钳制频率。
 - **不是零轮询**：BPF 有需求观察窗口，探针增加熄屏早退；CPU 区间复核在稳定时退避，异常时仍需检查和重试，看门狗也保留周期检查。FAS 请求采用最新单槽与超时约束；启动日志读取失败采用指数退避。充电沙盒逻辑仍包含预约/停充复核、涓流及写失败重试，控制台在可见总览刷新状态。这些都是代码层面的唤醒与失败路径改进，不能据此声称真机省电。
@@ -66,12 +67,13 @@ FAS 在选中的前台应用上异步读取 `dumpsys gfxinfo <包名> framestats
 
 | 类别 | 当前生效字段及含义 |
 | --- | --- |
-| `[daemon]` | `log_level="info"`；`profile_path="/data/adb/tempo/profile/device.toml"`（模块服务也显式传入该路径） |
+| `[daemon]` | `log_level="off"`（默认不写日志，可用界面临时改 `info` 排查）；`profile_path="/data/adb/tempo/profile/device.toml"`（模块服务也显式传入该路径） |
+| `[governor]` | `smooth=true` 总开关；`prediction=false`（对应 `walt/pl`）；`up_rate_limit_us=40000`（0–100000）、`down_rate_limit_us=0`（0–200000）、`reapply_ms=60000`（0–600000）。只改换档节奏，不设置任何频率上下限；界面上这五项保存后立即生效 |
 | `[events]` | `runtime_quantum_us=250000`（500–300000 µs）、`demand_step=0.10`（0.01–0.20）：探针观察与发布阈值；`screen_path=""` 自动发现屏幕节点；`quiet_decay_ms=60`：最近触摸后的静默等待 |
 | `[control]` 静默 | `floor_enter_ratio=0.05`、`floor_exit_ratio=0.12`（退出必须高于进入）、`floor_settle_ms=60`；`quiet_decay_ms + floor_settle_ms ≤ 300` |
 | 负载分档 | `tier_table_max=8`（6–10）、`up_confirm_ms=120`（40–400）、`down_step_ms=45`（15–200）、`max_up_step=2`（1–4）、`demand_smooth_ms=200`（50–1000） |
 | 交互窗口 | `touch_lift_tiers=1`（1–3）、`touch_lift_ms=150`（20–600）、`launch_lift_ms=1000`（200–1500）、`launch_tier_ratio=0.62`（0.30–0.90）；比例按档位索引计算，不是固定 GHz |
-| 目标与可选上限 | `prime_cap_ratio=0.70`、`ime_cap_ratio=0.45` 约束调度目标档位，不是最高频率限制。`[control.cluster_cap_ratio]` 默认空；键为簇首 CPU（如 `cpu7`），`1.0` 不施加省电上限，`0.5` 按硬件最高频率的 50% 向下贴档，不低于硬件最低频率。温控及外部限制仍有效。 |
+| 目标与可选上限 | `prime_cap_ratio=0.70`、`ime_cap_ratio=0.45` 约束调度目标档位，不是最高频率限制。`[control.cluster_cap_ratio]` 安装/开机时按真实簇拓扑自动生成（1 簇、2 簇、3 簇机型都各自适配，并清理不属于本机的旧键）；`1.0` 不施加省电上限，`0.5` 按硬件最高频率的 50% 向下贴档，不低于硬件最低频率。温控及外部限制仍有效。 |
 | 帧反馈 | `frame_slack_ms=3.0`、`frame_burst_ms=150`、`frame_burst_level=0.70`、`pressure_hold_ms=1000`：超预算余量、短时救援及持续压力保持 |
 | 启动保护 | `startup_guard_ms=20000`（5000–120000）：守护启动后的 cpufreq 只读期，不表示充电控制也暂停 |
 | `[scene]` | `reading_floor_tier` / `video_floor_tier` / `default_floor_tier` 默认 0，允许 0–5、按实际档位截断；`reading_packages` / `video_packages` / `ime_packages` 为分类包名列表，各最多 64 项，不等于 FAS 选包 |
@@ -99,6 +101,45 @@ $CTL apply --file /data/local/tmp/aegis-candidate.toml
 ```
 
 查看返回的 `ok` / `restart_required`。改变探针窗口、发布阈值、日志级别、档案路径或启动保护需重启守护（推荐重启设备）；应用配置可能重置控制状态，之后重新检查。服务启动时无效配置会尝试 `.bak`，再尝试模块默认配置，仍无效则不接管。
+
+## 界面参数怎么设（教学）
+
+APP 与 WebUI 使用同一份配置。滑杆**必须按住小圆圈拖动**才改值，点轨道空白处不会跳变；松手后才写入配置草稿，再点“保存”才下发。数字框可直接输入，保存后界面会以守护读回的结果回填。
+
+### 变频节流（walt）
+
+| 参数 | 默认 | 怎么设 |
+| --- | --- | --- |
+| 启用换档接管 | 开启 | 关闭后完全保持厂商 walt，下面四项同时失效。只有想对比原厂行为时才关 |
+| 预测换档 | 关闭 | 对应 `walt/pl`。低占用时偶尔跳到最高频，主要就是它把短时唤醒放大了；保持关闭 |
+| 升频最小间隔 | 40000 µs | 两次升频的最小间隔。0 = 不限制；越大平均频率越低。轻滑场景 40000 已能明显压下顶频尖峰；调更大要自己重测冷启动和滑动是否仍 0 掉帧 |
+| 降频最小间隔 | 0 | 0 = 负载一落就降档。**不要加**：加节流会把高频“挂”住，平均频率反而更高 |
+| 参数补写周期 | 60000 ms | 被厂商或其它模块改回默认时的重写周期。0 = 只在启动/保存时写一次。频繁被改回再调小 |
+
+这五项**都不是频率上限**，也不会锁最高频；它们只决定多久允许换一次档。保存后立即生效，不需要重启。
+
+### 每簇自愿省电（选配）
+
+- 界面按设备**真实簇拓扑**生成滑杆，例如 `CPU 0, 1, 2`、`CPU 3, 4, 5, 6`、`CPU 7`；两簇机型就只出现两行。刷同一个 ZIP 不会套用别的手机的模板，开机时也会自动补键、删掉不属于本机的旧键。
+- `1.0` = 不限制（默认）；`0.8` = 该簇最高频率约 80%，向下贴到实际 OPP；低于硬件最低频时夹到最低频。
+- 这是**唯一**会主动锁该簇最高频的地方。不确定就保持 1.0，先用“变频节流”改善尖峰。
+
+### 静默与压缩 / 触摸与帧 / 换档与目标档位
+
+- 静默组决定前台空闲时能压多低。“进入阈值”越低越容易进入静默，“退出阈值”必须更高，两者相差太小会来回抖。
+- 触摸组只给一次加档（`touch_lift_tiers`），长按/持续滑动不会叠加；调大更容易跟手，但也更容易把中核拉高。
+- 目标档位比例（`prime_cap_ratio`、`ime_cap_ratio`）限制的是**调度目标档位**，不是硬件上限；真实重载仍可继续往上走。
+
+### 采样与确认
+
+- 采样越稀，守护自身唤醒越少；`runtime_quantum_us` 与 `demand_step` 改大更省电，但反应变慢。改这两项需要重启服务。
+- 日志级别默认 `off`，完全不写日志文件。需要排查时临时改 `warn`/`info`，排查完改回 `off` 并保存。
+
+### 充电与温度
+
+- 停充阈值 80%、恢复阈值 70% 是最常用的组合；恢复必须低于停充。
+- 上限设 100% 时不会在显示 100% 时立刻断充，要等涓流小电流持续足够久才锁存停充。
+- 温度保护到温停充、回落复充；这是充电保护，不改 CPU 频率。
 
 ## 备份与回滚
 
@@ -137,18 +178,24 @@ rustup target add aarch64-linux-android
 .\scripts\build-android.ps1 -Release
 # 重建 WebUI、同步 APP assets、Gradle release、正式签名验证并输出 APK
 .\app\build.ps1
-.\scripts\build-module.ps1 -Version '3.6.2' `
+.\scripts\build-module.ps1 -Version '3.6.5' `
   -BuildDir $env:TEMPO_ANDROID_TARGET_DIR `
-  -Apk 'D:\aegis-build\output\Aegis-v3.6.2.apk' `
+  -Apk 'D:\aegis-build\output\Aegis-v3.6.5.apk' `
   -OutputDir 'D:\aegis-build\output'
 ```
 
 `build-module.ps1` 只打包现有 Android 二进制、`webui/dist/` 和匹配的已签名 APK，不会代替编译。需要直接使用 Cargo 时，先构建非空 `probe/dist/tempo.bpf.o`，设置 NDK linker、CC/AR 和 `CARGO_TARGET_DIR`（参照 `scripts/build-android.ps1`），再运行 `cargo build --release --target aarch64-linux-android --workspace`。不能只编译宿主程序后改名打包。
 
-正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 3.6.2 / 22，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
+正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 3.6.5 / 23，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
 
 ## 验证状态与许可
 
-此 README 描述当前实现与验证方法，**不是 v3.6.2 真机验收报告**。未运行的构建、回归、跨机节点验证及功耗测试不记为成功；旧版本的帧率、电流和频率记录不能代表本版结果，故不在此沿用。正式适配需记录设备/内核/ROM、参数、节点读回、测试条件及同条件对照；降低频率不自动等于降低整机功耗。
+此 README 描述当前实现与验证方法，**不是泛机型验收报告**。未运行的构建、回归、跨机节点验证及功耗测试不记为成功；旧版本的帧率、电流和频率记录不能代表本版结果，故不在此沿用。正式适配需记录设备/内核/ROM、参数、节点读回、测试条件及同条件对照；降低频率不自动等于降低整机功耗。
+
+### v3.6.5 本机实测（小米 13 / 8 Gen 2 领先版，SM8550-AC）
+
+- 超大核硬件最高频 `cpuinfo_max_freq = 3360000`，`profile/device.toml` 已包含该频点；直接把 `scaling_max_freq` 写为 `3360000` 可稳定保持，说明没有被模块或内核硬锁。守护的调度上限只会 ≤ 硬件最高频，重载时可达硬件最高频。
+- 唯一会主动锁定某簇最高频的是 `[control.cluster_cap_ratio]`；默认 `1.0` 不限制。
+- 中核（policy3）设置页轻滑 10 秒：厂商标配平均 1187–1208 MHz；本版默认（关预测 + 40 ms 升频节流 + 不限制降频）约 **1038 MHz**，顶频命中 80 → 0 次，`gfxinfo` 0 掉帧、99th 9 ms，冷启动无回归。**844–1000 MHz 未达到**：再加大升频节流收益趋近于 0（100 ms 时约 1028 MHz），剩余差距来自厂商 perfd 设置的动态最低频与 walt 自身选档，继续压低只能靠限制频率，与本项目“不限制频率省电”的约束冲突，故不做。
 
 GPL-3.0-or-later，见 [LICENSE](LICENSE)。Copyright (c) 2026 默默的阿文。

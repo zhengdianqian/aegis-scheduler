@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 members = [
     "crates/tempo-core",
@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "3.6.2"
+version = "3.6.5"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["默默的阿文"]

@@ -20,6 +20,48 @@ use tempo_core::profile::DeviceProfile;
 
 use crate::writer::policy_dir;
 
+/// 启动时记录厂商 walt 原值；关闭接管时写回，保证“关闭 = 完全不动厂商设置”。
+pub struct Snapshot {
+    nodes: Vec<(std::path::PathBuf, u64)>,
+}
+
+const WALT_NODES: [&str; 3] = ["pl", "up_rate_limit_us", "down_rate_limit_us"];
+
+/// 在写入任何值之前抓取原值。
+pub fn capture(profile: &DeviceProfile) -> Snapshot {
+    let mut nodes = Vec::new();
+    for cluster in &profile.clusters {
+        let Some(cpu) = cluster.cpus.first() else {
+            continue;
+        };
+        let Some(dir) = policy_dir(*cpu) else {
+            continue;
+        };
+        let walt = dir.join("walt");
+        if !walt.is_dir() {
+            continue;
+        }
+        for name in WALT_NODES {
+            let path = walt.join(name);
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Ok(value) = text.trim().parse::<u64>() {
+                    nodes.push((path, value));
+                }
+            }
+        }
+    }
+    Snapshot { nodes }
+}
+
+/// 关闭接管时把原值写回；值与快照一致时不重复写。
+pub fn restore(snapshot: &Snapshot) -> usize {
+    snapshot
+        .nodes
+        .iter()
+        .filter(|(path, value)| write_node(path, *value) == 1)
+        .count()
+}
+
 /// 把平滑参数写到每个簇的 walt 目录。节点不存在时静默跳过，兼容非 walt 机型。
 /// 返回实际写入的节点数。
 pub fn apply(profile: &DeviceProfile, governor: &GovernorConfig) -> usize {

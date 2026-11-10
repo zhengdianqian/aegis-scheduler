@@ -22,8 +22,15 @@
   var DEFAULTS = {
     schema: 1,
     daemon: {
-      log_level: 'warn',
+      log_level: 'off',
       profile_path: '/data/adb/tempo/device.toml'
+    },
+    governor: {
+      smooth: true,
+      prediction: false,
+      up_rate_limit_us: 40000,
+      down_rate_limit_us: 0,
+      reapply_ms: 60000
     },
     events: {
       runtime_quantum_us: 50000,
@@ -577,6 +584,13 @@
         screen_path: pickStringAllowEmpty(src, 'events.screen_path', d.events.screen_path),
         frame_stride: pickNumber(src, 'events.frame_stride', d.events.frame_stride),
         quiet_decay_ms: pickNumber(src, 'events.quiet_decay_ms', d.events.quiet_decay_ms)
+      },
+      governor: {
+        smooth: pickBool(src, 'governor.smooth', d.governor.smooth),
+        prediction: pickBool(src, 'governor.prediction', d.governor.prediction),
+        up_rate_limit_us: pickNumber(src, 'governor.up_rate_limit_us', d.governor.up_rate_limit_us),
+        down_rate_limit_us: pickNumber(src, 'governor.down_rate_limit_us', d.governor.down_rate_limit_us),
+        reapply_ms: pickNumber(src, 'governor.reapply_ms', d.governor.reapply_ms)
       },
       control: {
         quiet_ratio: pickNumber(src, 'control.quiet_ratio', d.control.quiet_ratio),
