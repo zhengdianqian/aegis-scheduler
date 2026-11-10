@@ -1,6 +1,6 @@
 ﻿# Aegis
 
-**v3.6.5 · versionCode 23**｜Android arm64 CPU 分档自适应调频、可选帧反馈（Aegis Frame）、充电控制。
+**v3.8.0 · versionCode 24**｜Android arm64 CPU 分档自适应调频、可选帧反馈（Aegis Frame）、充电控制。
 模块 id：`aegis_scheduler`；APP 包名：`com.aegis.scheduler`；支持通过 KernelSU / Magisk 安装。
 作者：**默默的阿文**。本项目为独立编写与独立署名，不包含第三方模块源码，详见 [PROVENANCE.md](PROVENANCE.md)。
 
@@ -12,7 +12,7 @@
 
 1. 确认设备已 root，保留可用的模块禁用/救砖途径。先禁用其他调频及充电控制模块并重启，避免备份到其限制值；仅自动迁移旧 `tempo_sched`，不会自动识别所有竞争模块。
 2. 首次安装前保存现有 CPU policy、充电状态及旧配置；升级前备份 `/data/adb/tempo/`。**不要把另一台手机的 `profile/` 或 `orig/` 拷到本机使用。**
-3. 在模块管理器刷入 `Aegis-v3.6.5.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v3.6.5.apk`。已有不同签名 APP 可能无法覆盖安装。
+3. 在模块管理器刷入 `Aegis-v3.8.0.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v3.8.0.apk`。已有不同签名 APP 可能无法覆盖安装。
 4. 打开 Aegis，在 root 管理器中为 APP **单独授权超级用户权限**。随模块安装不等于已获 root；也可使用模块管理器支持的 WebUI。
 5. 服务等待开机完成（最多 180 秒）、解锁检查（最多 120 秒）及额外 30 秒，再生成档案、校验配置、备份并启动守护；默认还有 20 秒 cpufreq 只读保护。不要把启动保护期当成调频失效。
 6. 检查状态、探针、频表和读回错误，再逐项检查触摸/长按、冷启动、前台切换、阅读、视频和息屏；充电只允许隔离假节点的沙盒测试，禁止真机充电控制测试。每次只改一类参数，保留原配置和同条件对照记录。
@@ -178,21 +178,30 @@ rustup target add aarch64-linux-android
 .\scripts\build-android.ps1 -Release
 # 重建 WebUI、同步 APP assets、Gradle release、正式签名验证并输出 APK
 .\app\build.ps1
-.\scripts\build-module.ps1 -Version '3.6.5' `
+.\scripts\build-module.ps1 -Version '3.8.0' `
   -BuildDir $env:TEMPO_ANDROID_TARGET_DIR `
-  -Apk 'D:\aegis-build\output\Aegis-v3.6.5.apk' `
+  -Apk 'D:\aegis-build\output\Aegis-v3.8.0.apk' `
   -OutputDir 'D:\aegis-build\output'
 ```
 
 `build-module.ps1` 只打包现有 Android 二进制、`webui/dist/` 和匹配的已签名 APK，不会代替编译。需要直接使用 Cargo 时，先构建非空 `probe/dist/tempo.bpf.o`，设置 NDK linker、CC/AR 和 `CARGO_TARGET_DIR`（参照 `scripts/build-android.ps1`），再运行 `cargo build --release --target aarch64-linux-android --workspace`。不能只编译宿主程序后改名打包。
 
-正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 3.6.5 / 23，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
+正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 3.8.0 / 24，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
 
 ## 验证状态与许可
 
 此 README 描述当前实现与验证方法，**不是泛机型验收报告**。未运行的构建、回归、跨机节点验证及功耗测试不记为成功；旧版本的帧率、电流和频率记录不能代表本版结果，故不在此沿用。正式适配需记录设备/内核/ROM、参数、节点读回、测试条件及同条件对照；降低频率不自动等于降低整机功耗。
 
-### v3.6.5 本机实测（小米 MIX FOLD 3 / 8 Gen 2 领先版，SM8550-AC）
+### v3.8.0 本机实测（小米 MIX FOLD 3 / 8 Gen 2 领先版，SM8550-AC）
+
+- **升级路径**：从 v3.6.5（旧 `[scene]` / `[fas]` 段名与 `fas.json` 侧车）用 KernelSU 刷入 v3.8.0 并重启，服务自动迁移为 `[aegis_app]` / `[aegis_frame]` 与 `aegis-frame.json`；`tempoctl status` 返回 `ok=true`、`version="3.8.0"`，`validate` 通过，模块随包 APK 自动更新到 versionCode 24。
+- **帧反馈 A/B（抖音缓存信息流）**：同一会话内交替开关，真实触摸用 evdev `sendevent` 注入（`input swipe` 只走 InputManager，守护的触摸源看不到，不会触发探测），每阶段 2400–2600 帧，ABBA 各两轮：
+  - 关闭：legacy janky 3.09–3.80%，99th 26–28 ms，中核均值 1.73–1.84 GHz。
+  - 开启：legacy janky 4.26–4.60%，99th 27 ms，中核均值 1.73–1.78 GHz。
+  - 两轮方向相反、差值均在轮次噪声内：**本场景没有可测的流畅度提升，也没有稳定可测的劣化**。该信息流多数帧已在 16 ms 预算内，帧反馈只在探测到超预算帧时才给 150 ms 短时抬档，因此基本不介入；此结果只说明“不会明显拖慢”，不能当作游戏或重载场景的收益证明。
+- **Chrome 不能用来验证帧反馈**：网页渲染在浏览器自有合成器里，`dumpsys gfxinfo com.android.chrome` 只统计浏览器自身 UI 帧（实测每阶段仅 6 帧），滚动的网页帧不在其中。要用 gfxinfo 做对照，目标必须是主线程绘制的普通 View 应用。
+
+### 频率控制与锁频（v3.6.5 起实测，控制逻辑未变）
 
 - 超大核硬件最高频 `cpuinfo_max_freq = 3360000`，`profile/device.toml` 已包含该频点；直接把 `scaling_max_freq` 写为 `3360000` 可稳定保持，说明没有被模块或内核硬锁。守护的调度上限只会 ≤ 硬件最高频，重载时可达硬件最高频。
 - 唯一会主动锁定某簇最高频的是 `[control.cluster_cap_ratio]`；默认 `1.0` 不限制。
