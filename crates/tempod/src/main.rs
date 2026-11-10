@@ -19,6 +19,8 @@ mod event_loop;
 mod fas;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod foreground;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod governor;
 mod ipc;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod launch;

@@ -1,6 +1,7 @@
 # ---- Rust / Cargo ----
 target/
 **/target/
+target-android/
 *.rs.bk
 
 # ---- Android / Gradle ----

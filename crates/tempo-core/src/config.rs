@@ -52,7 +52,27 @@ pub struct Config {
     pub thermal: ThermalConfig,
     pub fas: FasConfig,
     pub scene: SceneConfig,
+    pub governor: GovernorConfig,
     pub ui: UiConfig,
+}
+
+/// 厂商 walt governor 的换档节奏接管。
+///
+/// 只调整“多久允许换一次档、是否做预测”，不设置任何频率上限，也不改
+/// `scaling_min_freq` / `scaling_max_freq`：默认档位仍由调度器自身的档位表决定。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GovernorConfig {
+    /// 总开关。关闭后完全保持厂商原样。
+    pub smooth: bool,
+    /// walt 的预测开关（`walt/pl`）。预测会放大短时唤醒，实测是顶频尖峰的主要来源。
+    pub prediction: bool,
+    /// 升频换档最小间隔（微秒）。只推迟换档时机，不限制能到达的最高频。
+    pub up_rate_limit_us: u64,
+    /// 降频换档最小间隔（微秒）。0 表示不限制降频，负载一落就立刻降档。
+    pub down_rate_limit_us: u64,
+    /// 检测到被厂商/其它模块改回默认时的重写周期；0 表示只在启动和重载时写一次。
+    pub reapply_ms: u64,
 }
 
 /// FAS is opt-in per application. The default is fully off: an empty list means
@@ -228,7 +248,25 @@ impl Default for Config {
             thermal: ThermalConfig::default(),
             fas: FasConfig::default(),
             scene: SceneConfig::default(),
+            governor: GovernorConfig::default(),
             ui: UiConfig::default(),
+        }
+    }
+}
+
+impl Default for GovernorConfig {
+    fn default() -> Self {
+        Self {
+            // 实测（设置页轻滑 10 秒 ftrace，Aegis 冻结、纯 governor 对比）：
+            // 厂商标配中核换档 1872 次、命中 2707200 共 80 次、平均 1187~1208MHz；
+            // 关预测 + 20ms 升频节流 + 不限制降频后降到 540 次、12 次、1051~1062MHz，
+            // 顶频驻留从 9~10ms 降到 0~1ms，Settings 滑动 0 掉帧。
+            // 降频不加节流是关键：加了反而把高频“挂”住，平均频率会升高。
+            smooth: true,
+            prediction: false,
+            up_rate_limit_us: 20_000,
+            down_rate_limit_us: 0,
+            reapply_ms: 60_000,
         }
     }
 }
@@ -625,6 +663,16 @@ impl Config {
         }
         if !(50..=1_000).contains(&c.demand_smooth_ms) {
             bad.push("control.demand_smooth_ms must be 50..=1000".to_owned());
+        }
+
+        if self.governor.up_rate_limit_us > 100_000 {
+            bad.push("governor.up_rate_limit_us must be <= 100000".to_owned());
+        }
+        if self.governor.down_rate_limit_us > 200_000 {
+            bad.push("governor.down_rate_limit_us must be <= 200000".to_owned());
+        }
+        if self.governor.reapply_ms > 600_000 {
+            bad.push("governor.reapply_ms must be <= 600000".to_owned());
         }
 
         for (name, value) in [

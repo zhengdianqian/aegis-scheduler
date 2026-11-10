@@ -116,6 +116,21 @@ profile = "auto"
 [ui]
 language = "zh"
 
+# 接管厂商 walt governor 的换档节奏：只写 walt/pl 与 walt/{up,down}_rate_limit_us，
+# 不设置频率上限，也不改 scaling_min_freq / scaling_max_freq。
+# 实测（设置页轻滑 10 秒 ftrace，Aegis 冻结、纯 governor 对比）：
+#   厂商标配：中核换档 1872 次、命中 2707200 共 80 次、平均 1187~1208MHz；
+#   关预测 + 20ms 升频节流 + 不限制降频：540 次、12 次、1051~1062MHz，
+#   顶频驻留 9~10ms -> 0~1ms，Settings 滑动 0 掉帧，冷启动耗时不变。
+# 降频不要加节流：那会把高频“挂”住，平均频率反而升高（实测 2ms/8ms 时更高）。
+[governor]
+smooth = true
+prediction = false
+up_rate_limit_us = 20000
+down_rate_limit_us = 0
+# 被厂商或其它模块改回默认时的补写周期；0 = 只在启动/重载时写一次。
+reapply_ms = 60000
+
 [fas]
 # 总开关开启且前台包被选中才采样；空列表不代表所有应用。
 enabled = false

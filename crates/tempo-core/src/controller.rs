@@ -28,6 +28,10 @@ use crate::profile::{DeviceProfile, Role};
 const US_PER_MS: u64 = 1_000;
 // FAS 每 2 秒反馈一次，额外留出 500 毫秒调度抖动余量。
 const OVER_BUDGET_SAMPLE_GAP_US: u64 = 2_500_000;
+// 单帧超预算只补 1 档，持续超预算补 2 档；都叠加在已确认负载之上，
+// 低占用时的偶发掉帧不再把整机抬到最高档。
+const BURST_LIFT_TIERS: usize = 1;
+const PRESSURE_LIFT_TIERS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -340,8 +344,19 @@ impl Controller {
         if !self.touch_active {
             self.touch_active = true;
             let steps = self.config.control.touch_lift_tiers.max(1) as usize;
-            for (index, cluster) in self.clusters.iter_mut().enumerate() {
-                cluster.touch_target = (cluster.tier + steps).min(self.tiers[index].len() - 1);
+            // 以已确认负载/场景地板为基准，而不是当前档位：连续轻触、轻滑
+            // 不再把档位一级级累加到最高档。
+            let targets: Vec<usize> = (0..self.clusters.len())
+                .map(|index| {
+                    let count = self.tiers[index].len();
+                    self.load_tier(index)
+                        .max(self.scene_floor(count))
+                        .saturating_add(steps)
+                        .min(count - 1)
+                })
+                .collect();
+            for (cluster, target) in self.clusters.iter_mut().zip(targets) {
+                cluster.touch_target = target;
             }
         }
         self.last_touch_us = ts_us;
@@ -686,6 +701,42 @@ impl Controller {
         self.target_tier(index, ts_us, true)
     }
 
+    /// 需求到负载档位的映射，只表达已确认的 CPU 需求。
+    fn load_tier(&self, index: usize) -> usize {
+        let count = self.tiers[index].len();
+        let cluster = &self.clusters[index];
+        // Leave low demand at the bottom instead of amplifying small background
+        // activity with a concave curve. Sustained 75% demand still opens the
+        // full ladder; touch, launch and frame pressure remain separate paths.
+        let demand = cluster.busy_ema.max(cluster.fg_ema).clamp(0.0, 1.0);
+        let load = ((demand - self.config.control.floor_enter_ratio)
+            / (0.75 - self.config.control.floor_enter_ratio).max(0.01))
+        .clamp(0.0, 1.0);
+        self.ratio_tier(load, count)
+    }
+
+    /// 帧救援目标：在已确认负载档位之上补有限档数，而不是整机顶档。
+    /// 占用很低时即便连续掉帧也最多补 2 档——此时瓶颈通常不在 CPU 频率。
+    fn frame_target_tier(&self, index: usize, over_budget_hits: u32) -> usize {
+        let count = self.tiers[index].len();
+        if count <= 1 {
+            return 0;
+        }
+        let (lift, extra) = if over_budget_hits >= 3 {
+            (PRESSURE_LIFT_TIERS, 1)
+        } else {
+            (BURST_LIFT_TIERS, 0)
+        };
+        // frame_burst_level 只限制帧救援自身可请求的档位，不限制已确认负载。
+        let cap = self
+            .ratio_tier(self.config.control.frame_burst_level, count)
+            .saturating_add(extra);
+        self.load_tier(index)
+            .saturating_add(lift)
+            .min(cap)
+            .min(count - 1)
+    }
+
     fn target_tier(&self, index: usize, ts_us: u64, include_load: bool) -> usize {
         let count = self.tiers[index].len();
         if count <= 1 {
@@ -701,25 +752,25 @@ impl Controller {
             return floor.min(thermal_limit);
         }
 
-        let demand = cluster.busy_ema.max(cluster.fg_ema).clamp(0.0, 1.0);
-        // Leave low demand at the bottom instead of amplifying small background
-        // activity with a concave curve. Sustained 75% demand still opens the
-        // full ladder; touch, launch and frame pressure remain immediate paths.
-        let load = ((demand - self.config.control.floor_enter_ratio)
-            / (0.75 - self.config.control.floor_enter_ratio).max(0.01))
-        .clamp(0.0, 1.0);
         let load_tier = if include_load {
-            self.ratio_tier(load, count)
+            self.load_tier(index)
         } else {
             0
         };
         let mut tier = load_tier.max(floor);
 
-        if self.burst_until_us.is_some_and(|until| ts_us < until) {
-            tier = tier.max(self.ratio_tier(self.config.control.frame_burst_level, count));
-        }
-        if self.pressure_active(ts_us) {
-            tier = count - 1;
+        let pressure = self.pressure_active(ts_us);
+        if pressure
+            || self
+                .burst_until_us
+                .is_some_and(|until| ts_us < until)
+        {
+            let hits = if pressure {
+                3
+            } else {
+                self.over_budget_hits.max(1)
+            };
+            tier = tier.max(self.frame_target_tier(index, hits));
         }
         if self.launch_active(ts_us) {
             tier = tier.max(self.launch_target_tier(count));
@@ -838,9 +889,13 @@ impl Controller {
                         {
                             self.clusters[index].touch_target
                         }
-                        DecisionReason::FrameBurst if self.pressure_active(ts_us) => count - 1,
                         DecisionReason::FrameBurst => {
-                            self.ratio_tier(self.config.control.frame_burst_level, count)
+                            let hits = if self.pressure_active(ts_us) {
+                                3
+                            } else {
+                                self.over_budget_hits.max(1)
+                            };
+                            self.frame_target_tier(index, hits)
                         }
                         _ => 0,
                     };
@@ -1070,6 +1125,55 @@ mod tests {
         let step = c.on_demand(demand(900, 0.0));
         let tier = step[1].tier as usize;
         assert_eq!(tier, high - 1, "one tier per down_step_ms");
+    }
+
+    #[test]
+    fn over_budget_pressure_does_not_pin_top_tier() {
+        let mut c = controller();
+        // 轻负载：设置页、桌面这类 20% 左右的占用。
+        c.on_demand(demand(100, 0.2));
+        c.on_demand(demand(400, 0.2));
+        let light = c.desired_tier(1, 400 * US_PER_MS);
+        assert!(light <= 2, "light load stays low: {light}");
+
+        // 连续 3 帧超预算，触发帧救援窗口。
+        for i in 0..3u64 {
+            c.on_frame(FrameSample {
+                ts_us: (500 + i * 20) * US_PER_MS,
+                render_ms: 40.0,
+                budget_ms: 16.0,
+                foreground: true,
+            });
+        }
+
+        // 短时 burst 结束后仍处于压力窗口：只允许高出负载档 PRESSURE_LIFT_TIERS。
+        let ts = 800 * US_PER_MS;
+        for index in 0..3 {
+            let tier = c.desired_tier(index, ts);
+            assert!(
+                tier < c.tier_table(index).len() - 1,
+                "cluster {index} tier {tier} hit the top on a light frame burst"
+            );
+            assert!(
+                tier <= light + PRESSURE_LIFT_TIERS,
+                "cluster {index} tier {tier} exceeds the bounded lift"
+            );
+        }
+    }
+
+    #[test]
+    fn heavy_demand_still_reaches_top_tier() {
+        let mut c = controller();
+        for i in 0..8u64 {
+            c.on_demand(demand(100 + i * 200, 0.95));
+        }
+        for index in 0..3 {
+            assert_eq!(
+                c.desired_tier(index, 2000 * US_PER_MS),
+                c.tier_table(index).len() - 1,
+                "cluster {index} must still open the full ladder under real load"
+            );
+        }
     }
 
     #[test]

@@ -611,16 +611,43 @@ fn slow_fas_samples_two_seconds_apart_trigger_pressure() {
     }
     controller.on_deadline(4_300 * MS);
     controller.on_deadline(4_500 * MS);
-    assert!(
-        controller.tier(0) > 3,
-        "pressure raises the target above burst"
+    assert_eq!(
+        controller.tier(0),
+        2,
+        "pressure lifts one tier above a single burst but stays bounded without load"
     );
-    controller.on_deadline(5_200 * MS);
     assert!(controller.tier(0) < controller.tier_count(0) - 1);
+    controller.on_deadline(5_200 * MS);
+    assert!(controller.tier(0) < 2);
     assert_eq!(
         controller.cap_tier(0, 5_200 * MS),
         controller.tier_count(0) - 1
     );
+}
+
+#[test]
+fn light_load_frame_pressure_never_reaches_the_top_tier() {
+    // 用户场景：设置页轻轻上下滑动，偶发掉帧但实际占用很低。
+    let mut config = Config::default();
+    config.control.max_up_step = 2;
+    let mut controller = Controller::new(profile(), config);
+    for ts in (100..3_000).step_by(200) {
+        controller.on_demand(demand(ts, 0.03));
+    }
+    for ts in [3_100, 3_200, 3_300, 3_400] {
+        controller.on_frame(frame(ts, 30.0));
+        controller.on_deadline(ts * MS);
+    }
+    for index in 0..3 {
+        let count = controller.tier_count(index);
+        assert!(
+            controller.tier(index) <= 2,
+            "cluster {index} rises to {} of {} on a light frame burst",
+            controller.tier(index),
+            count
+        );
+        assert!(controller.tier(index) < count - 1);
+    }
 }
 
 #[test]
@@ -730,6 +757,28 @@ fn launch_does_not_cash_in_unconfirmed_load() {
         );
         drain_deadlines(&mut controller, 111 * MS);
         assert_eq!(controller.tier(0), controller.tier_count(0) - 1);
+    }
+}
+
+#[test]
+fn rapid_light_taps_do_not_ratchet_the_middle_cluster() {
+    // 用户场景：低占用下连续轻点/轻滑，触摸抬频不能一级级累加到最高档。
+    let mut controller = Controller::new(profile(), Config::default());
+    for ts in (100..1_000).step_by(200) {
+        controller.on_demand(demand(ts, 0.02));
+    }
+    let mut ts = 1_000;
+    for _ in 0..20 {
+        controller.on_touch(ts * MS);
+        controller.on_touch_up((ts + 10) * MS);
+        ts += 20;
+    }
+    for index in 0..3 {
+        assert!(
+            controller.tier(index) <= 2,
+            "cluster {index} climbed to {} on repeated light taps",
+            controller.tier(index)
+        );
     }
 }
 

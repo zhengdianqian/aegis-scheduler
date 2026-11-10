@@ -24,6 +24,7 @@ use tempo_core::{Config, DeviceProfile};
 use crate::charge::ChargeWatcher;
 use crate::fas::FasCollector;
 use crate::foreground::ForegroundResolver;
+use crate::governor;
 use crate::ipc::{self, ControlContext, Outcome, RuntimeStatus};
 use crate::launch::{self, WakePipe};
 use crate::power;
@@ -284,6 +285,18 @@ pub fn run(
             writer.arm_guard(Duration::from_millis(config.control.startup_guard_ms));
             verify_timer.arm(now_us() + config.control.startup_guard_ms.saturating_mul(1000));
         }
+    }
+
+    // walt 换档节奏只改 pl / rate limit，不涉及 min/max，因此不依赖探针是否附着。
+    let mut governor_last_us = 0u64;
+    if apply {
+        let nodes = governor::apply(&profile, &config.governor);
+        governor_last_us = now_us();
+        tracing::info!(
+            nodes,
+            smooth = config.governor.smooth,
+            "governor pacing applied"
+        );
     }
 
     let mut touches: Vec<TouchWatcher> = TouchWatcher::open_all();
@@ -723,6 +736,11 @@ pub fn run(
                             config = parsed;
                             // 主配置替换后必须再次合并侧车，即使内容未发生变化。
                             merge_fas_sidecar(&mut config, fas_stamp.as_deref());
+                            if apply {
+                                let nodes = governor::apply(&profile, &config.governor);
+                                governor_last_us = now_us();
+                                tracing::info!(nodes, "governor pacing reloaded");
+                            }
                             let decisions = reload_controller(
                                 &mut controller,
                                 &profile,
@@ -826,6 +844,17 @@ pub fn run(
 
             if token == CEILING_TIMER {
                 ceiling_timer.drain();
+                let now = now_us();
+                // 厂商或其它模块可能把 walt 参数改回默认；按配置周期补写。
+                let reapply_us = config.governor.reapply_ms.saturating_mul(1000);
+                if apply
+                    && config.governor.smooth
+                    && reapply_us > 0
+                    && now.saturating_sub(governor_last_us) >= reapply_us
+                {
+                    governor::apply(&profile, &config.governor);
+                    governor_last_us = now;
+                }
                 let disturbed = writer
                     .as_mut()
                     .is_some_and(|writer| writer.reconcile().unwrap_or(true));
