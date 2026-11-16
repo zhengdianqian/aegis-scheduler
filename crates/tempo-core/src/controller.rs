@@ -177,6 +177,10 @@ pub struct Controller {
     /// Raised when a video/reading app class still produces over-budget frames;
     /// it is the automatic form of the "walk down until zero drops" calibration.
     adaptive_floor: usize,
+    /// 前景低需求且无交互时收紧该簇上限，抑制静态场景下后台突发顶频。
+    static_cap: bool,
+    /// 最近一次需求样本里前台 pid 集合可用；前台跟踪丢失时不得收紧上限。
+    fg_tracking: bool,
 }
 
 impl Controller {
@@ -240,6 +244,8 @@ impl Controller {
             thermal_cap: None,
             app_class: AppClass::Default,
             adaptive_floor: 0,
+            static_cap: false,
+            fg_tracking: false,
         }
     }
 
@@ -261,11 +267,67 @@ impl Controller {
     }
 
     pub fn cap_khz(&self, index: usize) -> u32 {
-        let user_cap = self.clusters[index].user_cap_khz;
+        let mut cap = self.clusters[index].user_cap_khz;
+        if self.static_cap {
+            // 静态（前台低需求、无交互）时按比例收缩上限：完全静默用 quiet_cap，
+            // 后台仍有活动的静态浏览用 quiet_ratio。任何触摸、启动、帧压力或
+            // 前台负载回升都会立即回到完整上限，不牺牲交互流畅度。
+            let ratio = if self.quiet {
+                self.config.control.quiet_cap
+            } else {
+                self.config.control.quiet_ratio
+            };
+            cap = cap.min(self.ratio_cap_khz(index, ratio));
+        }
         if self.thermal_cap.is_some() {
-            user_cap.min(self.tiers[index][self.thermal_cap_tier(index)])
-        } else {
-            user_cap
+            cap = cap.min(self.tiers[index][self.thermal_cap_tier(index)]);
+        }
+        cap
+    }
+
+    /// 按频率跨度比例向下取到真实档位，与温控上限同一取整方式。
+    fn ratio_cap_khz(&self, index: usize, ratio: f32) -> u32 {
+        let ladder = &self.tiers[index];
+        let min = f64::from(ladder[0]);
+        let max = f64::from(ladder[ladder.len() - 1]);
+        let limit = min + (max - min) * f64::from(ratio.clamp(0.05, 1.0));
+        let tier = ladder.partition_point(|&khz| f64::from(khz) <= limit).saturating_sub(1);
+        ladder[tier]
+    }
+
+    /// 最近是否仍有交互窗口（触摸余量、抬档、启动、帧救援、压力）。
+    fn interaction_clear(&self, ts_us: u64) -> bool {
+        ts_us >= self.last_touch_us + self.config.events.quiet_decay_ms * US_PER_MS
+            && self.lift_until_us.is_none_or(|until| ts_us >= until)
+            && self.launch_until_us.is_none_or(|until| ts_us >= until)
+            && self.burst_until_us.is_none_or(|until| ts_us >= until)
+            && self.pressure_active(ts_us) == false
+    }
+
+    /// 收紧条件：前台跟踪可用、前台瞬时负载低于进入阈值且无交互窗口。
+    /// 释放条件：前台瞬时负载达到退出阈值即刻放行（比进入阈值高，形成迟滞）。
+    /// 单看前台是为了只限制“用户没在用”的后台突发，不压制前台渲染。
+    fn update_static_cap(&mut self, ts_us: u64) {
+        if !self.screen_on {
+            self.static_cap = false;
+            return;
+        }
+        let mut fg_now = 0.0f32;
+        let mut fg_ema = 0.0f32;
+        for cluster in &self.clusters {
+            fg_now = fg_now.max(cluster.fg_raw);
+            fg_ema = fg_ema.max(cluster.fg_ema);
+        }
+        if self.static_cap {
+            // 前台负载回升或任何交互（触摸、启动、抬档、压力）都立刻放行上限。
+            if fg_now >= self.config.control.floor_exit_ratio || !self.interaction_clear(ts_us) {
+                self.static_cap = false;
+            }
+        } else if self.fg_tracking
+            && fg_ema <= self.config.control.floor_enter_ratio
+            && self.interaction_clear(ts_us)
+        {
+            self.static_cap = true;
         }
     }
 
@@ -496,6 +558,8 @@ impl Controller {
         });
         self.last_demand_us = Some(ts);
         self.filter_updated_us = Some(ts);
+        // 前台 pid 集合不可用时不得收紧上限，避免把正在使用的应用压到低顶频。
+        self.fg_tracking = sample.foreground_active;
 
         let mut instant_fg = 0.0f32;
         let mut instant_busy = 0.0f32;
@@ -611,6 +675,15 @@ impl Controller {
                 let decay = self.last_touch_us + self.config.events.quiet_decay_ms * US_PER_MS;
                 consider(settle.max(decay), DeadlineKind::QuietEntry);
             }
+        }
+
+        // 触摸余量结束后需要一次评估才能进入静态限顶；后台繁忙导致没有新的
+        // 需求样本时，这唯一的一次唤醒保证静态上限不会永远等不到机会生效。
+        if self.screen_on && !self.static_cap && !self.interaction_clear(now_us) {
+            consider(
+                self.last_touch_us + self.config.events.quiet_decay_ms * US_PER_MS,
+                DeadlineKind::QuietEntry,
+            );
         }
 
         for (index, cluster) in self.clusters.iter().enumerate() {
@@ -849,6 +922,7 @@ impl Controller {
     fn evaluate(&mut self, ts_us: u64, base_reason: DecisionReason) -> Vec<Decision> {
         self.advance_demand_filter(ts_us);
         self.check_quiet_entry(ts_us);
+        self.update_static_cap(ts_us);
         if self.clusters.is_empty() {
             return Vec::new();
         }

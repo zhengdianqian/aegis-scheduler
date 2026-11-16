@@ -18,10 +18,15 @@ quiet_decay_ms = 60
 
 [control]
 # 以下旧兼容字段仍解析、校验，但不参与当前分档控制：
-# quiet_ratio/quiet_cap、floor_exit_ms/fg_fast_ms/floor_residence_ms、
+# floor_exit_ms/fg_fast_ms/floor_residence_ms、
 # drop_ratio/drop_factor、touch_lift_level/touch_ramp_ms/touch_ramp_stages/touch_decay_ms、
 # launch_lift_level、prime_lift_level/prime_load_cap、ceiling_headroom、
 # reserve_ratio/step_hysteresis/parked_headroom，以及 control.role_cap。
+# quiet_ratio / quiet_cap 在 4.0 起重新生效：静态（前台低需求且无触摸/启动/帧压力）
+# 时按比例收缩该簇 scaling_max_freq，前台负载回升或任何交互立即放开。
+#   quiet_ratio：一般静态浏览的顶频比例（0.5 ≈ 该簇频率跨度的一半）
+#   quiet_cap：完全静默（quiet 生效）时更紧的顶频比例
+# 这是唯一“动态”压顶的地方：进入/退出都以前台负载为准，后台突发被限制在该比例内。
 quiet_ratio = 0.50
 quiet_cap = 0.28
 # 静默按瞬时最大簇需求进入/退出；进入还需满足 settle 和交互窗口结束。
@@ -111,6 +116,8 @@ full_hold_seconds = 9
 
 [thermal]
 # 基于电池温度的附加 CPU 档位限制，不关闭厂商 thermal。
+# 同时是“外部上限让位线”：thermal_c >= guard_c 时尊重外部（云控/性能服务）写下的
+# 上限；低于该温度时由本模块按退避节奏重新写回自己的目标上限，不再被云控压住。
 guard_c = 45.0
 # profile 保留于 schema，当前未实现按此名称选择温控曲线。
 profile = "auto"

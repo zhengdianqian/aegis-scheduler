@@ -862,6 +862,12 @@ pub fn run(
                     governor::apply(&profile, &config.governor);
                     governor_last_us = now;
                 }
+                // 温度保护线下夺回被云控/性能服务改写的频率上限；达到保护线则
+                // 让位外部写入者，把温控优先权交还给系统。
+                let hot = power::thermal_c().is_some_and(|t| t >= config.thermal.guard_c);
+                if let Some(writer) = writer.as_mut() {
+                    writer.set_respect_external(hot);
+                }
                 let disturbed = writer
                     .as_mut()
                     .is_some_and(|writer| writer.reconcile().unwrap_or(true));

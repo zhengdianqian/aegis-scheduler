@@ -79,6 +79,10 @@ pub struct CpufreqWriter {
     guard_until: Option<Instant>,
     suspended: bool,
     enabled: bool,
+    /// 设备温度低于 `thermal.guard_c` 时为 false：外部（云控/性能服务）写下的
+    /// 频率上限不再被永久让位，本模块按退避节奏重新夺回自己的上限；温度达到
+    /// 保护线时为 true，恢复“尊重外部上限”，把温控优先权交还给系统。
+    respect_external: bool,
     pub last_error: Option<String>,
 }
 
@@ -142,6 +146,7 @@ impl CpufreqWriter {
             guard_until: None,
             suspended: false,
             enabled: true,
+            respect_external: true,
             last_error: None,
         })
     }
@@ -158,6 +163,11 @@ impl CpufreqWriter {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    /// 见 `respect_external` 字段说明；由事件循环按当前温度调用。
+    pub fn set_respect_external(&mut self, respect: bool) {
+        self.respect_external = respect;
     }
 
     pub fn needs_initial_apply(&self) -> bool {
@@ -197,6 +207,7 @@ impl CpufreqWriter {
             drifted |= sync_policy(
                 policy,
                 now,
+                self.respect_external,
                 &mut self.applied,
                 &mut self.cap_writes,
                 &mut self.floor_writes,
@@ -240,6 +251,7 @@ impl CpufreqWriter {
             sync_policy(
                 policy,
                 Instant::now(),
+                self.respect_external,
                 &mut self.applied,
                 &mut self.cap_writes,
                 &mut self.floor_writes,
@@ -411,6 +423,7 @@ fn backoff(policy: &mut Policy, now: Instant, problem: String) {
 fn sync_policy(
     policy: &mut Policy,
     now: Instant,
+    respect_external: bool,
     applied: &mut u64,
     cap_writes: &mut u64,
     floor_writes: &mut u64,
@@ -442,13 +455,21 @@ fn sync_policy(
             }
         }
     }
-    let cap = policy
-        .last_cap
-        .min(policy.external_cap.unwrap_or(policy.last_cap));
+    // 温度保护线下不再向外部上限让位：本模块的目标上限直接生效，外部改写会
+    // 走下面既有的退避重试路径，形成有上限的低频争抢，而不是永久放弃。
+    let cap = if respect_external {
+        policy.last_cap.min(policy.external_cap.unwrap_or(policy.last_cap))
+    } else {
+        policy.last_cap
+    };
     let desired = (policy.last_target.min(cap), cap);
-    let constraint = policy
-        .external_cap
-        .map(|cap| format!("{}: external frequency cap {cap}", policy.dir.display()));
+    let constraint = (respect_external && policy.external_cap.is_some()).then(|| {
+        format!(
+            "{}: external frequency cap {}",
+            policy.dir.display(),
+            policy.external_cap.unwrap_or_default()
+        )
+    });
     if live == desired {
         policy.observed = Some(live);
         policy.error = constraint;
@@ -588,6 +609,7 @@ mod tests {
                 guard_until: None,
                 suspended: false,
                 enabled: true,
+                respect_external: true,
                 last_error: None,
             }
         }
@@ -616,6 +638,7 @@ mod tests {
         sync_policy(
             &mut writer.policies[0],
             now,
+            writer.respect_external,
             &mut writer.applied,
             &mut writer.cap_writes,
             &mut writer.floor_writes,
@@ -920,6 +943,28 @@ mod tests {
         assert_eq!(sysfs.range(), (700, 1000));
         assert_eq!(writer.policies[0].external_cap, None);
         assert!(writer.last_error.is_none());
+    }
+
+    #[test]
+    fn cool_device_reasserts_own_cap_over_external_writer() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        writer.apply(&[decision(500, 700, false)]).unwrap();
+        // 外部写入者（云控/性能服务）把上限压到 300。
+        write_khz(&sysfs.0.join("scaling_max_freq"), 300).unwrap();
+        writer.policies[0].observed = Some((500, 300));
+        writer.policies[0].external_cap = Some(300);
+        // 温度保护线下不再让位：我们按自己的目标上限夺回控制权。
+        writer.set_respect_external(false);
+        sync_at(&mut writer, Instant::now());
+        assert_eq!(sysfs.range(), (500, 700));
+        // 外部上限仍被跟踪，温度回升后恢复让位逻辑。
+        assert_eq!(writer.policies[0].external_cap, Some(300));
+        writer.set_respect_external(true);
+        write_khz(&sysfs.0.join("scaling_max_freq"), 300).unwrap();
+        writer.policies[0].last_reconcile = None;
+        sync_at(&mut writer, Instant::now());
+        assert_eq!(sysfs.range().1, 300);
     }
 
     #[test]

@@ -66,37 +66,47 @@ impl ForegroundResolver {
     /// scrolling, so a 2 s throttle still spawned `dumpsys window` every 2 s,
     /// which wakes system_server and window manager and shows up as periodic
     /// jank plus ~0.25% single-core CPU. The top-app set is already the
-    /// authoritative "in front" signal; the IME filter below removes the
-    /// overlay case that `dumpsys` was originally meant to disambiguate.
+    /// authoritative "in front" signal; input-method threads are excluded in
+    /// the vote below so an overlay IME can neither win nor block the app
+    /// behind it.
     pub fn resolve(&mut self, tids: &[u32]) -> Option<&str> {
         if self.imes.is_none() {
             self.imes = Some(ime_packages());
         }
-        let package = top_process(tids);
+        let package = top_process(tids, self.imes.as_ref().unwrap());
         let name = package.map(|name| name.split(':').next().unwrap_or(&name).to_owned());
-        // An input method stealing the focused window is an overlay event, not
-        // an app switch: keep the app behind it so IME show/hide cannot trigger
-        // foreground lifts or frame feedback churn.
-        if let Some(name) = name.as_deref() {
-            if is_ime(name, self.imes.as_ref().unwrap()) {
-                return self.package.as_deref();
-            }
+        // 输入法与系统进程在投票阶段已被排除；这里只处理“投票为空”的瞬时状态
+        // （top-app 集合里暂时只剩输入法/系统线程）。此时保持上一个包名，避免
+        // 键盘或系统线程把前台包清空、制造一次假的前台切换。
+        if name.is_none() {
+            return self.package.as_deref();
         }
         self.package = name;
         self.package.as_deref()
     }
 }
 
-fn top_process(tids: &[u32]) -> Option<String> {
+fn top_process(tids: &[u32], imes: &HashSet<String>) -> Option<String> {
+    let names: Vec<String> = tids
+        .iter()
+        .take(MAX_TIDS)
+        .filter_map(|tid| process_name(*tid))
+        .collect();
+    vote(&names, imes)
+}
+
+/// 在非系统、非输入法的进程名里按线程数投票。
+/// 输入法必须在投票前排除：MIUI 上输入法线程数常年高于前台应用
+/// （实测 sogou 89 线程 vs settings 63 线程），若只在投票后按“赢家是输入法”
+/// 过滤，输入法会永远赢下投票，前台包永远停在上一个应用，前台切换抬档和
+/// 阅读/视频分类因此全部失效。
+fn vote(names: &[String], imes: &HashSet<String>) -> Option<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for tid in tids.iter().take(MAX_TIDS) {
-        let Some(name) = process_name(*tid) else {
-            continue;
-        };
-        if is_system(&name) {
+    for name in names {
+        if is_system(name) || is_ime(name, imes) {
             continue;
         }
-        *counts.entry(name).or_insert(0) += 1;
+        *counts.entry(name.clone()).or_insert(0) += 1;
     }
     counts
         .into_iter()
@@ -171,5 +181,31 @@ mod tests {
         let mut resolver = ForegroundResolver::new();
         resolver.package = Some("com.example.reader".to_owned());
         assert_eq!(resolver.package(), Some("com.example.reader"));
+    }
+
+    #[test]
+    fn ime_threads_never_outvote_the_foreground_app() {
+        let imes: HashSet<String> = ["com.sohu.inputmethod.sogou.xiaomi"]
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        // 输入法线程数（10）高于前台应用（4）：投票仍必须给出前台应用。
+        let mut names: Vec<String> = vec![
+            "com.android.settings".to_owned(),
+            "com.android.settings".to_owned(),
+            "com.android.settings".to_owned(),
+            "com.android.settings".to_owned(),
+        ];
+        for _ in 0..10 {
+            names.push("com.sohu.inputmethod.sogou.xiaomi".to_owned());
+        }
+        names.push("system_server".to_owned());
+        assert_eq!(
+            vote(&names, &imes).as_deref(),
+            Some("com.android.settings")
+        );
+        // 只剩输入法与系统线程时返回 None，由调用方保持上一个包名。
+        let only_ime: Vec<String> = vec!["com.sohu.inputmethod.sogou.xiaomi".to_owned()];
+        assert_eq!(vote(&only_ime, &imes), None);
     }
 }

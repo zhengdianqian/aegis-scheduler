@@ -1,6 +1,6 @@
 # Aegis
 
-**v3.8.1 · versionCode 25**｜Android arm64 CPU 分档自适应调频、可选帧反馈（Aegis Frame）、充电控制。
+**v4.0 · versionCode 26**｜Android arm64 CPU 分档自适应调频、可选帧反馈（Aegis Frame）、充电控制。
 模块 id：`aegis_scheduler`；APP 包名：`com.aegis.scheduler`；支持通过 KernelSU / Magisk 安装。
 作者：**默默的阿文**。本项目为独立编写与独立署名，不包含第三方模块源码，详见 [PROVENANCE.md](PROVENANCE.md)。
 
@@ -12,7 +12,7 @@
 
 1. 确认设备已 root，保留可用的模块禁用/救砖途径。先禁用其他调频及充电控制模块并重启，避免备份到其限制值；仅自动迁移旧 `tempo_sched`，不会自动识别所有竞争模块。
 2. 首次安装前保存现有 CPU policy、充电状态及旧配置；升级前备份 `/data/adb/tempo/`。**不要把另一台手机的 `profile/` 或 `orig/` 拷到本机使用。**
-3. 在模块管理器刷入 `Aegis-v3.8.1.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v3.8.1.apk`。已有不同签名 APP 可能无法覆盖安装。
+3. 在模块管理器刷入 `Aegis-v4.0.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v4.0.apk`。已有不同签名 APP 可能无法覆盖安装。
 4. 打开 Aegis，在 root 管理器中为 APP **单独授权超级用户权限**。随模块安装不等于已获 root；也可使用模块管理器支持的 WebUI。
 5. 服务等待开机完成（最多 180 秒）、解锁检查（最多 120 秒）及额外 30 秒，再生成档案、校验配置、备份并启动守护；默认还有 20 秒 cpufreq 只读保护。不要把启动保护期当成调频失效。
 6. 检查状态、探针、频表和读回错误，再逐项检查触摸/长按、冷启动、前台切换、阅读、视频和息屏；充电只允许隔离假节点的沙盒测试，禁止真机充电控制测试。每次只改一类参数，保留原配置和同条件对照记录。
@@ -74,6 +74,7 @@ APP / WebUI 共用控制服务和配置，提供状态、调度、帧反馈选�
 | 负载分档 | `tier_table_max=8`（6–10）、`up_confirm_ms=120`（40–400）、`down_step_ms=45`（15–200）、`max_up_step=2`（1–4）、`demand_smooth_ms=200`（50–1000） |
 | 交互窗口 | `touch_lift_tiers=1`（1–3）、`touch_lift_ms=150`（20–600）、`launch_lift_ms=1000`（200–1500）、`launch_tier_ratio=0.62`（0.30–0.90）；比例按档位索引计算，不是固定 GHz |
 | 目标与可选上限 | `prime_cap_ratio=0.70`、`ime_cap_ratio=0.45` 约束调度目标档位，不是最高频率限制。`[control.cluster_cap_ratio]` 安装/开机时按真实簇拓扑自动生成（1 簇、2 簇、3 簇机型都各自适配，并清理不属于本机的旧键）；`1.0` 不施加省电上限，`0.5` 按硬件最高频率的 50% 向下贴档，不低于硬件最低频率。温控及外部限制仍有效。 |
+| 静态限顶（4.0） | `quiet_ratio=0.50`（静态浏览）、`quiet_cap=0.28`（完全静默）：前台低需求且无触摸/启动/帧压力时，把该簇 `scaling_max_freq` 收缩到频率跨度的该比例；**前台瞬时负载 ≥ `floor_exit_ratio` 或任何交互立刻放开到完整上限**。前台 pid 集合不可用时不收紧。这是动态行为，不改 `cluster_cap_ratio` 的静态省电语义。 |
 | 帧反馈 | `frame_slack_ms=3.0`、`frame_burst_ms=150`、`frame_burst_level=0.70`、`pressure_hold_ms=1000`：超预算余量、短时救援及持续压力保持 |
 | 启动保护 | `startup_guard_ms=20000`（5000–120000）：守护启动后的 cpufreq 只读期，不表示充电控制也暂停 |
 | `[aegis_app]` | `reading_floor_tier` / `video_floor_tier` / `default_floor_tier` 默认 0，允许 0–5、按实际档位截断；`reading_packages` / `video_packages` / `ime_packages` 为分类包名列表，各最多 64 项，不等于帧反馈选包 |
@@ -85,7 +86,7 @@ APP / WebUI 共用控制服务和配置，提供状态、调度、帧反馈选�
 
 **旧兼容字段不等于生效调参项。** 当前分档控制不读取以下字段来决定频率，但仍解析并校验，勿随意删除约束或填写越界值：
 
-- `[control]` 的 `quiet_ratio`、`quiet_cap`、`floor_exit_ms`、`fg_fast_ms`、`floor_residence_ms`、`drop_ratio`、`drop_factor`、`touch_lift_level`、`touch_ramp_ms`、`touch_ramp_stages`、`touch_decay_ms`、`launch_lift_level`、`prime_lift_level`、`prime_load_cap`、`ceiling_headroom`、`reserve_ratio`、`step_hysteresis`、`parked_headroom`，及 `[control.role_cap]` 全组。
+- `[control]` 的 `floor_exit_ms`、`fg_fast_ms`、`floor_residence_ms`、`drop_ratio`、`drop_factor`、`touch_lift_level`、`touch_ramp_ms`、`touch_ramp_stages`、`touch_decay_ms`、`launch_lift_level`、`prime_lift_level`、`prime_load_cap`、`ceiling_headroom`、`reserve_ratio`、`step_hysteresis`、`parked_headroom`，及 `[control.role_cap]` 全组。**`quiet_ratio` / `quiet_cap` 自 4.0 起重新生效，已不在本清单**，见上表“静态限顶（4.0）”。
 - `[events].frame_stride` 不用于当前 gfxinfo 抽帧；`[thermal].profile` 未选择实际温控曲线；`[charge].latch_per_plug` 的实际锁存逻辑由 `stop_at_percent == 100` 推导。
 
 3.4 已从默认模板移除未定义且不生效的 `flat_ceiling_bias`、`task_fit_margin`、`max_single_burst_us`、`log_cooldown_us`、`pose_swap_grace_us`。迁移旧配置时也应删除这些项，再执行 `--check`；不要把不存在的参数当作调优开关。
@@ -178,19 +179,25 @@ rustup target add aarch64-linux-android
 .\scripts\build-android.ps1 -Release
 # 重建 WebUI、同步 APP assets、Gradle release、正式签名验证并输出 APK
 .\app\build.ps1
-.\scripts\build-module.ps1 -Version '3.8.0' `
+.\scripts\build-module.ps1 -Version '4.0' `
   -BuildDir $env:TEMPO_ANDROID_TARGET_DIR `
-  -Apk 'D:\aegis-build\output\Aegis-v3.8.1.apk' `
+  -Apk 'D:\aegis-build\output\Aegis-v4.0.apk' `
   -OutputDir 'D:\aegis-build\output'
 ```
 
 `build-module.ps1` 只打包现有 Android 二进制、`webui/dist/` 和匹配的已签名 APK，不会代替编译。需要直接使用 Cargo 时，先构建非空 `probe/dist/tempo.bpf.o`，设置 NDK linker、CC/AR 和 `CARGO_TARGET_DIR`（参照 `scripts/build-android.ps1`），再运行 `cargo build --release --target aarch64-linux-android --workspace`。不能只编译宿主程序后改名打包。
 
-正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 3.8.1 / 25，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
+正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 4.0 / 26，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
 
 ## 验证状态与许可
 
 此 README 描述当前实现与验证方法，**不是泛机型验收报告**。未运行的构建、回归、跨机节点验证及功耗测试不记为成功；旧版本的帧率、电流和频率记录不能代表本版结果，故不在此沿用。正式适配需记录设备/内核/ROM、参数、节点读回、测试条件及同条件对照；降低频率不自动等于降低整机功耗。
+
+### v4.0 变更（小米 MIX FOLD 3 / 8 Gen 2 领先版，本机验证）
+
+- **静态限顶**：新增“前台低需求 + 无交互 → 按 `quiet_ratio` / `quiet_cap` 收缩每簇 `scaling_max_freq`”。本机实测静态时 `policy0/3/7` 上限为 `1017600 / 1651200 / 1977600`；连续滑动（前台瞬时负载 ≥ `floor_exit_ratio`）立即放开到 `2016000 / 2803200 / 3360000`，停止约 1 秒后重新收紧。触摸抬档、应用启动、帧救援窗口期间一律不收紧。**未做长时续航对照，不声称具体省电幅度。**
+- **外部上限策略**：`thermal_c >= thermal.guard_c` 时维持原“尊重外部上限”；低于该温度时不再把外部（云控/性能服务）写下的上限当作最终约束，按既有退避节奏写回自己的目标上限。本机实测冷态下 `policy3` 不再被固定在 `2707200`（`cap_writes` 持续、`writer.error` 不再报 external cap）。**争抢有退避上限（≤5 s/簇），不是实时对写；未验证高温下厂商温控的完整交互。**
+- **已知未解决问题**：`scaling_min_freq` 仍存在外部写入者（实测读回 `672000`/`1459200` 等非本模块目标值，`rejected_floor` 持续增长，约 86% 的下限写入被改回）。4.0 未改变下限争抢策略，仅保持有界退避；来源在 `powerkeeper` 暂停测试中显著下降但未最终确认（`scene-daemon` 暂停无显著差异）。该问题主要影响下限，不阻塞静态限顶与上限回收。
 
 ### v3.8.0 本机实测（小米 MIX FOLD 3 / 8 Gen 2 领先版，SM8550-AC）
 
