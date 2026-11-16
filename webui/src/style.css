@@ -261,6 +261,7 @@ body::before {
 
 .pill--quiet { color: #9af0de; background: rgba(85, 224, 207, 0.14); border: 1px solid rgba(85, 224, 207, 0.32); }
 .pill--active { color: #ffe0ae; background: rgba(255, 191, 105, 0.14); border: 1px solid rgba(255, 191, 105, 0.30); }
+.pill--cap { color: #9ec5ff; background: rgba(99, 167, 255, 0.14); border: 1px solid rgba(99, 167, 255, 0.32); }
 
 .meta {
   display: grid;

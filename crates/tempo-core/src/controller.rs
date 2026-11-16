@@ -347,6 +347,11 @@ impl Controller {
         self.quiet
     }
 
+    /// 静态限顶是否正在生效（见 `cap_khz`）。
+    pub fn is_static_cap(&self) -> bool {
+        self.static_cap
+    }
+
     pub fn is_screen_on(&self) -> bool {
         self.screen_on
     }

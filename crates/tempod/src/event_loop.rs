@@ -181,6 +181,7 @@ pub fn run(
 
     let status: Arc<Mutex<RuntimeStatus>> = Arc::new(Mutex::new(RuntimeStatus {
         config_generation: 1,
+        respect_external: true,
         ..RuntimeStatus::default()
     }));
 
@@ -573,11 +574,12 @@ pub fn run(
                             });
                             // 负载突增交给需求换档；倍速播放和弹幕不是应用启动。
                             let quiet = controller.is_quiet();
+                            let static_cap = controller.is_static_cap();
                             // One lock for both the sample snapshot and the
                             // smoothed usage: the WebUI only needs the newest
                             // values, and a static page must not pay for a
                             // second mutex round trip per sample.
-                            record(&status, Some(&sample), Some(quiet));
+                            record(&status, Some(&sample), Some(quiet), Some(static_cap));
                             commit(&decisions, &mut writer, &status);
                             match controller.next_deadline(sample.ts_us) {
                                 Some(deadline) => deadline_source.arm(deadline.at_us),
@@ -610,6 +612,7 @@ pub fn run(
                         if let Ok(mut state) = status.lock() {
                             state.screen_on = on;
                             state.quiet = controller.is_quiet();
+                            state.static_cap = controller.is_static_cap();
                             state.frame_active = false;
                         }
                         commit(&decisions, &mut writer, &status);
@@ -867,6 +870,9 @@ pub fn run(
                 let hot = power::thermal_c().is_some_and(|t| t >= config.thermal.guard_c);
                 if let Some(writer) = writer.as_mut() {
                     writer.set_respect_external(hot);
+                }
+                if let Ok(mut state) = status.lock() {
+                    state.respect_external = !hot;
                 }
                 let disturbed = writer
                     .as_mut()
@@ -1150,6 +1156,7 @@ fn reload_controller(
     if let Ok(mut state) = status.lock() {
         state.app_class = app_class.as_str().to_owned();
         state.quiet = controller.is_quiet();
+        state.static_cap = controller.is_static_cap();
     }
     decisions
 }
@@ -1196,6 +1203,7 @@ fn record(
     status: &Arc<Mutex<RuntimeStatus>>,
     sample: Option<&probe::DemandSnapshot>,
     quiet: Option<bool>,
+    static_cap: Option<bool>,
 ) {
     if let Ok(mut state) = status.lock() {
         if let Some(sample) = sample {
@@ -1219,6 +1227,9 @@ fn record(
         }
         if let Some(quiet) = quiet {
             state.quiet = quiet;
+        }
+        if let Some(static_cap) = static_cap {
+            state.static_cap = static_cap;
         }
     }
 }

@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '3.8.1';
+  var APP_VERSION = '4.2.0';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -96,13 +96,15 @@
   var CFG_GROUPS = [
     {
       id: 'quiet',
-      title: '静默与压缩',
-      desc: '前台空闲时能压到多低、落到最低频有多快。',
+      title: '静默与静态限顶',
+      desc: '前台空闲时能压到多低、落到最低频有多快；静态时每簇顶频收缩到多低，前台一忙或任何交互当拍放开。',
       fields: [
         { path: 'control.demand_smooth_ms', label: '需求平滑时间', min: 50, max: 1000, step: 10, integer: true, unit: 'ms', tip: '需求滤波时间常数。' },
-        { path: 'control.floor_exit_ratio', label: '静默退出阈值', min: 0.02, max: 0.40, step: 0.01, decimals: 2, tip: '前台负载达到该比例后退出静默。' },
-        { path: 'control.floor_enter_ratio', label: '静默进入阈值', min: 0.005, max: 0.20, step: 0.005, decimals: 3, tip: '前台阶梯负载持续低于该比例，视为没有有效前台工作。' },
-        { path: 'control.down_step_ms', label: '降档间隔', min: 15, max: 200, step: 1, integer: true, unit: 'ms', tip: '每次下降一档的最小间隔。' }
+        { path: 'control.floor_exit_ratio', label: '静默退出阈值', min: 0.02, max: 0.40, step: 0.01, decimals: 2, tip: '前台负载达到该比例后退出静默；也是静态限顶的“当拍放开”阈值（按瞬时前台负载判定）。' },
+        { path: 'control.floor_enter_ratio', label: '静默进入阈值', min: 0.005, max: 0.20, step: 0.005, decimals: 3, tip: '前台阶梯负载持续低于该比例，视为没有有效前台工作；也是静态限顶的进入阈值（按平滑前台负载判定）。' },
+        { path: 'control.down_step_ms', label: '降档间隔', min: 15, max: 200, step: 1, integer: true, unit: 'ms', tip: '每次下降一档的最小间隔。' },
+        { path: 'control.quiet_ratio', label: '静态限顶比例', min: 0.05, max: 0.95, step: 0.01, decimals: 2, tip: '静态（前台低需求、无触摸/启动/帧压力）时该簇 scaling_max_freq 收缩到硬件频率跨度的该比例；前台瞬时负载达到退出阈值或任何交互当拍放开，只压“用户没在用”的后台突发。0.5 ≈ 频率跨度一半；1 = 关闭静态限顶。' },
+        { path: 'control.quiet_cap', label: '完全静默限顶比例', min: 0.05, max: 0.90, step: 0.01, decimals: 2, tip: '完全静默（静默态）时在静态限顶基础上进一步收紧的顶频比例；退出静默立即回到静态限顶比例。' }
       ]
     },
     {
@@ -112,10 +114,12 @@
       fields: [
         { path: 'control.touch_lift_ms', label: '触摸抬频窗口', min: 20, max: 600, step: 10, integer: true, unit: 'ms', tip: '一次触摸后维持抬频的时间。' },
         { path: 'control.touch_lift_tiers', label: '触摸抬升档数', min: 1, max: 3, step: 1, integer: true, tip: '触摸提升档数，不直接抬升超大核。' },
+        { path: 'control.launch_lift_ms', label: '启动抬频窗口', min: 200, max: 1500, step: 50, integer: true, unit: 'ms', tip: '应用启动与亮屏解锁后的抬频窗口；窗口内静态限顶不生效。' },
         { path: 'control.launch_tier_ratio', label: '启动档位比例', min: 0.30, max: 0.90, step: 0.01, decimals: 2, tip: '启动与前台切换的预热档位。' },
         { path: 'control.frame_slack_ms', label: '帧余量', min: 0.5, max: 20.0, step: 0.5, decimals: 1, unit: 'ms', tip: '渲染时间允许超出帧预算的余量。' },
         { path: 'control.frame_burst_ms', label: '掉帧抬频窗口', min: 40, max: 1000, step: 10, integer: true, unit: 'ms', tip: '检测到帧超时后的一次性抬频时间。' },
-        { path: 'control.frame_burst_level', label: '掉帧抬频目标', min: 0.10, max: 1.0, step: 0.01, decimals: 2, tip: '掉帧抬频窗口内允许达到的频率比例。' }
+        { path: 'control.frame_burst_level', label: '掉帧抬频目标', min: 0.10, max: 1.0, step: 0.01, decimals: 2, tip: '掉帧抬频窗口内允许达到的频率比例。' },
+        { path: 'control.pressure_hold_ms', label: '帧压力保持', min: 300, max: 5000, step: 100, integer: true, unit: 'ms', tip: '连续超预算反馈后维持抬档状态的时间；期间静态限顶不生效。' }
       ]
     },
     {
@@ -163,16 +167,19 @@
       desc: '设置停止充电的电量；100% 时先涓流，确认真正充满后自动停充并保持。',
       fields: [
         { path: 'charge.stop_at_percent', label: '停充阈值', min: 50, max: 100, step: 1, integer: true, unit: '%', presets: [80, 90, 100], tip: '电量达到该值后停止充电；100% 时先充到 100% 再涓流，真正充满后停充。' },
-        { path: 'charge.resume_at_percent', label: '恢复阈值', min: 20, max: 99, step: 1, integer: true, unit: '%', tip: '普通上限时，电量降到该值以下才继续充电；100% 时改为重新插电恢复。' }
+        { path: 'charge.resume_at_percent', label: '恢复阈值', min: 20, max: 99, step: 1, integer: true, unit: '%', tip: '普通上限时，电量降到该值以下才继续充电；100% 时改为重新插电恢复。' },
+        { path: 'charge.full_current_ma', label: '涓流判定电流', min: 20, max: 1000, step: 10, integer: true, unit: 'mA', tip: '仅停充阈值 100% 时参与判定：充电电流绝对值持续低于该值才算“真充满”。' },
+        { path: 'charge.full_hold_seconds', label: '涓流判定时长', min: 1, max: 60, step: 1, integer: true, unit: 's', tip: '仅停充阈值 100% 时参与判定：小电流需持续该时长才锁存停充；驱动上报 Full 时立即锁存。' }
       ]
     },
     {
       id: 'thermal',
-      title: '温度保护',
-      desc: '电池到温即停充，温度回落再恢复。',
+      title: '温度与让位线',
+      desc: '停充用电池温度；守护的让位线用最热温区：达到让位线后完全尊重外部（云控/温控）写下的频率上限。',
       fields: [
         { path: 'charge.temp_stop_c', label: '停充温度', min: 20, max: 70, step: 0.5, decimals: 1, unit: '°C', tip: '电池达到该温度时停止充电。' },
-        { path: 'charge.temp_resume_c', label: '恢复温度', min: 20, max: 69, step: 0.5, decimals: 1, unit: '°C', tip: '电池回落到该温度后恢复充电。' }
+        { path: 'charge.temp_resume_c', label: '恢复温度', min: 20, max: 69, step: 0.5, decimals: 1, unit: '°C', tip: '电池回落到该温度后恢复充电。' },
+        { path: 'thermal.guard_c', label: '频率上限让位线', min: 20, max: 80, step: 1, integer: true, unit: '°C', tip: '守护读取的最热温区低于该温度时，按退避节奏夺回外部（云控/性能服务）写下的频率上限；达到该温度即让位，温控优先。' }
       ]
     }
   ];
@@ -384,6 +391,16 @@
     var running = !!status;
     var mode = running ? '自适应调度' : '等待连接';
     var quiet = running && status.control && status.control.quiet;
+    var staticCap = running && status.control && status.control.static_cap;
+    var reclaim = running && status.writer && status.writer.respect_external;
+    var pills = '';
+    if (running) {
+      if (staticCap) pills += '<span class="pill pill--cap" title="前台低需求且无交互，每簇顶频正按 quiet_ratio 收缩">静态限顶</span>';
+      pills += quiet
+        ? '<span class="pill pill--quiet">静默中</span>'
+        : '<span class="pill pill--active">活跃</span>';
+      if (reclaim) pills += '<span class="pill pill--cap" title="温度低于让位线，正按退避节奏夺回外部写下的频率上限">云控回收</span>';
+    }
     var uptime = running ? formatDuration(status.uptime_ms) : '--';
     var version = 'v' + APP_VERSION;
 
@@ -397,9 +414,7 @@
               '<small>' + escapeHtml(mode) + '</small>' +
             '</div>' +
           '</div>' +
-          (running
-            ? '<span class="pill pill--' + (quiet ? 'quiet' : 'active') + '">' + (quiet ? '静默中' : '活跃') + '</span>'
-            : '') +
+          pills +
         '</div>' +
         '<div class="meta">' +
           '<div class="meta__cell"><span>版本</span><b>' + escapeHtml(version) + '</b></div>' +

@@ -31,6 +31,10 @@ pub struct RuntimeStatus {
     pub fg_switches: Vec<u64>,
     pub switches: Vec<u64>,
     pub quiet: bool,
+    /// 静态限顶是否生效（前台低需求且无交互，正按 quiet_ratio/quiet_cap 收缩上限）。
+    pub static_cap: bool,
+    /// 温度低于保护线时为 true：正在按退避节奏夺回外部（云控）写下的频率上限。
+    pub respect_external: bool,
     pub decisions: Vec<Decision>,
     pub touch_sources: usize,
     pub touch_events: u64,
@@ -233,9 +237,11 @@ pub fn status_json(
             "floor_writes": runtime.floor_writes,
             "rejected_floor": runtime.rejected_floor,
             "error": runtime.write_error,
+            "respect_external": runtime.respect_external,
         },
         "control": {
             "quiet": runtime.quiet,
+            "static_cap": runtime.static_cap,
             "decisions": runtime.decisions,
         },
     })

@@ -23,8 +23,8 @@ android {
         applicationId = "com.aegis.scheduler"
         minSdk = 24
         targetSdk = 36
-        versionCode = 26
-        versionName = "4.0"
+        versionCode = 27
+        versionName = "4.2.0"
     }
 
     signingConfigs {
