@@ -1,6 +1,15 @@
-# Aegis v3.6.0 默认配置，schema=1，单一自适应模式。
+# Aegis v5.0.0 默认配置，schema=1，AegisAuto 完全接管为默认模式。
 # 开机从 sysfs 推导拓扑；capacity 缺失时估算，频表缺失时仅保留端点。
 schema = 1
+
+# 对外模式名就是配置里显示的名字：
+#   AegisAuto —— 软件完全接管调频：内核提供 userspace governor 时切到
+#                userspace 并直写 scaling_setspeed；不提供时等效锁定
+#                min=max（内核调度器无权变频），两条路共用同一套
+#                eBPF 负载 EMA + 触摸/启动/帧感知决策与安全看门狗。
+#   Standard  —— 保留厂商 walt/schedutil，Aegis 只按 v4 行为约束上下限。
+[mode]
+name = "AegisAuto"
 
 [daemon]
 # off = 完全不写日志（默认，最省电）；排查问题时可在 WEBUI/APP 临时改为 info。
@@ -78,6 +87,22 @@ lookahead_tiers = 3
 startup_guard_ms = 20000
 pressure_hold_ms = 1000
 demand_smooth_ms = 200
+
+# ---- AegisAuto 日常完全接管（Standard 模式忽略以下三项） -------------------
+# 目标频率与当前实际频率差值在该比例以内不写（双向死区），压制 sysfs 往返
+# 与频率来回跳动；0 = 每次都写。
+auto_deadband = 0.10
+# 降频迟滞：目标低于当前频率必须连续低负载该时长才允许写入更低值。
+auto_down_hold_ms = 200
+
+# ---- AegisAuto 帧感知（FAS）救援（仅帧感知开启且前台应用被选中时） ---------
+# 单帧超预算：对应簇 scaling_setspeed 瞬间拉满到高频档位（最高优先级救援）。
+# 托底频率最短维持时长：
+fas_hold_ms = 500
+# 距最近一次超预算连续达到该时长且期间无新超预算，才允许开始降频：
+fas_decay_after_ms = 1000
+# 救援后的每次降频步长（相对当前托底频率的比例，0.10 = 每次降 10%）：
+fas_decay_ratio = 0.10
 
 # 选配的每簇自愿省电上限；留空或比例 1 不主动限制，保留温控且不锁最高频。
 # 键为设备实际的簇首 CPU（如 cpu0 / cpu3 / cpu7），安装与开机时会按真实拓扑

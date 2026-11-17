@@ -31,6 +31,7 @@ use crate::power;
 use crate::probe::{self, ProbeSession};
 use crate::screen::ScreenWatcher;
 use crate::touch::TouchWatcher;
+use crate::watchdog;
 use crate::writer::{CpufreqWriter, ReconcileBackoff};
 
 const LISTENER: Token = Token(0);
@@ -71,6 +72,8 @@ impl ShutdownSignals {
             libc::sigemptyset(&mut mask);
             libc::sigaddset(&mut mask, libc::SIGTERM);
             libc::sigaddset(&mut mask, libc::SIGINT);
+            // 看门狗心跳：USR1 只进 signalfd 唤醒主循环，不改变退出语义。
+            libc::sigaddset(&mut mask, libc::SIGUSR1);
             let code = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut previous);
             if code != 0 {
                 return Err(io::Error::from_raw_os_error(code));
@@ -115,6 +118,8 @@ pub fn run(
 ) -> io::Result<()> {
     // 在创建工作线程之前屏蔽退出信号，由主循环接收并正常析构 writer。
     let mut signals = ShutdownSignals::new()?;
+    // 任意线程 panic 先按启动备份回退 governor/频率区间，再走崩溃流程。
+    watchdog::install_panic_hook();
     std::fs::create_dir_all(run_dir).map_err(|error| context("create run dir", error))?;
 
     std::fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))
@@ -285,14 +290,36 @@ pub fn run(
         if let Some(writer) = writer.as_mut() {
             writer.arm_guard(Duration::from_millis(config.control.startup_guard_ms));
             verify_timer.arm(now_us() + config.control.startup_guard_ms.saturating_mul(1000));
+            // 模式与屏幕状态决定是否接管；首次写入在保护窗口结束后的
+            // 第一次 apply 里惰性接管。
+            writer.set_auto(
+                config.mode.name.is_auto(),
+                screen_on,
+                config.control.auto_deadband,
+            );
+        }
+        if let Some(writer) = writer.as_ref() {
+            // 注册紧急回退备份（panic/心跳看门狗共用），随后拉起心跳线程。
+            watchdog::register(
+                writer.emergency_policies(),
+                run_dir.to_owned(),
+                log_path.to_owned(),
+            );
+        }
+        if writer.is_some() {
+            watchdog::beat();
+            if let Err(error) = watchdog::spawn_heartbeat_thread() {
+                tracing::warn!(%error, "heartbeat watchdog thread unavailable");
+            }
         }
     }
 
     // walt 换档节奏只改 pl / rate limit，不涉及 min/max，因此不依赖探针是否附着。
+    // AegisAuto 完全接管时内核 governor 不再决策，跳过写入。
     let mut governor_last_us = 0u64;
     // 关闭接管时必须写回厂商原值，否则会残留上一次写入的节流参数。
     let mut governor_snapshot = None;
-    if apply && config.governor.smooth {
+    if apply && config.governor.smooth && !config.mode.name.is_auto() {
         governor_snapshot = Some(governor::capture(&profile));
         let nodes = governor::apply(&profile, &config.governor);
         governor_last_us = now_us();
@@ -450,6 +477,8 @@ pub fn run(
     let mut launch_invalidated_us: u64 = 0;
 
     loop {
+        // 每次醒来刷新心跳：看门狗线程据此判断主调频循环是否卡死。
+        watchdog::beat();
         if writer
             .as_ref()
             .is_some_and(|writer| writer.last_error.is_some())
@@ -469,17 +498,37 @@ pub fn run(
         for event in events.iter() {
             let token = event.token();
             if token == SIGNAL {
-                let mut buffer = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
-                signals.file.read_exact(&mut buffer)?;
-                if let Some(writer) = writer.as_mut() {
-                    if !writer_restored {
-                        writer
-                            .restore()
-                            .map_err(|problem| io::Error::new(io::ErrorKind::Other, problem))?;
+                // 排空 signalfd：USR1 是看门狗心跳唤醒（刷新心跳即可继续），
+                // 只有 SIGTERM/SIGINT 才执行退出与恢复。
+                let mut shutdown = false;
+                loop {
+                    let mut buffer = [0u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+                    match signals.file.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let info =
+                                unsafe { &*(buffer.as_ptr() as *const libc::signalfd_siginfo) };
+                            if info.ssi_signo != libc::SIGUSR1 as u32 {
+                                shutdown = true;
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error),
                     }
                 }
-                write_clean_exit_marker(run_dir)?;
-                return Ok(());
+                if shutdown {
+                    if let Some(writer) = writer.as_mut() {
+                        if !writer_restored {
+                            writer
+                                .restore()
+                                .map_err(|problem| io::Error::new(io::ErrorKind::Other, problem))?;
+                        }
+                    }
+                    write_clean_exit_marker(run_dir)?;
+                    return Ok(());
+                }
+                watchdog::beat();
+                continue;
             }
 
             if token == LISTENER {
@@ -597,6 +646,15 @@ pub fn run(
                 if let Some(watcher) = screen.as_mut() {
                     while let Some(on) = watcher.refresh() {
                         screen_on = on;
+                        // AegisAuto：亮屏接管 / 息屏把区间交还内核（先于决策
+                        // 提交，随后的 apply 会按新状态执行或直接跳过）。
+                        if let Some(writer) = writer.as_mut() {
+                            writer.set_auto(
+                                config.mode.name.is_auto(),
+                                screen_on,
+                                config.control.auto_deadband,
+                            );
+                        }
                         ceiling_timer.arm(now_us() + ceiling_backoff.reset());
                         refresh_frame_sidecar(&mut config, &mut frame_stamp, &frame_path);
                         refresh_frame(&config, &foreground, &mut frame, &status, on);
@@ -738,8 +796,17 @@ pub fn run(
                             config = parsed;
                             // 主配置替换后必须再次合并侧车，即使内容未发生变化。
                             merge_frame_sidecar(&mut config, frame_stamp.as_deref());
+                            // 模式切换热生效：切到 Standard 立即解除接管，
+                            // 切到 AegisAuto 在下一次 apply 惰性接管。
+                            if let Some(writer) = writer.as_mut() {
+                                writer.set_auto(
+                                    config.mode.name.is_auto(),
+                                    screen_on,
+                                    config.control.auto_deadband,
+                                );
+                            }
                             if apply {
-                                if config.governor.smooth {
+                                if config.governor.smooth && !config.mode.name.is_auto() {
                                     if governor_snapshot.is_none() {
                                         governor_snapshot = Some(governor::capture(&profile));
                                     }
@@ -856,9 +923,11 @@ pub fn run(
                 ceiling_timer.drain();
                 let now = now_us();
                 // 厂商或其它模块可能把 walt 参数改回默认；按配置周期补写。
+                // AegisAuto 不写 walt 节流参数（内核 governor 不再决策换档）。
                 let reapply_us = config.governor.reapply_ms.saturating_mul(1000);
                 if apply
                     && config.governor.smooth
+                    && !config.mode.name.is_auto()
                     && reapply_us > 0
                     && now.saturating_sub(governor_last_us) >= reapply_us
                 {
@@ -989,6 +1058,29 @@ pub fn run(
                                 responses.push(text);
                                 if outcome == Outcome::Reloaded {
                                     merge_frame_sidecar(&mut config, frame_stamp.as_deref());
+                                    // config.apply 同样可能切换调度模式（热生效）。
+                                    if let Some(writer) = writer.as_mut() {
+                                        writer.set_auto(
+                                            config.mode.name.is_auto(),
+                                            screen_on,
+                                            config.control.auto_deadband,
+                                        );
+                                    }
+                                    if apply {
+                                        // walt 节流与模式互斥：Standard 才接管节奏，
+                                        // AegisAuto 下写回厂商原值。
+                                        if config.governor.smooth && !config.mode.name.is_auto() {
+                                            if governor_snapshot.is_none() {
+                                                governor_snapshot = Some(governor::capture(&profile));
+                                            }
+                                            let nodes = governor::apply(&profile, &config.governor);
+                                            governor_last_us = now_us();
+                                            tracing::info!(nodes, "governor pacing reloaded");
+                                        } else if let Some(snapshot) = governor_snapshot.take() {
+                                            let nodes = governor::restore(&snapshot);
+                                            tracing::info!(nodes, "governor pacing restored");
+                                        }
+                                    }
                                     let decisions = reload_controller(
                                         &mut controller,
                                         &profile,
@@ -1193,6 +1285,11 @@ fn commit(
             .map(CpufreqWriter::rejected_floor)
             .unwrap_or(0);
         state.guard_active = writer.as_ref().is_some_and(CpufreqWriter::guard_active);
+        state.auto_path = writer
+            .as_ref()
+            .and_then(CpufreqWriter::auto_path)
+            .map(|path| path.as_str().to_owned());
+        state.auto_active = state.auto_path.is_some();
         if let Some(writer) = writer.as_ref() {
             state.write_error = writer.last_error.clone();
         }

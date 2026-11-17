@@ -27,7 +27,32 @@ process_identity() {
 }
 
 identity=$(process_identity)
+
+# 进程状态（/proc/$PID/stat 第 3 字段；先剥掉带括号的 comm）。
+daemon_state() {
+    IFS= read -r stat < "/proc/$PID/stat" 2>/dev/null || return 1
+    stat=${stat##*) }
+    set -- $stat
+    [ "$#" -ge 1 ] || return 1
+    printf '%s\n' "$1"
+}
+
+stopped=0
 while [ -n "$identity" ] && [ "$(process_identity)" = "$identity" ]; do
+    # AegisAuto 心跳看门狗跑在守护进程内部；若整个进程被 SIGSTOP 冻结，
+    # 内部线程同样停摆。连续两次（约 10s）观察到 T 状态即判定卡死，
+    # 立即从开机备份恢复 governor 与频率区间（幂等）。
+    state=$(daemon_state)
+    if [ "$state" = "T" ] || [ "$state" = "t" ]; then
+        stopped=$((stopped + 1))
+        if [ "$stopped" -ge 2 ]; then
+            echo "aegis: daemon $PID frozen (state T); restoring cpufreq from backup" >> "$DATA/Aegis.log"
+            sh "$MODDIR/restore.sh" >> "$DATA/Aegis.log" 2>&1
+            stopped=0
+        fi
+    else
+        stopped=0
+    fi
     sleep 5 || break
 done
 

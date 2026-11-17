@@ -22,7 +22,7 @@
 
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{Config, ModeName};
 use crate::profile::{DeviceProfile, Role};
 
 const US_PER_MS: u64 = 1_000;
@@ -132,8 +132,14 @@ struct ClusterState {
     busy_raw: f32,
     fg_raw: f32,
     up_since_us: Option<u64>,
+    /// AegisAuto 降频迟滞：目标首次低于当前档位的时间点。只有连续低负载
+    /// 达到 `auto_down_hold_ms` 后才允许下降；目标回升时清零。
+    down_since_us: Option<u64>,
     last_step_us: u64,
     touch_target: usize,
+    /// AegisAuto 帧感知救援的托底频率（kHz，0 = 无救援）。触发时拉满到
+    /// 梯顶，托底窗口结束后按 `fas_decay_ratio` 逐级衰减到负载目标。
+    fas_floor_khz: u32,
 }
 
 impl ClusterState {
@@ -147,8 +153,10 @@ impl ClusterState {
             busy_raw: 0.0,
             fg_raw: 0.0,
             up_since_us: None,
+            down_since_us: None,
             last_step_us: 0,
             touch_target: 0,
+            fas_floor_khz: 0,
         }
     }
 }
@@ -302,6 +310,7 @@ impl Controller {
             && self.launch_until_us.is_none_or(|until| ts_us >= until)
             && self.burst_until_us.is_none_or(|until| ts_us >= until)
             && self.pressure_active(ts_us) == false
+            && !self.fas_rescue_active(ts_us)
     }
 
     /// 收紧条件：前台跟踪可用、前台瞬时负载低于进入阈值且无交互窗口。
@@ -360,6 +369,31 @@ impl Controller {
         self.app_class
     }
 
+    /// 是否处于 AegisAuto 完全接管模式。
+    pub fn is_auto(&self) -> bool {
+        matches!(self.config.mode.name, ModeName::AegisAuto)
+    }
+
+    /// FAS 救援托底窗口的结束时刻：超预算后至少维持 `fas_hold_ms`，
+    /// 且只有距最近一次超预算达到 `fas_decay_after_ms` 才进入衰减。
+    fn fas_hold_end_us(&self) -> u64 {
+        let window = self
+            .config
+            .control
+            .fas_hold_ms
+            .max(self.config.control.fas_decay_after_ms);
+        self.last_over_budget_us.saturating_add(window * US_PER_MS)
+    }
+
+    fn fas_floor_any(&self) -> bool {
+        self.is_auto() && self.clusters.iter().any(|c| c.fas_floor_khz > 0)
+    }
+
+    /// 救援托底窗口内（AegisAuto）：目标被拉满，静态限顶与静默一律让位。
+    fn fas_rescue_active(&self, ts_us: u64) -> bool {
+        self.fas_floor_any() && ts_us < self.fas_hold_end_us()
+    }
+
     pub fn on_screen(&mut self, ts_us: u64, on: bool) -> Vec<Decision> {
         self.screen_on = on;
         if on {
@@ -383,11 +417,13 @@ impl Controller {
             self.filter_updated_us = None;
             for cluster in self.clusters.iter_mut() {
                 cluster.up_since_us = None;
+                cluster.down_since_us = None;
                 cluster.busy_ema = 0.0;
                 cluster.fg_ema = 0.0;
                 cluster.busy_raw = 0.0;
                 cluster.fg_raw = 0.0;
                 cluster.touch_target = 0;
+                cluster.fas_floor_khz = 0;
             }
             self.evaluate(ts_us, DecisionReason::ScreenOff)
         }
@@ -431,6 +467,7 @@ impl Controller {
         self.low_demand_since_us = None;
         for cluster in self.clusters.iter_mut() {
             cluster.up_since_us = None;
+            cluster.down_since_us = None;
         }
         self.lift_until_us = Some(ts_us + self.config.control.touch_lift_ms * US_PER_MS);
         self.evaluate(ts_us, DecisionReason::TouchLift)
@@ -476,8 +513,20 @@ impl Controller {
         self.low_demand_since_us = None;
         for cluster in self.clusters.iter_mut() {
             cluster.up_since_us = None;
+            cluster.down_since_us = None;
         }
         self.burst_until_us = Some(sample.ts_us + self.config.control.frame_burst_ms * US_PER_MS);
+
+        if self.is_auto() {
+            // AegisAuto：单帧超预算即最高优先级救援，对应簇瞬间拉满到梯顶
+            // 并进入托底窗口（≥ fas_hold_ms，且连续 fas_decay_after_ms 无
+            // 新超预算才允许开始按 fas_decay_ratio 降频）。
+            for (cluster, ladder) in self.clusters.iter_mut().zip(&self.tiers) {
+                if let Some(&top) = ladder.last() {
+                    cluster.fas_floor_khz = top;
+                }
+            }
+        }
 
         // 单个弹幕或切页尖峰只给短时救援；持续超预算才提高会话地板。
         if self.over_budget_hits >= 3 && matches!(self.app_class, AppClass::Video | AppClass::Reading) {
@@ -501,6 +550,7 @@ impl Controller {
         }
         for cluster in self.clusters.iter_mut() {
             cluster.up_since_us = None;
+            cluster.down_since_us = None;
         }
         self.launch_until_us = Some(ts_us + self.config.control.launch_lift_ms * US_PER_MS);
         self.quiet = false;
@@ -514,6 +564,7 @@ impl Controller {
         }
         for cluster in self.clusters.iter_mut() {
             cluster.up_since_us = None;
+            cluster.down_since_us = None;
         }
         self.launch_until_us = Some(ts_us + self.config.control.launch_lift_ms * US_PER_MS);
         self.quiet = false;
@@ -544,6 +595,8 @@ impl Controller {
         self.low_demand_since_us = None;
         for cluster in self.clusters.iter_mut() {
             cluster.up_since_us = None;
+            cluster.down_since_us = None;
+            cluster.fas_floor_khz = 0;
         }
         self.evaluate(ts_us, DecisionReason::Load)
     }
@@ -691,6 +744,25 @@ impl Controller {
             );
         }
 
+        // AegisAuto 帧感知：托底窗口结束与逐级衰减需要独立唤醒，否则没有
+        // 新样本时救援频率会一直挂在梯顶。
+        if self.fas_floor_any() {
+            let hold_end = self.fas_hold_end_us();
+            if now_us < hold_end {
+                consider(hold_end, DeadlineKind::BurstEnd);
+            } else {
+                for cluster in &self.clusters {
+                    if cluster.fas_floor_khz > 0 {
+                        consider(
+                            cluster.last_step_us
+                                + self.config.control.down_step_ms * US_PER_MS,
+                            DeadlineKind::Decay,
+                        );
+                    }
+                }
+            }
+        }
+
         for (index, cluster) in self.clusters.iter().enumerate() {
             let desired = self.desired_tier(index, now_us);
             if desired > cluster.tier {
@@ -701,10 +773,19 @@ impl Controller {
                     );
                 }
             } else if desired < cluster.tier && self.down_allowed(index, now_us) {
-                consider(
-                    cluster.last_step_us + self.config.control.down_step_ms * US_PER_MS,
-                    DeadlineKind::Decay,
-                );
+                let mut at = cluster.last_step_us
+                    + self.config.control.down_step_ms * US_PER_MS;
+                if self.is_auto() {
+                    // 降频必须同时满足步进间隔与连续低负载迟滞，取较晚者唤醒。
+                    let hold_at = match cluster.down_since_us {
+                        Some(since) => {
+                            since + self.config.control.auto_down_hold_ms * US_PER_MS
+                        }
+                        None => now_us + self.config.control.auto_down_hold_ms * US_PER_MS,
+                    };
+                    at = at.max(hold_at);
+                }
+                consider(at, DeadlineKind::Decay);
             }
         }
         best
@@ -882,6 +963,7 @@ impl Controller {
         // 复用最近一次低负载观测，到期时无需等待新的采样事件。
         if self.screen_on
             && !self.quiet
+            && !self.fas_rescue_active(ts_us)
             && self.low_demand_since_us.is_some_and(|since| {
                 ts_us.saturating_sub(since) >= self.config.control.floor_settle_ms * US_PER_MS
             })
@@ -957,7 +1039,10 @@ impl Controller {
             if !self.screen_on || old_tier > thermal_limit {
                 new_tier = if self.screen_on { thermal_limit } else { 0 };
                 self.clusters[index].up_since_us = None;
+                self.clusters[index].down_since_us = None;
             } else if desired > old_tier {
+                // 负载目标高于当前档位即中断“连续低负载”计时。
+                self.clusters[index].down_since_us = None;
                 let immediate = if event {
                     let target = match base_reason {
                         DecisionReason::Launch | DecisionReason::Foreground => {
@@ -1018,7 +1103,24 @@ impl Controller {
                 }
             } else if desired < old_tier {
                 self.clusters[index].up_since_us = None;
-                if self.down_allowed(index, ts_us)
+                // AegisAuto：目标低于当前频率必须连续满足 auto_down_hold_ms
+                // 的低负载迟滞才放行降频；Standard 模式保持原有节奏。
+                let hold_ok = if self.is_auto() {
+                    match self.clusters[index].down_since_us {
+                        Some(since) => {
+                            ts_us.saturating_sub(since)
+                                >= self.config.control.auto_down_hold_ms * US_PER_MS
+                        }
+                        None => {
+                            self.clusters[index].down_since_us = Some(ts_us);
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if hold_ok
+                    && self.down_allowed(index, ts_us)
                     && ts_us.saturating_sub(self.clusters[index].last_step_us)
                         >= self.config.control.down_step_ms * US_PER_MS
                 {
@@ -1035,6 +1137,49 @@ impl Controller {
                 }
             } else {
                 self.clusters[index].up_since_us = None;
+                self.clusters[index].down_since_us = None;
+            }
+
+            // AegisAuto 帧感知救援：托底窗口内直接拉满到梯顶；窗口结束后
+            // 才允许按 fas_decay_ratio 从托底逐级衰减，直到回落到负载目标。
+            if self.is_auto()
+                && self.screen_on
+                && self.clusters[index].fas_floor_khz > 0
+            {
+                let hold_end = self.fas_hold_end_us();
+                if ts_us < hold_end {
+                    new_tier = thermal_limit;
+                    reason = DecisionReason::FrameBurst;
+                } else {
+                    let ladder = &self.tiers[index];
+                    let target_khz = ladder[new_tier];
+                    let mut floor = self.clusters[index].fas_floor_khz;
+                    if floor > target_khz
+                        && ts_us.saturating_sub(self.clusters[index].last_step_us)
+                            >= self.config.control.down_step_ms * US_PER_MS
+                    {
+                        // 托底频率按 fas_decay_ratio 精确衰减 10%，档位由
+                        // ladder 向下取整呈现（每步至少降一档）。
+                        floor = ((f64::from(floor))
+                            * (1.0 - f64::from(self.config.control.fas_decay_ratio)))
+                            as u32;
+                        self.clusters[index].fas_floor_khz = floor;
+                        self.clusters[index].last_step_us = ts_us;
+                    }
+                    if floor <= target_khz {
+                        self.clusters[index].fas_floor_khz = 0;
+                    } else {
+                        let floor_tier = ladder
+                            .partition_point(|&khz| khz <= floor)
+                            .saturating_sub(1)
+                            .min(thermal_limit)
+                            .min(count - 1);
+                        if floor_tier > new_tier {
+                            new_tier = floor_tier;
+                            reason = DecisionReason::FrameBurst;
+                        }
+                    }
+                }
             }
 
             if new_tier != old_tier {

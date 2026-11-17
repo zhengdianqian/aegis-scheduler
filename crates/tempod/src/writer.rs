@@ -63,11 +63,43 @@ struct Policy {
     pending_max: Option<u32>,
     /// An external ceiling persists across our own successful range changes.
     external_cap: Option<u32>,
+    /// AegisAuto：外部把下限抬到我们的目标之上时读回被拒，锁存（地板值,
+    /// 拒绝时刻）并让位。时效 2s：瞬时 boost 地板过期即重新下探；持久地板靠
+    /// 新拒绝刷新；目标回升超过地板或外部主动下调时立即跟随/解除。
+    external_floor: Option<(u32, Instant)>,
     retries: u32,
     retry_at: Option<Instant>,
     error: Option<String>,
     /// Set before attempting a write: even a failed readback needs restoration.
     touched: bool,
+    /// AegisAuto 接管方式：`SetSpeed` = userspace governor + scaling_setspeed；
+    /// `Pin` = 内核无 userspace 时的等效接管（min=max=目标频率）。
+    /// `None` = Standard 模式（或未接管），走原有的上下限约束路径。
+    auto: Option<AutoPath>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoPath {
+    SetSpeed,
+    Pin,
+}
+
+impl AutoPath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SetSpeed => "userspace",
+            Self::Pin => "pin",
+        }
+    }
+}
+
+/// 紧急回退所需的原始状态快照（每个策略目录一条）。
+#[derive(Debug, Clone)]
+pub struct EmergencyPolicy {
+    pub dir: PathBuf,
+    pub pristine_min: u32,
+    pub pristine_max: u32,
+    pub original_governor: String,
 }
 
 pub struct CpufreqWriter {
@@ -83,6 +115,12 @@ pub struct CpufreqWriter {
     /// 频率上限不再被永久让位，本模块按退避节奏重新夺回自己的上限；温度达到
     /// 保护线时为 true，恢复“尊重外部上限”，把温控优先权交还给系统。
     respect_external: bool,
+    /// 配置选择了 AegisAuto 模式。
+    auto_mode: bool,
+    /// AegisAuto + 息屏：接管挂起，任何写入都不发生（区间交还内核）。
+    standby: bool,
+    /// 目标与当前频率差值在该比例以内不写（AegisAuto 防抖死区）。
+    deadband: f32,
     pub last_error: Option<String>,
 }
 
@@ -131,10 +169,12 @@ impl CpufreqWriter {
                 observed: None,
                 pending_max: None,
                 external_cap: None,
+                external_floor: None,
                 retries: 0,
                 retry_at: None,
                 error: None,
                 touched: false,
+                auto: None,
             });
         }
         Ok(Self {
@@ -147,8 +187,101 @@ impl CpufreqWriter {
             suspended: false,
             enabled: true,
             respect_external: true,
+            auto_mode: false,
+            standby: false,
+            deadband: 0.10,
             last_error: None,
         })
+    }
+
+    /// 紧急回退快照：原始 min/max 与原始 governor，panic/看门狗/信号处理共用。
+    pub fn emergency_policies(&self) -> Vec<EmergencyPolicy> {
+        self.policies
+            .iter()
+            .map(|policy| EmergencyPolicy {
+                dir: policy.dir.clone(),
+                pristine_min: policy.pristine_min,
+                pristine_max: policy.pristine_max,
+                original_governor: policy.original_governor.clone(),
+            })
+            .collect()
+    }
+
+    /// 模式与屏幕状态变化时调用。
+    ///
+    /// * `mode_auto=false`：Standard，若已接管则立即恢复原始区间/governor。
+    /// * `mode_auto=true` 且息屏：挂起接管（写恢复原样，区间交还内核）。
+    /// * `mode_auto=true` 且亮屏：由下一次 `apply` 惰性接管。
+    pub fn set_auto(&mut self, mode_auto: bool, screen_on: bool, deadband: f32) {
+        self.auto_mode = mode_auto;
+        self.deadband = deadband.clamp(0.0, 0.30);
+        self.standby = mode_auto && !screen_on;
+        if !(mode_auto && screen_on) {
+            self.disengage_auto();
+        }
+    }
+
+    /// 当前 AegisAuto 接管方式（全部策略的最短路径；未接管为 None）。
+    pub fn auto_path(&self) -> Option<AutoPath> {
+        if !self.auto_mode || self.standby {
+            return None;
+        }
+        self.policies.iter().filter_map(|p| p.auto).min_by_key(|p| match p {
+            AutoPath::Pin => 0,
+            AutoPath::SetSpeed => 1,
+        })
+    }
+
+    /// 尝试把每个策略切到 userspace governor；内核不提供时退化为 Pin。
+    /// 只在亮屏、非保护窗口、尚未接管时执行。
+    fn engage_auto(&mut self) {
+        for policy in &mut self.policies {
+            if policy.auto.is_some() {
+                continue;
+            }
+            let supports_userspace = fs::read_to_string(policy.dir.join("scaling_available_governors"))
+                .map(|text| {
+                    text.split_whitespace().any(|word| word == "userspace")
+                })
+                .unwrap_or(false)
+                && policy.dir.join("scaling_setspeed").exists();
+            let path = if supports_userspace && governor_write(&policy.dir, "userspace") {
+                AutoPath::SetSpeed
+            } else {
+                AutoPath::Pin
+            };
+            tracing::info!(
+                cluster = policy.cluster,
+                path = path.as_str(),
+                "AegisAuto takeover engaged"
+            );
+            policy.auto = Some(path);
+        }
+    }
+
+    /// 解除接管：恢复原始区间，再把 governor 写回备份值（userspace 必须回退）。
+    fn disengage_auto(&mut self) {
+        let mut error = None;
+        let mut writes = 0u64;
+        for policy in &mut self.policies {
+            if policy.auto.is_none() && !governor_changed(policy) {
+                continue;
+            }
+            if let Err(problem) = restore_policy(policy, &mut writes) {
+                error.get_or_insert(problem);
+            }
+            policy.auto = None;
+            policy.last_target = 0;
+            policy.last_cap = 0;
+            policy.observed = None;
+            policy.pending_max = None;
+            policy.retry_at = None;
+            policy.retries = 0;
+        }
+        self.applied += writes;
+        if let Some(problem) = error {
+            tracing::warn!(%problem, "AegisAuto takeover released with errors");
+        }
     }
 
     pub fn arm_guard(&mut self, window: Duration) {
@@ -193,6 +326,10 @@ impl CpufreqWriter {
         if self.guarded() {
             return Ok(false);
         }
+        // AegisAuto 息屏挂起：没有我们写入的状态需要校验。
+        if self.auto_mode && self.standby {
+            return Ok(false);
+        }
         let mut drifted = false;
         let now = Instant::now();
         for policy in &mut self.policies {
@@ -204,6 +341,35 @@ impl CpufreqWriter {
                 continue;
             }
             policy.last_reconcile = Some(now);
+            if policy.auto == Some(AutoPath::SetSpeed) {
+                // setspeed 路径不碰 min/max；只校验 governor 仍为 userspace。
+                // 被厂商改回原 governor 时按既有退避节奏重新接管。
+                if policy.retry_at.is_some_and(|at| now < at) {
+                    continue;
+                }
+                if read_governor(&policy.dir).as_deref() != Some("userspace") {
+                    if governor_write(&policy.dir, "userspace") {
+                        policy.error = None;
+                        policy.retry_at = None;
+                        policy.retries = 0;
+                    } else {
+                        backoff(
+                            policy,
+                            now,
+                            format!(
+                                "{}: external governor change; userspace rewrite pending",
+                                policy.dir.display()
+                            ),
+                        );
+                    }
+                    drifted = true;
+                } else {
+                    policy.error = None;
+                    policy.retry_at = None;
+                    policy.retries = 0;
+                }
+                continue;
+            }
             drifted |= sync_policy(
                 policy,
                 now,
@@ -222,6 +388,14 @@ impl CpufreqWriter {
         if self.guarded() {
             return Ok(());
         }
+        // AegisAuto 息屏挂起：区间已交还内核，本守护不写任何节点。
+        if self.auto_mode && self.standby {
+            return Ok(());
+        }
+        if self.auto_mode {
+            self.engage_auto();
+        }
+        let respect_external = self.respect_external;
         for decision in decisions {
             let Some(policy) = self
                 .policies
@@ -230,6 +404,20 @@ impl CpufreqWriter {
             else {
                 continue;
             };
+            if let Some(path) = policy.auto {
+                apply_auto(
+                    policy,
+                    decision,
+                    path,
+                    self.deadband,
+                    respect_external,
+                    &mut self.applied,
+                    &mut self.cap_writes,
+                    &mut self.floor_writes,
+                    &mut self.rejected_floor,
+                );
+                continue;
+            }
             let cap = decision.cap_khz.clamp(policy.hw_min, policy.hw_max);
             // 频点表可能省略最高档；解除限频时不能再按该表向下取整。
             let cap = if cap == policy.hw_max {
@@ -270,35 +458,55 @@ impl CpufreqWriter {
             })
     }
 
-    /// 恢复启动时的 min/max；不触碰 governor、温控开关或其他限制节点。
+    /// 恢复启动时的 min/max 并把 governor 写回备份值；不触碰温控开关或其他限制节点。
+    ///
+    /// 外部下限争写（powerkeeper 类）可能让单次恢复的某个节点读回失败；
+    /// 失败的节点最多再试 2 轮（间隔 200ms），成功即退出，仍失败才上报错误
+    /// （由 shell 看门狗继续兜底重试）。
     pub fn restore(&mut self) -> Result<(), String> {
         self.suspended = true;
-        let mut error = None;
-        for policy in &mut self.policies {
-            if !policy.touched {
-                continue;
-            }
-            let result = set_range(
-                &policy.dir,
-                policy.pristine_min,
-                policy.pristine_max,
-                |path, value| write_verified(path, value),
-            );
-            match result {
-                Ok(()) => {
-                    policy.touched = false;
-                    policy.error = None;
+        let mut writes = 0u64;
+        let mut error;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let mut failed = false;
+            let mut pass_error: Option<String> = None;
+            for policy in &mut self.policies {
+                if !policy.touched && !governor_changed(policy) {
+                    continue;
                 }
-                Err(problem) => {
-                    policy.error = Some(problem.clone());
-                    error.get_or_insert(problem);
+                match restore_policy(policy, &mut writes) {
+                    Ok(()) => {
+                        policy.touched = false;
+                        policy.error = None;
+                        policy.auto = None;
+                    }
+                    Err(problem) => {
+                        policy.error = Some(problem.clone());
+                        pass_error.get_or_insert(problem);
+                        failed = true;
+                    }
                 }
             }
+            if !failed || attempt >= 3 {
+                error = pass_error;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
+        self.applied += writes;
         self.guard_until = None;
         self.last_error = error.clone();
         if error.is_none() {
+            // 恢复成功不计作调度写入；接管状态与目标一并清掉。
             self.applied = 0;
+            for policy in &mut self.policies {
+                policy.last_target = 0;
+                policy.last_cap = 0;
+                policy.observed = None;
+                policy.pending_max = None;
+            }
         }
         error.map_or(Ok(()), Err)
     }
@@ -414,7 +622,14 @@ fn set_range(
 }
 
 fn backoff(policy: &mut Policy, now: Instant, problem: String) {
-    let wait = Duration::from_millis(500u64.saturating_mul(1 << policy.retries.min(4)).min(5000));
+    // AegisAuto 锁频必须同时压住 min 与 max：外部（场景/省电档案）每隔数百毫秒
+    // 改写一侧时，指数退避会让内核在数秒内重获自由。接管态固定 500ms 重夺，
+    // 有界且更快收敛；Standard 模式保持原有指数退避，避免与厂商高频互写。
+    let wait = if policy.auto.is_some() {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_millis(500u64.saturating_mul(1 << policy.retries.min(4)).min(5000))
+    };
     policy.retries = policy.retries.saturating_add(1);
     policy.retry_at = Some(now + wait);
     policy.error = Some(problem);
@@ -443,6 +658,15 @@ fn sync_policy(
         policy.observed = Some((policy.observed.map_or(live.0, |range| range.0), live.1));
         policy.pending_max = None;
     }
+    // 外部地板锁存的跟随与释放：外部主动下调地板时锁存值下移；已观察到的
+    // 下限不再高于我们的目标时锁存立即解除（含我们自己锁在目标上的状态）。
+    if let Some((floor, at)) = policy.external_floor {
+        if live.0 <= policy.last_target {
+            policy.external_floor = None;
+        } else if live.0 < floor {
+            policy.external_floor = Some((live.0, at));
+        }
+    }
     let externally_changed = policy.observed.is_some_and(|previous| previous != live);
     // Only a max different from our last successful range is external evidence.
     // In particular, our own lower cap must neither tighten nor release this latch.
@@ -462,7 +686,29 @@ fn sync_policy(
     } else {
         policy.last_cap
     };
-    let desired = (policy.last_target.min(cap), cap);
+    // 地板让位的时效与自愈：只在最近 2s 内发生过拒绝时生效（瞬时 boost 地板
+    // 过期即重新下探）；目标回升超过地板时锁存立即失效。
+    if let Some((floor, at)) = policy.external_floor {
+        if floor <= policy.last_target || now.saturating_duration_since(at) > Duration::from_secs(2)
+        {
+            policy.external_floor = None;
+        }
+    }
+    let desired = if matches!(policy.auto, Some(AutoPath::Pin)) {
+        // AegisAuto 锁频：目标低于外部锁存的地板（powerkeeper 等原生守护的
+        // 下限）时把锁频值抬到地板——该地板无论如何都会生效，锁在地板值上
+        // 比放任内核在其区间内自由运行更省；热机仍受外部上限约束。
+        let mut x = policy
+            .last_target
+            .max(policy.external_floor.map_or(0, |(floor, _)| floor));
+        if respect_external {
+            x = x.min(policy.external_cap.unwrap_or(u32::MAX));
+        }
+        x = x.clamp(policy.hw_min, policy.hw_max);
+        (x, x)
+    } else {
+        (policy.last_target.min(cap), cap)
+    };
     let constraint = (respect_external && policy.external_cap.is_some()).then(|| {
         format!(
             "{}: external frequency cap {}",
@@ -509,13 +755,25 @@ fn sync_policy(
         if actual != value {
             if is_floor {
                 *rejected_floor += 1;
+                // 外部把下限抬到我们的目标之上：锁存其地板值与拒绝时刻，锁频
+                // 让位到地板，结束“永远打不赢”的下限争写；2s 时效保证瞬时
+                // boost 地板不会把锁频长期钉在高频。
+                if policy.auto.is_some() && actual > value {
+                    policy.external_floor = Some((actual, now));
+                }
             }
             return Err(format!(
                 "{}: requested {value}, read back {actual}",
                 path.display()
             ));
         }
-        if !is_floor {
+        if is_floor {
+            if let Some((floor, _)) = policy.external_floor {
+                if value >= floor {
+                    policy.external_floor = None;
+                }
+            }
+        } else {
             // 后续下限写入即使失败，也不能把已验证的自身上限误判为外部限制。
             policy.observed = Some((live.0, actual));
             policy.pending_max = None;
@@ -544,6 +802,224 @@ fn write_verified(path: &Path, value: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn read_governor(dir: &Path) -> Option<String> {
+    fs::read_to_string(dir.join("scaling_governor"))
+        .ok()
+        .map(|text| text.trim().to_owned())
+}
+
+/// 写并读回校验 `scaling_governor`；值相同视为成功（不重复写）。
+fn governor_write(dir: &Path, name: &str) -> bool {
+    if read_governor(dir).as_deref() == Some(name) {
+        return true;
+    }
+    if fs::write(dir.join("scaling_governor"), format!("{name}\n")).is_err() {
+        return false;
+    }
+    read_governor(dir).as_deref() == Some(name)
+}
+
+/// 当前 governor 是否已经偏离启动时的备份值（未备份视为未偏离）。
+fn governor_changed(policy: &Policy) -> bool {
+    if policy.original_governor.is_empty() {
+        return false;
+    }
+    read_governor(&policy.dir).as_deref() != Some(policy.original_governor.as_str())
+}
+
+fn write_setspeed(path: &Path, value: u32) -> Result<(), String> {
+    write_khz(path, value)?;
+    let actual = read_required(path)?;
+    if actual != value {
+        return Err(format!(
+            "{}: requested {value}, read back {actual}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// AegisAuto 写入路径。目标频率 = 决策目标（已含温控/静态限顶/自愿省电上限）。
+///
+/// * ±`deadband` 死区内保持不写（双向），内核不再兜底时压制频率来回跳动。
+/// * `Pin`：min=max=目标频率，walt/schedutil 彻底无权变频；始终走既有
+///   `sync_policy` 机械，外部（温控/云控）改写会按退避被重新锁回。
+/// * `SetSpeed`：直写 `scaling_setspeed`，带读回校验与退避；不碰 min/max。
+#[allow(clippy::too_many_arguments)]
+fn apply_auto(
+    policy: &mut Policy,
+    decision: &Decision,
+    path: AutoPath,
+    deadband: f32,
+    respect_external: bool,
+    applied: &mut u64,
+    cap_writes: &mut u64,
+    floor_writes: &mut u64,
+    rejected_floor: &mut u64,
+) {
+    let mut target = decision.ceiling_khz.clamp(policy.hw_min, policy.hw_max);
+    if target != policy.hw_max {
+        target = snap_down(&policy.freqs, target).unwrap_or(target).max(policy.hw_min);
+    }
+    policy.idle_floor = decision.idle;
+    let now = Instant::now();
+    let reference = policy.last_target;
+    let within_deadband = reference != 0
+        && f64::from(target.abs_diff(reference)) <= f64::from(reference) * f64::from(deadband);
+
+    match path {
+        AutoPath::Pin => {
+            if !within_deadband {
+                if target > policy.last_cap && policy.pending_max.is_none() {
+                    policy.retry_at = None;
+                }
+                policy.last_target = target;
+                policy.last_cap = target;
+            }
+            sync_policy(
+                policy,
+                now,
+                respect_external,
+                applied,
+                cap_writes,
+                floor_writes,
+                rejected_floor,
+            );
+        }
+        AutoPath::SetSpeed => {
+            if within_deadband || policy.retry_at.is_some_and(|at| now < at) {
+                return;
+            }
+            match write_setspeed(&policy.dir.join("scaling_setspeed"), target) {
+                Ok(()) => {
+                    policy.touched = true;
+                    policy.last_target = target;
+                    policy.last_cap = target;
+                    *applied += 1;
+                    policy.error = None;
+                    policy.retry_at = None;
+                    policy.retries = 0;
+                }
+                Err(problem) => backoff(policy, now, problem),
+            }
+        }
+    }
+}
+
+/// 恢复单个策略到启动备份：先恢复原始 min/max（解除锁频），再把 governor
+/// 写回备份值；governor 未能恢复时把 scaling_setspeed 拉回可用频率兜底。
+fn restore_policy(policy: &mut Policy, writes: &mut u64) -> Result<(), String> {
+    let result = restore_dir(
+        &policy.dir,
+        policy.pristine_min,
+        policy.pristine_max,
+        &policy.original_governor,
+    );
+    match result {
+        Ok(count) => {
+            *writes += count;
+            policy.touched = false;
+            Ok(())
+        }
+        Err(problem) => Err(problem),
+    }
+}
+
+/// 把一个策略目录恢复到备份状态。**逐节点独立尝试**（顺序：先开 max、再还原
+/// min、最后回写 governor），任何单点失败都不阻塞其余节点——息屏瞬间厂商
+/// 温控/省电档案常把 max 压到备份值以下，读回小于备份 max 属于更保守的外部
+/// 上限，视为可接受；governor 回写被拒且仍停留在 userspace 时，把
+/// `scaling_setspeed` 拉回备份的可用频率兜底。返回实际写入的节点数。
+fn restore_dir(dir: &Path, pristine_min: u32, pristine_max: u32, original_governor: &str) -> Result<u64, String> {
+    let mut count = 0u64;
+    let mut error: Option<String> = None;
+    let min_path = dir.join("scaling_min_freq");
+    let max_path = dir.join("scaling_max_freq");
+
+    // 1) 先放开上限：只有高于备份值才算失败（低于等于备份值均为安全方向）。
+    match read_required(&max_path) {
+        Ok(live) if live == pristine_max => {}
+        Ok(live) if live > pristine_max => {
+            // 外部把 max 抬到开机备份之上：仍按备份写回并严格校验。
+            match write_verified(&max_path, pristine_max) {
+                Ok(()) => count += 1,
+                Err(problem) => {
+                    error.get_or_insert(problem);
+                }
+            }
+        }
+        Ok(_) => {
+            // 外部（多为息屏省电档案）把 max 压得更低：尝试写回备份值，
+            // 读回仍低于备份也接受——上限不会高于原始值，方向安全。
+            if fs::write(&max_path, format!("{pristine_max}\n")).is_ok() {
+                count += 1;
+            }
+            if let Ok(live) = read_required(&max_path) {
+                if live > pristine_max {
+                    error.get_or_insert_with(|| {
+                        format!("{}: max restore read back {live}", max_path.display())
+                    });
+                }
+            }
+        }
+        Err(problem) => {
+            error.get_or_insert(problem);
+        }
+    }
+
+    // 2) 释放下限（解除锁频）：必须精确回到备份值，失败交给 shell 看门狗重试。
+    match write_verified(&min_path, pristine_min) {
+        Ok(()) => count += 1,
+        Err(problem) => {
+            // 备份值已生效时（值相同不写也会成功）不会走到这里；仅真实失败记录。
+            error.get_or_insert(problem);
+        }
+    }
+
+    // 3) 最后回写 governor（区间已恢复，接管态的 userspace 必须退出）。
+    if !original_governor.is_empty() && read_governor(dir).as_deref() != Some(original_governor) {
+        if governor_write(dir, original_governor) {
+            tracing::info!(dir = %dir.display(), governor = original_governor, "scaling_governor restored");
+            count += 1;
+        } else {
+            if read_governor(dir).as_deref() == Some("userspace") {
+                let _ = write_setspeed(&dir.join("scaling_setspeed"), pristine_max);
+                count += 1;
+            }
+            error.get_or_insert_with(|| format!("{}: governor restore rejected", dir.display()));
+        }
+    }
+
+    match error {
+        Some(problem) => Err(problem),
+        None => Ok(count),
+    }
+}
+
+/// 紧急回退（panic 钩子 / 心跳看门狗 / 恢复兜底）：不做任何运行簿记，
+/// 直接按备份恢复每个策略。返回实际写入的节点数。
+pub fn emergency_restore(policies: &[EmergencyPolicy]) -> Result<u64, String> {
+    let mut writes = 0u64;
+    let mut error: Option<String> = None;
+    for policy in policies {
+        match restore_dir(
+            &policy.dir,
+            policy.pristine_min,
+            policy.pristine_max,
+            &policy.original_governor,
+        ) {
+            Ok(count) => writes += count,
+            Err(problem) => {
+                error.get_or_insert(problem);
+            }
+        }
+    }
+    match error {
+        Some(problem) => Err(problem),
+        None => Ok(writes),
+    }
 }
 
 fn snap_down(freqs: &[u32], value: u32) -> Option<u32> {
@@ -577,6 +1053,7 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             write_khz(&dir.join("scaling_min_freq"), 100).unwrap();
             write_khz(&dir.join("scaling_max_freq"), 1000).unwrap();
+            fs::write(dir.join("scaling_governor"), "schedutil\n").unwrap();
             Self(dir)
         }
         fn writer(&self) -> CpufreqWriter {
@@ -597,10 +1074,12 @@ mod tests {
                     observed: None,
                     pending_max: None,
                     external_cap: None,
+                    external_floor: None,
                     retries: 0,
                     retry_at: None,
                     error: None,
                     touched: false,
+                    auto: None,
                 }],
                 applied: 0,
                 cap_writes: 0,
@@ -610,11 +1089,37 @@ mod tests {
                 suspended: false,
                 enabled: true,
                 respect_external: true,
+                auto_mode: false,
+                standby: false,
+                deadband: 0.10,
                 last_error: None,
             }
         }
         fn range(&self) -> (u32, u32) {
             read_range(&self.0).unwrap()
+        }
+        fn governor(&self) -> String {
+            fs::read_to_string(self.0.join("scaling_governor"))
+                .unwrap()
+                .trim()
+                .to_owned()
+        }
+        fn set_governor(&self, name: &str) {
+            fs::write(self.0.join("scaling_governor"), format!("{name}\n")).unwrap();
+        }
+        /// 模拟内核提供 userspace governor 的设备（含 scaling_setspeed 节点）。
+        fn enable_userspace(&self) {
+            fs::write(
+                self.0.join("scaling_available_governors"),
+                "walt conservative powersave performance schedutil userspace\n",
+            )
+            .unwrap();
+            if !self.0.join("scaling_setspeed").exists() {
+                write_khz(&self.0.join("scaling_setspeed"), 100).unwrap();
+            }
+        }
+        fn set_speed(&self) -> Option<u32> {
+            read_u32(&self.0.join("scaling_setspeed"))
         }
     }
     impl Drop for Sysfs {
@@ -1063,11 +1568,178 @@ mod tests {
         let mut writer = sysfs.writer();
         writer.apply(&[decision(500, 700, false)]).unwrap();
         let min = sysfs.0.join("scaling_min_freq");
+        // 用同名目录顶替节点：写入必然失败（EISDIR），模拟恢复被拒。
         fs::remove_file(&min).unwrap();
+        fs::create_dir(&min).unwrap();
         assert!(writer.restore().is_err());
         assert!(writer.last_error.is_some());
+        fs::remove_dir(&min).unwrap();
         write_khz(&min, 500).unwrap();
         drop(writer);
         assert_eq!(sysfs.range(), (100, 1000));
+    }
+
+    #[test]
+    fn auto_pin_takes_over_and_releases_on_standby_and_mode_switch() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        // 内核未提供 userspace（沙箱无 available_governors）→ 退化为 Pin 锁频。
+        writer.set_auto(true, true, 0.10);
+        writer.apply(&[decision(700, 700, false)]).unwrap();
+        assert_eq!(writer.auto_path(), Some(AutoPath::Pin));
+        assert_eq!(sysfs.range(), (700, 700), "Pin 接管 = min=max=目标频率");
+
+        // AegisAuto 息屏：区间交还内核，随后的 apply 不得写入。
+        writer.set_auto(true, false, 0.10);
+        assert_eq!(writer.auto_path(), None);
+        assert_eq!(sysfs.range(), (100, 1000));
+        writer.apply(&[decision(300, 300, false)]).unwrap();
+        assert_eq!(sysfs.range(), (100, 1000), "息屏挂起期间不得写入");
+        assert!(!writer.reconcile().unwrap());
+
+        // 亮屏重新接管。
+        writer.set_auto(true, true, 0.10);
+        writer.apply(&[decision(500, 500, false)]).unwrap();
+        assert_eq!(writer.auto_path(), Some(AutoPath::Pin));
+        assert_eq!(sysfs.range(), (500, 500));
+
+        // 切回 Standard：立即恢复原始区间。
+        writer.set_auto(false, true, 0.10);
+        assert_eq!(writer.auto_path(), None);
+        assert_eq!(sysfs.range(), (100, 1000));
+    }
+
+    #[test]
+    fn auto_deadband_suppresses_small_moves_both_directions() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        // 密集频点：相邻档位相差 <10%，用来验证双向死区。
+        writer.policies[0].freqs = vec![100, 300, 500, 540, 580, 620, 700, 1000];
+        writer.set_auto(true, true, 0.10);
+
+        writer.apply(&[decision(540, 540, false)]).unwrap();
+        assert_eq!(sysfs.range(), (540, 540));
+        // 上行 7.4%（540→580）在 ±10% 内：不写。
+        writer.apply(&[decision(580, 580, false)]).unwrap();
+        assert_eq!(sysfs.range(), (540, 540), "上行死区内保持不写");
+        // 上行 14.8%：写入。
+        writer.apply(&[decision(620, 620, false)]).unwrap();
+        assert_eq!(sysfs.range(), (620, 620));
+        // 下行 6.5%（620→580）在 ±10% 内：不写。
+        writer.apply(&[decision(580, 580, false)]).unwrap();
+        assert_eq!(sysfs.range(), (620, 620), "下行死区内保持不写");
+        // 下行 19.4%：写入。
+        writer.apply(&[decision(500, 500, false)]).unwrap();
+        assert_eq!(sysfs.range(), (500, 500));
+    }
+
+    #[test]
+    fn auto_setspeed_path_keeps_range_and_repairs_governor() {
+        let sysfs = Sysfs::new();
+        sysfs.enable_userspace();
+        let mut writer = sysfs.writer();
+        writer.set_auto(true, true, 0.10);
+        writer.apply(&[decision(700, 700, false)]).unwrap();
+        assert_eq!(writer.auto_path(), Some(AutoPath::SetSpeed));
+        assert_eq!(sysfs.governor(), "userspace");
+        assert_eq!(sysfs.set_speed(), Some(700));
+        assert_eq!(
+            sysfs.range(),
+            (100, 1000),
+            "setspeed 路径不得改动 min/max"
+        );
+
+        // 被外部改回原 governor：reconcile 重新切回 userspace。
+        sysfs.set_governor("schedutil");
+        writer.policies[0].last_reconcile = None;
+        assert!(writer.reconcile().unwrap());
+        assert_eq!(sysfs.governor(), "userspace");
+
+        // 紧急回退：governor 写回备份值，区间保持原始状态。
+        let policies = writer.emergency_policies();
+        crate::writer::emergency_restore(&policies).unwrap();
+        assert_eq!(sysfs.governor(), "schedutil");
+        assert_eq!(sysfs.range(), (100, 1000));
+    }
+
+    #[test]
+    fn restore_returns_governor_and_range_after_takeover() {
+        let sysfs = Sysfs::new();
+        sysfs.enable_userspace();
+        let mut writer = sysfs.writer();
+        writer.set_auto(true, true, 0.10);
+        writer.apply(&[decision(700, 700, false)]).unwrap();
+        assert_eq!(sysfs.governor(), "userspace");
+        writer.restore().unwrap();
+        assert_eq!(sysfs.governor(), "schedutil", "退出时必须写回原 governor");
+        assert_eq!(sysfs.range(), (100, 1000));
+        assert_eq!(writer.auto_path(), None);
+        // 恢复后进入 suspended，任何 apply 都不再写入。
+        writer.apply(&[decision(300, 300, false)]).unwrap();
+        assert_eq!(sysfs.range(), (100, 1000));
+    }
+
+    #[test]
+    fn emergency_restore_is_safe_without_prior_takeover() {
+        let sysfs = Sysfs::new();
+        let writer = sysfs.writer();
+        let policies = writer.emergency_policies();
+        crate::writer::emergency_restore(&policies).unwrap();
+        assert_eq!(sysfs.range(), (100, 1000));
+        assert_eq!(sysfs.governor(), "schedutil");
+    }
+
+    #[test]
+    fn auto_pin_yields_to_latched_external_floor() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        writer.set_auto(true, true, 0.10);
+        writer.apply(&[decision(300, 300, false)]).unwrap();
+        assert_eq!(sysfs.range(), (300, 300));
+
+        // 外部（powerkeeper 类）把下限抬到 500 并被读回拒绝 → 锁存地板。
+        writer.policies[0].external_floor = Some((500, Instant::now()));
+        write_khz(&sysfs.0.join("scaling_min_freq"), 500).unwrap();
+        writer.policies[0].last_reconcile = None;
+        // 外部改写先进入退避（以 Err 形式上报争写），到期后按“让位到地板”
+        // 重新锁频：min=max=500。
+        assert!(writer.reconcile().unwrap_or(true));
+        let retry = writer.policies[0].retry_at.unwrap();
+        sync_at(&mut writer, retry);
+        assert_eq!(sysfs.range(), (500, 500), "锁频让位到外部地板而不是目标");
+        assert!(writer.last_error.is_none(), "让位后不再报告争写错误");
+
+        // 目标回升到地板之上：让位自动解除，锁回目标。
+        writer.policies[0].last_reconcile = None;
+        writer.apply(&[decision(700, 700, false)]).unwrap();
+        assert_eq!(sysfs.range(), (700, 700));
+        assert!(writer.policies[0].external_floor.is_none());
+    }
+
+    #[test]
+    fn auto_pin_stale_external_floor_expires_and_descends() {
+        let sysfs = Sysfs::new();
+        let mut writer = sysfs.writer();
+        writer.set_auto(true, true, 0.10);
+        // 曾被瞬时 boost 地板顶到 500：锁频在 500，目标 300，锁存已超 2s 时效。
+        write_khz(&sysfs.0.join("scaling_min_freq"), 500).unwrap();
+        write_khz(&sysfs.0.join("scaling_max_freq"), 500).unwrap();
+        writer.policies[0].last_target = 300;
+        writer.policies[0].last_cap = 300;
+        writer.policies[0].external_floor = Some((500, Instant::now() - Duration::from_secs(3)));
+
+        writer.policies[0].last_reconcile = None;
+        let _ = writer.reconcile().unwrap_or(true);
+        assert!(
+            writer.policies[0].external_floor.is_none(),
+            "过期的 boost 地板必须自动失效"
+        );
+        let retry = writer.policies[0].retry_at.unwrap_or_else(|| Instant::now());
+        sync_at(&mut writer, retry);
+        assert_eq!(
+            sysfs.range(),
+            (300, 300),
+            "地板过期后必须下探回目标频率"
+        );
     }
 }

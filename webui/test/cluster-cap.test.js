@@ -93,7 +93,9 @@ apps = ["example.app"]
   assert.equal(saved.control.startup_guard_ms, 23456);
   assert.deepEqual(plain(saved.control.role_cap), plain(doc.control.role_cap));
   assert.deepEqual(plain(saved.aegis_app), plain(doc.aegis_app));
-  assert.deepEqual(plain(saved.aegis_frame), plain(doc.aegis_frame));
+  // frame_budget_ms 自 v5.0 起是界面暴露字段（帧感知分区），保存时按模型写入；
+  // enabled / apps 仍来自设备原文（由帧反馈侧车在守护侧合并）。
+  assert.deepEqual(plain(saved.aegis_frame), { enabled: true, apps: ['example.app'], frame_budget_ms: 16 });
   for (const key of ['full_current_ma', 'full_hold_seconds', 'full_voltage_mv']) assert.equal(saved.charge[key], doc.charge[key]);
   assert.deepEqual(plain(T.parse(T.stringify({ control: { cluster_cap_ratio: {} } }))), { control: { cluster_cap_ratio: {} } });
 });

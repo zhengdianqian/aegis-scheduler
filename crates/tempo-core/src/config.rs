@@ -48,6 +48,7 @@ impl LogLevel {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub schema: u32,
+    pub mode: ModeConfig,
     pub daemon: DaemonConfig,
     pub events: EventsConfig,
     pub control: ControlConfig,
@@ -57,6 +58,52 @@ pub struct Config {
     pub aegis_app: AegisAppConfig,
     pub governor: GovernorConfig,
     pub ui: UiConfig,
+}
+
+/// 对外的调度模式名称。配置文件里就是 `AegisAuto` / `Standard`，
+/// 守护内部据此映射到“完全接管”或“内核协同”两条执行路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModeName {
+    /// AegisAuto：软件完全接管调频（userspace+scaling_setspeed，
+    /// 内核不提供 userspace 时退化为锁定 min=max 的等效接管）。
+    AegisAuto,
+    /// Standard：保留厂商 governor，Aegis 只按 v4 行为约束上下限与换档节奏。
+    Standard,
+}
+
+impl Default for ModeName {
+    fn default() -> Self {
+        // 兼容默认：旧配置缺少 [mode] 时保持 v4 行为，
+        // 模块默认配置 packaging/config.toml 显式下发 AegisAuto。
+        Self::Standard
+    }
+}
+
+impl ModeName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AegisAuto => "AegisAuto",
+            Self::Standard => "Standard",
+        }
+    }
+
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::AegisAuto)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModeConfig {
+    pub name: ModeName,
+}
+
+impl Default for ModeConfig {
+    fn default() -> Self {
+        Self {
+            name: ModeName::default(),
+        }
+    }
 }
 
 /// 厂商 walt governor 的换档节奏接管。
@@ -176,6 +223,21 @@ pub struct ControlConfig {
     pub pressure_hold_ms: u64,
     /// EMA time constant of the demand filters.
     pub demand_smooth_ms: u64,
+
+    // ---- AegisAuto 日常完全接管 -------------------------------------------
+    /// 目标频率与当前实际频率差值在该比例以内时不写（双向死区）。
+    /// 内核不再兜底后用于压制 sysfs 往返与频率来回跳动；0 = 每次都写。
+    pub auto_deadband: f32,
+    /// 降频迟滞：目标低于当前频率必须连续满足该时长才允许写入更低值。
+    pub auto_down_hold_ms: u64,
+
+    // ---- AegisAuto 帧感知（FAS）救援 ---------------------------------------
+    /// 单帧超预算触发的托底（救援频率）最短维持时间。
+    pub fas_hold_ms: u64,
+    /// 距最近一次超预算帧达到该时长且期间无新超预算，才允许开始降频。
+    pub fas_decay_after_ms: u64,
+    /// 救援后的每次降频步长（相对当前托底频率的比例）。
+    pub fas_decay_ratio: f32,
 }
 
 /// Per-app-class floor calibration. Reading and video floors are tier indices
@@ -244,6 +306,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             schema: SCHEMA_VERSION,
+            mode: ModeConfig::default(),
             daemon: DaemonConfig::default(),
             events: EventsConfig::default(),
             control: ControlConfig::default(),
@@ -356,6 +419,13 @@ impl Default for ControlConfig {
             startup_guard_ms: 20_000,
             pressure_hold_ms: 1_000,
             demand_smooth_ms: 200,
+            // ±10% 内不写、连续 200ms 低负载才降频：内核不再兜底时的防抖强化。
+            auto_deadband: 0.10,
+            auto_down_hold_ms: 200,
+            // 单帧超预算拉满后：托底至少 500ms，连续 1000ms 无超预算才按 10% 降频。
+            fas_hold_ms: 500,
+            fas_decay_after_ms: 1_000,
+            fas_decay_ratio: 0.10,
         }
     }
 }
@@ -503,6 +573,10 @@ impl Config {
         }
         if self.daemon.profile_path.trim().is_empty() {
             bad.push("daemon.profile_path must not be empty".to_owned());
+        }
+        // 模式名由 serde 枚举白名单保证，这里只做一次可读性兜底。
+        if self.mode.name.as_str().is_empty() {
+            bad.push("mode.name must not be empty".to_owned());
         }
         if !(500..=300_000).contains(&self.events.runtime_quantum_us) {
             bad.push("events.runtime_quantum_us must be 500..=300000".to_owned());
@@ -667,6 +741,21 @@ impl Config {
         if !(50..=1_000).contains(&c.demand_smooth_ms) {
             bad.push("control.demand_smooth_ms must be 50..=1000".to_owned());
         }
+        if !(0.0..=0.30).contains(&c.auto_deadband) {
+            bad.push("control.auto_deadband must be 0.0..=0.30".to_owned());
+        }
+        if !(50..=2_000).contains(&c.auto_down_hold_ms) {
+            bad.push("control.auto_down_hold_ms must be 50..=2000".to_owned());
+        }
+        if !(100..=5_000).contains(&c.fas_hold_ms) {
+            bad.push("control.fas_hold_ms must be 100..=5000".to_owned());
+        }
+        if !(200..=10_000).contains(&c.fas_decay_after_ms) {
+            bad.push("control.fas_decay_after_ms must be 200..=10000".to_owned());
+        }
+        if !(0.05..=0.50).contains(&c.fas_decay_ratio) {
+            bad.push("control.fas_decay_ratio must be 0.05..=0.50".to_owned());
+        }
 
         if self.governor.up_rate_limit_us > 100_000 {
             bad.push("governor.up_rate_limit_us must be <= 100000".to_owned());
@@ -781,6 +870,46 @@ mod tests {
             .expect("模块默认配置必须能被当前版本解析");
         cfg.validate().expect("模块默认配置必须有效");
         assert!(!cfg.aegis_frame.enabled);
+        // v5.0 模块默认下发 AegisAuto 完全接管；Rust 侧兼容默认仍是 Standard。
+        assert_eq!(cfg.mode.name, ModeName::AegisAuto);
+        assert_eq!(ModeName::default(), ModeName::Standard);
+        assert_eq!(cfg.mode.name.as_str(), "AegisAuto");
+    }
+
+    #[test]
+    fn mode_name_roundtrips_and_rejects_unknown_values() {
+        let cfg: Config = toml::from_str("schema = 1\n[mode]\nname = \"AegisAuto\"\n").unwrap();
+        assert!(cfg.mode.name.is_auto());
+        let text = cfg.to_toml_string().unwrap();
+        assert!(text.contains("name = \"AegisAuto\""));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.mode.name, ModeName::AegisAuto);
+        let bad = toml::from_str::<Config>("schema = 1\n[mode]\nname = \"turbo\"\n");
+        assert!(bad.is_err(), "未知模式名必须被拒绝");
+        // 缺少 [mode] 的旧配置回落到 Standard，接管行为不会被悄悄打开。
+        let legacy: Config = toml::from_str("schema = 1\n").unwrap();
+        assert_eq!(legacy.mode.name, ModeName::Standard);
+    }
+
+    #[test]
+    fn auto_and_fas_defaults_match_the_specified_windows() {
+        let cfg = Config::default();
+        cfg.validate().expect("defaults must be valid");
+        assert_eq!(cfg.control.auto_deadband, 0.10);
+        assert_eq!(cfg.control.auto_down_hold_ms, 200);
+        assert_eq!(cfg.control.fas_hold_ms, 500);
+        assert_eq!(cfg.control.fas_decay_after_ms, 1_000);
+        assert_eq!(cfg.control.fas_decay_ratio, 0.10);
+
+        let mut cfg = Config::default();
+        cfg.control.auto_deadband = 0.5;
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.control.auto_down_hold_ms = 10;
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::default();
+        cfg.control.fas_decay_ratio = 0.01;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

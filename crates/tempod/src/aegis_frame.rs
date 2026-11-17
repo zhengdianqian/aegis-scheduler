@@ -229,8 +229,11 @@ fn command_output(command: &mut Command, timeout: Duration) -> io::Result<Vec<u8
     result
 }
 
-/// Parses the CSV block of `framestats`. Columns 1 and 13 are the intended
-/// vsync and the frame completion timestamp in nanoseconds.
+/// Parses the CSV block of `framestats`，表头与列位置动态识别。
+///
+/// Android 16 起表头变为 `Flags,FrameTimelineVsyncId,IntendedVsync,...` 且
+/// `FrameCompleted` 从第 13 列移到第 17 列；旧格式 `Flags,IntendedVsync,...`
+/// 仍按旧列消费。两种布局都以表头中的列名定位，不再写死列号。
 pub fn parse_framestats(package: &str, text: &str) -> AegisFrameReport {
     parse_new_framestats(package, text, &mut 0)
 }
@@ -239,11 +242,21 @@ fn parse_new_framestats(package: &str, text: &str, watermark: &mut u64) -> Aegis
     let previous = *watermark;
     let mut sample: Vec<f32> = Vec::new();
     let mut header_seen = false;
+    let mut intended_col = 1usize;
+    let mut completed_col = 13usize;
     for line in text.lines() {
         let trimmed = line.trim();
         if !header_seen {
-            if trimmed.starts_with("Flags,IntendedVsync") {
-                header_seen = true;
+            if trimmed.starts_with("Flags,") && trimmed.contains("IntendedVsync") {
+                let columns: Vec<&str> = trimmed.trim_end_matches(',').split(',').collect();
+                if let (Some(intended), Some(completed)) = (
+                    columns.iter().position(|name| *name == "IntendedVsync"),
+                    columns.iter().position(|name| *name == "FrameCompleted"),
+                ) {
+                    intended_col = intended;
+                    completed_col = completed;
+                    header_seen = true;
+                }
             }
             continue;
         }
@@ -252,11 +265,11 @@ fn parse_new_framestats(package: &str, text: &str, watermark: &mut u64) -> Aegis
             continue;
         }
         let columns: Vec<&str> = trimmed.split(',').collect();
-        if columns.len() < 14 {
+        if columns.len() <= intended_col.max(completed_col) {
             continue;
         }
-        let intended: u64 = columns[1].parse().unwrap_or(0);
-        let completed: u64 = columns[13].parse().unwrap_or(0);
+        let intended: u64 = columns[intended_col].parse().unwrap_or(0);
+        let completed: u64 = columns[completed_col].parse().unwrap_or(0);
         if intended == 0
             || completed <= intended
             || completed == i64::MAX as u64
@@ -363,6 +376,18 @@ mod tests {
         assert_eq!(report.frames, 2);
         assert!((report.worst_ms - 24.998).abs() < 0.001);
         assert_eq!(report.over_budget, 2);
+    }
+
+    #[test]
+    fn parses_android16_framestats_layout() {
+        // Android 16 起表头插入 FrameTimelineVsyncId，FrameCompleted 移到第 17 列。
+        let text = "Flags,FrameTimelineVsyncId,IntendedVsync,Vsync,InputEventId,HandleInputStart,AnimationStart,PerformTraversalsStart,DrawStart,FrameDeadline,FrameStartTime,FrameInterval,WorkloadTarget,SyncQueued,SyncStart,IssueDrawCommandsStart,SwapBuffers,FrameCompleted,DequeueBufferDuration,\n\
+            32,38308369,1000,1000,0,0,0,0,0,0,0,0,0,0,0,0,0,25000000,0,\n\
+            32,38308370,2000,2000,0,0,0,0,0,0,0,0,0,0,0,0,0,9000000,0,\n";
+        let report = parse_framestats("demo", &text);
+        assert_eq!(report.frames, 2, "A16 新布局必须能解析");
+        assert!((report.worst_ms - 24.999).abs() < 0.001);
+        assert_eq!(report.over_budget, 1, "仅 24.999ms 帧超过 16ms 基准");
     }
 
     #[test]

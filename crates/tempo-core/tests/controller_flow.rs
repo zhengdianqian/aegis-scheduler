@@ -4,7 +4,7 @@
 
 //! Controller integration tests for frequency bounds, workload events and deadlines.
 
-use tempo_core::config::Config;
+use tempo_core::config::{Config, ModeName};
 use tempo_core::controller::{AppClass, Controller, DemandSample, FrameSample};
 use tempo_core::profile::{CapacitySource, ClusterProfile, DeviceProfile, Role};
 
@@ -858,4 +858,161 @@ fn screen_off_uses_minimum_floor_and_hardware_max_cap() {
             controller.profile().clusters[index].max_khz
         );
     }
+}
+
+/// AegisAuto 配置：缩短 EMA 时间常数，把降频迟滞本身隔离出来验证。
+fn auto_config() -> Config {
+    let mut config = Config::default();
+    config.mode.name = ModeName::AegisAuto;
+    config.control.demand_smooth_ms = 50;
+    config
+}
+
+#[test]
+fn auto_mode_downgrade_waits_for_continuous_low_load() {
+    let mut controller = Controller::new(profile(), auto_config());
+    for ts in (100..900).step_by(100) {
+        controller.on_demand(demand(ts, 0.95));
+    }
+    let high = controller.tier(1);
+    assert!(high >= 4, "前置条件：负载必须先爬升，实际 {high}");
+
+    // 首个低负载样本：目标已低于当前档位，200ms 迟滞开始计时。
+    controller.on_demand(demand(1_000, 0.0));
+    let held = controller.tier(1);
+    assert_eq!(held, high, "首拍只开始计时，不得降频");
+    controller.on_deadline(1_199 * MS);
+    assert_eq!(controller.tier(1), held, "迟滞未满 200ms 不得降频");
+    controller.on_deadline(1_200 * MS);
+    assert!(
+        controller.tier(1) < held,
+        "连续 200ms 低负载后才允许降频"
+    );
+
+    // 触摸会打断“连续低负载”计时：从触摸时刻重新累计 200ms。
+    controller.on_touch(1_300 * MS);
+    controller.on_touch_up(1_310 * MS);
+    controller.on_demand(demand(1_400, 0.0));
+    let after_touch = controller.tier(1);
+    controller.on_deadline(1_499 * MS);
+    assert_eq!(
+        controller.tier(1),
+        after_touch,
+        "触摸后 199ms 内不得降频（迟滞重新累计）"
+    );
+    controller.on_deadline(1_500 * MS);
+    assert!(
+        controller.tier(1) < after_touch,
+        "触摸后满 200ms 才恢复降频"
+    );
+}
+
+#[test]
+fn standard_mode_still_steps_down_at_its_own_cadence() {
+    // 对照组：Standard 模式没有 200ms 迟滞，首个低负载样本即可开始降档。
+    let mut controller = Controller::new(profile(), Config::default());
+    for ts in (100..900).step_by(100) {
+        controller.on_demand(demand(ts, 0.95));
+    }
+    let high = controller.tier(1);
+    assert!(high >= 4, "前置条件：负载必须先爬升，实际 {high}");
+    controller.on_demand(demand(1_000, 0.0));
+    controller.on_deadline(1_050 * MS);
+    assert!(
+        controller.tier(1) < high,
+        "Standard 首个低负载样本后 50ms 内降档，不受 200ms 迟滞约束"
+    );
+}
+
+#[test]
+fn auto_frame_rescue_slams_top_holds_then_decays_in_steps() {
+    let mut controller = Controller::new(profile(), auto_config());
+    for ts in (100..600).step_by(100) {
+        controller.on_demand(demand(ts, 0.05));
+    }
+    let low = controller.tier(1);
+    assert!(low <= 1, "轻载基线前置条件：{low}");
+
+    // 单帧超预算：无需连续确认，所有簇瞬间拉满到梯顶。
+    controller.on_frame(frame(700, 40.0));
+    for index in 0..3 {
+        assert_eq!(
+            controller.tier(index),
+            controller.tier_count(index) - 1,
+            "AegisAuto 单帧超预算直接拉满簇 {index}"
+        );
+    }
+
+    // 托底：500ms 与 1000ms 内都必须钉在梯顶（连续 1000ms 无超预算才放行降频）。
+    for ts in [1_000, 1_699] {
+        controller.on_deadline(ts * MS);
+        for index in 0..3 {
+            assert_eq!(
+                controller.tier(index),
+                controller.tier_count(index) - 1,
+                "托底窗口内不得降频：ts={ts} cluster={index}"
+            );
+        }
+    }
+
+    // 超过 1000ms 无超预算：开始按 10% 步长衰减。
+    controller.on_deadline(1_701 * MS);
+    assert!(
+        controller.tier(1) < controller.tier_count(1) - 1,
+        "连续 1000ms 无超预算后才允许降频"
+    );
+
+    // 最终收敛回轻载目标，且 deadline 序列有界。
+    let stopped = drain_deadlines(&mut controller, 1_701 * MS);
+    for index in 0..3 {
+        assert!(
+            controller.tier(index) <= 1,
+            "救援衰减应回到轻载目标：cluster {index} 停在 {}",
+            controller.tier(index)
+        );
+    }
+    assert!(controller.next_deadline(stopped).is_none());
+}
+
+#[test]
+fn auto_frame_rescue_overrides_quiet_and_static_cap() {
+    // 前台跟踪可用但负载为零：静默与静态限顶都能成立的典型静态场景。
+    let idle_known = |ts_ms: u64| DemandSample {
+        ts_us: ts_ms * MS,
+        cluster_busy: vec![0.0; 3],
+        foreground_busy: vec![0.0; 3],
+        foreground_active: true,
+    };
+    let mut controller = Controller::new(profile(), auto_config());
+    // 进入静默 + 静态限顶。
+    for ts in (100..600).step_by(100) {
+        controller.on_demand(idle_known(ts));
+    }
+    controller.on_deadline(600 * MS);
+    assert!(controller.is_quiet());
+    let capped = controller.cap_khz(1);
+    assert!(
+        capped < controller.profile().clusters[1].max_khz,
+        "静默态静态限顶应收缩上限"
+    );
+
+    // 救援期间：目标拉满，静态限顶让位（cap 放开到用户上限）。
+    controller.on_frame(frame(700, 40.0));
+    for index in 0..3 {
+        assert_eq!(controller.tier(index), controller.tier_count(index) - 1);
+        assert_eq!(
+            controller.cap_khz(index),
+            controller.profile().clusters[index].max_khz,
+            "救援窗口内静态限顶必须放开"
+        );
+    }
+
+    // 救援结束、重新静默后，静态限顶恢复生效。
+    controller.on_demand(idle_known(2_500));
+    drain_deadlines(&mut controller, 2_500 * MS);
+    assert!(controller.is_quiet(), "救援结束后允许重新进入静默");
+    assert!(
+        controller.cap_khz(1) < controller.profile().clusters[1].max_khz,
+        "静态限顶应重新生效"
+    );
 }

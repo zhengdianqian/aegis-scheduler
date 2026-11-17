@@ -63,6 +63,10 @@ pub struct RuntimeStatus {
     pub write_error: Option<String>,
     pub config_generation: u64,
     pub restart_required: bool,
+    /// AegisAuto 接管方式（"userspace" / "pin"），None = Standard 或未接管。
+    pub auto_path: Option<String>,
+    /// AegisAuto 是否正在接管（亮屏且已接管；息屏挂起时为 false）。
+    pub auto_active: bool,
 }
 
 impl RuntimeStatus {
@@ -153,7 +157,15 @@ pub fn status_json(
         "service": "Aegis",
         "version": env!("CARGO_PKG_VERSION"),
         "stage": if writing { "active" } else { "observe" },
-        "mode": if writing { "adaptive" } else { "observe-only" },
+        "mode": {
+            // 对外模式名：AegisAuto / Standard（与配置文件一致）。
+            "name": config.mode.name.as_str(),
+            "takeover": config.mode.name.is_auto(),
+            // 实际接管路径："userspace"（内核支持）、"pin"（等效锁频接管）、
+            // null（Standard 或息屏挂起）。
+            "path": runtime.auto_path,
+            "active": runtime.auto_active,
+        },
         "scheduler_writes": writing,
         "guard": {
             "active": runtime.guard_active,

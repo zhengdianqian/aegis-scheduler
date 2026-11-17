@@ -17,7 +17,9 @@ if [ -z "$boot_id" ] || [ "$(cat "$ORIG/boot_id" 2>/dev/null)" != "$boot_id" ]; 
 fi
 
 failed=0
-# Never change governors, thermal services, or thermal limit nodes.
+# Never change thermal services or thermal limit nodes.
+# v5.0 起 AegisAuto 会切换 scaling_governor（userspace），因此恢复时必须
+# 把 governor 写回开机备份值；非接管模式下写回值与当前一致，不会产生写入。
 restore_node() {
     if [ "$(cat "$2" 2>/dev/null)" != "$1" ]; then
         printf '%s\n' "$1" > "$2" || return 1
@@ -56,6 +58,20 @@ for dir in "$ORIG"/policy*; do
        [ "$(cat "$target/scaling_max_freq")" != "$max" ]; then
         echo "aegis: $name: restore readback did not match" >&2
         failed=1
+    fi
+    # 区间恢复之后再回写 governor（顺序保证锁频先解除）。
+    gov=$(cat "$dir/governor" 2>/dev/null)
+    if [ -n "$gov" ] && [ "$(cat "$target/scaling_governor" 2>/dev/null)" != "$gov" ]; then
+        if ! restore_node "$gov" "$target/scaling_governor"; then
+            # 极端兜底：governor 回写被拒且仍停留在 userspace 时，把
+            # scaling_setspeed 拉回备份的可用频率，避免频率被钉死。
+            if [ "$(cat "$target/scaling_governor" 2>/dev/null)" = "userspace" ] &&
+               [ "$max" -gt 0 ] 2>/dev/null; then
+                printf '%s\n' "$max" > "$target/scaling_setspeed" 2>/dev/null
+            fi
+            echo "aegis: $name: governor restore rejected" >&2
+            failed=1
+        fi
     fi
 done
 

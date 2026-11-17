@@ -1,10 +1,12 @@
 # Aegis
 
-**v4.2.0 · versionCode 27**｜Android arm64 CPU 分档自适应调频、可选帧反馈（Aegis Frame）、充电控制。
+**v5.0.0 · versionCode 28**｜Android arm64 CPU 分档自适应调频（新增 **AegisAuto** 完全接管模式）、可选帧反馈（Aegis Frame）、充电控制。
 模块 id：`aegis_scheduler`；APP 包名：`com.aegis.scheduler`；支持通过 KernelSU / Magisk 安装。
 作者：**默默的阿文**。本项目为独立编写与独立署名，不包含第三方模块源码，详见 [PROVENANCE.md](PROVENANCE.md)。
 
-模块根据设备实际 cpufreq policy 生成档案，**主动控制每簇 `scaling_min_freq` 和 `scaling_max_freq`**。本次改进自主控制，但不锁频；真实负载可达硬件允许的 max，仍受温控、驱动和外部约束。正常控制不改 governor，保留厂商温控及 thermal / perf HAL。**厂商 XML 覆盖 apply 仍为 `disabled_unverified_hal_timing`，不能声称已完全屏蔽官方调度。** 厂商 QoS、温控和其他写入者仍可能覆盖或限制结果，不能承诺所有手机兼容、零掉帧或固定省电幅度。
+**v5.0 引入 AegisAuto（默认模式）**：选择 AegisAuto 后守护将 CPU 的 `scaling_governor` 切换为 `userspace` 并直写 `scaling_setspeed`，完全绕过内核 schedutil/walt 的换档决策；内核不提供 `userspace` governor 的机型（实测小米 babylon 系 walt 内核即如此）自动退化为**等效锁频接管**——把 `scaling_min_freq` 与 `scaling_max_freq` 锁到同一目标频率，walt 同样无权变频，两条路径共用同一套目标计算、防抖与安全看门狗。`Standard` 模式保留 v4 行为（内核协同 + 上下限约束），可随时在界面切换，保存即热生效。
+
+Standard 模式下模块根据设备实际 cpufreq policy 生成档案，**主动控制每簇 `scaling_min_freq` 和 `scaling_max_freq`**。本次改进自主控制，但不锁频；真实负载可达硬件允许的 max，仍受温控、驱动和外部约束。正常控制不改 governor（AegisAuto 切换 governor 属于上述接管语义，退出/看门狗/恢复一律写回开机备份值），保留厂商温控及 thermal / perf HAL。**厂商 XML 覆盖 apply 仍为 `disabled_unverified_hal_timing`，不能声称已完全屏蔽官方调度。** 厂商 QoS、温控和其他写入者仍可能覆盖或限制结果，不能承诺所有手机兼容、零掉帧或固定省电幅度。
 
 默认不按场景或负载压低最高频率，也不会锁定最高频率；省电上限仅在用户为某簇选择小于 `1` 的比例时启用。复核退避、帧反馈超时、启动日志退避和探针熄屏早退均不代表实测功耗或续航收益。厂商策略须校验机型及 OTA 指纹哈希；指纹哈希失配时跳过覆盖，未知机型回退，不强行套用其他机型策略。
 
@@ -12,7 +14,7 @@
 
 1. 确认设备已 root，保留可用的模块禁用/救砖途径。先禁用其他调频及充电控制模块并重启，避免备份到其限制值；仅自动迁移旧 `tempo_sched`，不会自动识别所有竞争模块。
 2. 首次安装前保存现有 CPU policy、充电状态及旧配置；升级前备份 `/data/adb/tempo/`。**不要把另一台手机的 `profile/` 或 `orig/` 拷到本机使用。**
-3. 在模块管理器刷入 `Aegis-v4.2.0.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v4.2.0.apk`。已有不同签名 APP 可能无法覆盖安装（4.2.0 起为内测签名，需先卸载旧签名 APP）。
+3. 在模块管理器刷入 `Aegis-v5.0.0.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v5.0.0.apk`。已有不同签名 APP 可能无法覆盖安装（4.2.0 起为内测签名，需先卸载旧签名 APP）。
 4. 打开 Aegis，在 root 管理器中为 APP **单独授权超级用户权限**。随模块安装不等于已获 root；也可使用模块管理器支持的 WebUI。
 5. 服务等待开机完成（最多 180 秒）、解锁检查（最多 120 秒）及额外 30 秒，再生成档案、校验配置、备份并启动守护；默认还有 20 秒 cpufreq 只读保护。不要把启动保护期当成调频失效。
 6. 检查状态、探针、频表和读回错误，再逐项检查触摸/长按、冷启动、前台切换、阅读、视频和息屏；充电只允许隔离假节点的沙盒测试，禁止真机充电控制测试。每次只改一类参数，保留原配置和同条件对照记录。
@@ -37,10 +39,11 @@ $CTL logs --lines 80
 ## 控制逻辑与边界
 
 - 每簇从实际频表按索引抽取档位；默认最多 8 档，可设 6–10，原始频点不足时保留现有档位。负载经 EMA 平滑，升档需确认，常规降档一次一档；亮屏、前台切换、应用启动有独立短窗口。**单纯负载上升不作为应用启动事件。**
+- **AegisAuto 完全接管**：亮屏且模式为 AegisAuto 时，目标频率（负载 EMA + 触摸/启动/帧决策的产物）直接写入 `scaling_setspeed`（userspace 路径）或以 min=max 锁定（等效路径）；内核 governor 不再自行换档。±`auto_deadband` 死区内不写、降频需连续 `auto_down_hold_ms` 低负载；息屏挂起接管（区间交还内核），亮屏重新接管，切到 Standard 立即恢复原始区间与 governor。守护卡死（心跳停摆 >5s）、任意线程 panic、SIGTERM/INT、进程被 SIGSTOP（shell 看门狗 10s）或 SIGKILL（shell 看门狗）都会按开机备份恢复 `scaling_governor` 与 min/max——`orig/` 备份含 governor，恢复顺序为先区间后 governor，governor 回写失败时把 `scaling_setspeed` 拉回备份的可用频率兜底。
 - 同一触摸接触会话固定一次加档目标，不因持续移动或长按叠加；静态长按不重复续 boost；prime 角色不参与触摸加档，但仍可响应负载、启动和帧压力。
-- 低负载下中核偶发顶频来自厂商 `walt`：`pl=1` 的预测会把短时唤醒放大成一次最高频，实测 10 秒轻滑命中 `2707200` 达 80 次。`[governor]` 段只写 `walt/pl` 与 `walt/{up,down}_rate_limit_us`（默认关预测、升频 40 ms 节流、降频不节流），**不设置任何频率上限、不改 min/max**；同场景命中降到 0、平均频率 1187→1038 MHz、顶频驻留 9~10 ms→0~1 ms，Settings 滑动 0 掉帧、冷启动耗时无回归。降频加节流会把高频“挂”住并抬高平均频率，故默认不给降频节流。
-- 阅读/视频/输入法场景按前台包分类。单次 UI 帧超预算提供短时救援；连续至少 3 次有效超预算反馈才提高阅读/视频自适应地板，健康反馈重置连续计数，反馈间隔过长重新计数。场景改变重置自适应地板；这不是视频解码质量检测。
-- 模块写两端并读回验证，必要时先降低 min 或先提高 max，避免上下限次序冲突。外部改写/驱动拒绝会报告错误并有限退避重试。观察到外部降低 max 后，floor/cap 不越过该约束；只有外部明确放宽才解除。该机制不是内核原子仲裁，无法保证捕获两次读取之间的瞬时限制。正常写入不改 thermal 节点；对 governor 的唯一写入是上述换档节奏（`walt/pl`、`walt/{up,down}_rate_limit_us`），不改档位表与 min/max。内核温控仍可能钳制频率。
+- 低负载下中核偶发顶频来自厂商 `walt`：`pl=1` 的预测会把短时唤醒放大成一次最高频，实测 10 秒轻滑命中 `2707200` 达 80 次。`[governor]` 段只写 `walt/pl` 与 `walt/{up,down}_rate_limit_us`（默认关预测、升频 40 ms 节流、降频不节流），**不设置任何频率上限、不改 min/max**，且仅在 Standard 模式写入（AegisAuto 下内核 governor 不再决策，跳过）；同场景命中降到 0、平均频率 1187→1038 MHz、顶频驻留 9~10 ms→0~1 ms，Settings 滑动 0 掉帧、冷启动耗时无回归。降频加节流会把高频“挂”住并抬高平均频率，故默认不给降频节流。
+- 阅读/视频/输入法场景按前台包分类。**AegisAuto + 帧感知开启时，单帧超预算即最高优先级救援**：对应簇目标瞬间拉满到梯顶，托底维持 `fas_hold_ms`，连续 `fas_decay_after_ms` 无超预算后才按 `fas_decay_ratio` 逐级降回负载目标（快升慢降），期间静态限顶与静默让位。Standard 模式维持 v4 行为：单次 UI 帧超预算提供短时救援；连续至少 3 次有效超预算反馈才提高阅读/视频自适应地板，健康反馈重置连续计数，反馈间隔过长重新计数。场景改变重置自适应地板；这不是视频解码质量检测。
+- 模块写两端并读回验证，必要时先降低 min 或先提高 max，避免上下限次序冲突。外部改写/驱动拒绝会报告错误并有限退避重试。观察到外部降低 max 后，floor/cap 不越过该约束；只有外部明确放宽才解除。该机制不是内核原子仲裁，无法保证捕获两次读取之间的瞬时限制。正常写入不改 thermal 节点；对 governor 的写入仅限 Standard 的换档节奏（`walt/pl`、`walt/{up,down}_rate_limit_us`）与 AegisAuto 的 `userspace` 切换（退出/恢复写回备份值），不改档位表。内核温控仍可能钳制频率（AegisAuto 下热机让位与外部上限回收沿用同一套退避逻辑）。
 - **不是零轮询**：BPF 有需求观察窗口，探针增加熄屏早退；CPU 区间复核在稳定时退避，异常时仍需检查和重试，看门狗也保留周期检查。帧反馈请求采用最新单槽与超时约束；启动日志读取失败采用指数退避。充电沙盒逻辑仍包含预约/停充复核、涓流及写失败重试，控制台在可见总览刷新状态。这些都是代码层面的唤醒与失败路径改进，不能据此声称真机省电。
 
 ### 帧反馈与控制界面
@@ -67,6 +70,7 @@ APP / WebUI 共用控制服务和配置，提供状态、调度、帧反馈选�
 
 | 类别 | 当前生效字段及含义 |
 | --- | --- |
+| `[mode]` | `name="AegisAuto"`（默认）或 `"Standard"`，与界面显示一致。AegisAuto：切换 `scaling_governor` 为 `userspace` 并直写 `scaling_setspeed`；内核无 `userspace` 时等效锁频（min=max=目标频率）。Standard：v4 行为。保存后热切换，无需重启 |
 | `[daemon]` | `log_level="off"`（默认不写日志，可用界面临时改 `info` 排查）；`profile_path="/data/adb/tempo/profile/device.toml"`（模块服务也显式传入该路径） |
 | `[governor]` | `smooth=true` 总开关；`prediction=false`（对应 `walt/pl`）；`up_rate_limit_us=40000`（0–100000）、`down_rate_limit_us=0`（0–200000）、`reapply_ms=60000`（0–600000）。只改换档节奏，不设置任何频率上下限；界面上这五项保存后立即生效 |
 | `[events]` | `runtime_quantum_us=250000`（500–300000 µs）、`demand_step=0.10`（0.01–0.20）：探针观察与发布阈值；`screen_path=""` 自动发现屏幕节点；`quiet_decay_ms=60`：最近触摸后的静默等待 |
@@ -74,8 +78,10 @@ APP / WebUI 共用控制服务和配置，提供状态、调度、帧反馈选�
 | 负载分档 | `tier_table_max=8`（6–10）、`up_confirm_ms=120`（40–400）、`down_step_ms=45`（15–200）、`max_up_step=2`（1–4）、`demand_smooth_ms=200`（50–1000） |
 | 交互窗口 | `touch_lift_tiers=1`（1–3）、`touch_lift_ms=150`（20–600）、`launch_lift_ms=1000`（200–1500）、`launch_tier_ratio=0.62`（0.30–0.90）；比例按档位索引计算，不是固定 GHz |
 | 目标与可选上限 | `prime_cap_ratio=0.70`、`ime_cap_ratio=0.45` 约束调度目标档位，不是最高频率限制。`[control.cluster_cap_ratio]` 安装/开机时按真实簇拓扑自动生成（1 簇、2 簇、3 簇机型都各自适配，并清理不属于本机的旧键）；`1.0` 不施加省电上限，`0.5` 按硬件最高频率的 50% 向下贴档，不低于硬件最低频率。温控及外部限制仍有效。 |
-| 静态限顶（4.0） | `quiet_ratio=0.50`（静态浏览）、`quiet_cap=0.28`（完全静默）：前台低需求且无触摸/启动/帧压力时，把该簇 `scaling_max_freq` 收缩到频率跨度的该比例；**前台瞬时负载 ≥ `floor_exit_ratio` 或任何交互立刻放开到完整上限**。前台 pid 集合不可用时不收紧。这是动态行为，不改 `cluster_cap_ratio` 的静态省电语义。 |
+| 静态限顶（4.0） | `quiet_ratio=0.50`（一般静态浏览，看剧/看小说由此压缩）、`quiet_cap=0.28`（完全静默，应 ≤ `quiet_ratio`）：前台低需求且无触摸/启动/帧压力时，把该簇 `scaling_max_freq` 收缩到频率跨度的该比例；**前台瞬时负载 ≥ `floor_exit_ratio` 或任何交互立刻放开到完整上限**。前台 pid 集合不可用时不收紧。这是动态行为，不改 `cluster_cap_ratio` 的静态省电语义。 |
+| AegisAuto 接管防抖 | `auto_deadband=0.10`（0–0.30）：目标与当前频率差值在该比例内不写（双向死区）；`auto_down_hold_ms=200`（50–2000）：目标低于当前频率须连续低负载该时长才降频。仅 AegisAuto 生效 |
 | 帧反馈 | `frame_slack_ms=3.0`、`frame_burst_ms=150`、`frame_burst_level=0.70`、`pressure_hold_ms=1000`：超预算余量、短时救援及持续压力保持 |
+| 帧感知救援（FAS，AegisAuto） | `fas_hold_ms=500`（100–5000）托底最短维持；`fas_decay_after_ms=1000`（200–10000）连续无超预算才允许降频；`fas_decay_ratio=0.10`（0.05–0.50）每次降频步长。单帧超预算直接把对应簇拉满到梯顶（最高优先级），期间静态限顶/静默让位；仅帧反馈选中的前台应用触发 |
 | 启动保护 | `startup_guard_ms=20000`（5000–120000）：守护启动后的 cpufreq 只读期，不表示充电控制也暂停 |
 | `[aegis_app]` | `reading_floor_tier` / `video_floor_tier` / `default_floor_tier` 默认 0，允许 0–5、按实际档位截断；`reading_packages` / `video_packages` / `ime_packages` 为分类包名列表，各最多 64 项，不等于帧反馈选包 |
 | `[aegis_frame]` | `enabled=false`、`apps=[]`（最多 64）、`frame_budget_ms=16.0`（6–40 ms）；侧车保存界面选包 |
@@ -107,7 +113,17 @@ $CTL apply --file /data/local/tmp/aegis-candidate.toml
 
 APP 与 WebUI 使用同一份配置。滑杆**必须按住小圆圈拖动**才改值，点轨道空白处不会跳变；松手后才写入配置草稿，再点“保存”才下发。数字框可直接输入，保存后界面会以守护读回的结果回填。
 
-### 变频节流（walt）
+v5.0 起“参数”页按三个分区展示：**调度模式 → 日常自动调频 → 帧感知（FAS）**；帧感知参数与日常参数彻底分开，不玩手游的日常用户可以完全忽略帧感知分区（帧反馈总开关与选包仍在“帧反馈”页）。
+
+### 调度模式
+
+| 参数 | 默认 | 怎么设 |
+| --- | --- | --- |
+| 调度模式 | AegisAuto | `AegisAuto` = 完全接管（有 userspace 直写 setspeed，没有则等效锁频），首页会显示真实接管路径；`Standard` = v4 内核协同行为。保存立即热切换，无需重启 |
+| 写频死区 | 0.10 | 目标与当前频率差值在该比例内不写（双向）。太小会频繁写 sysfs、频率来回跳；调大更省电但响应略钝。0 = 每次都写 |
+| 降频迟滞 | 200 ms | 目标低于当前频率必须连续低负载该时长才降频。输入法打字、界面微动不会触发降频抖动；调大会让静态场景降频更稳但略慢 |
+
+### 变频节流（walt，仅 Standard）
 
 | 参数 | 默认 | 怎么设 |
 | --- | --- | --- |
@@ -125,11 +141,25 @@ APP 与 WebUI 使用同一份配置。滑杆**必须按住小圆圈拖动**才�
 - `1.0` = 不限制（默认）；`0.8` = 该簇最高频率约 80%，向下贴到实际 OPP；低于硬件最低频时夹到最低频。
 - 这是**唯一**会主动锁该簇最高频的地方。不确定就保持 1.0，先用“变频节流”改善尖峰。
 
-### 静默与压缩 / 触摸与帧 / 换档与目标档位
+### 静默与静态限顶 / 触摸与启动 / 换档与目标档位
 
 - 静默组决定前台空闲时能压多低。“进入阈值”越低越容易进入静默，“退出阈值”必须更高，两者相差太小会来回抖。
+- **静态限顶比例（`quiet_ratio`，默认 0.50）管一般静态**（看剧、看小说这类“仍在活动但前台没什么负载”的场景）；**完全静默限顶比例（`quiet_cap`，默认 0.28）管彻底没活动的静默态**，应 ≤ 静态限顶比例。两者填反会出现“静态时压得过狠、完全静默反而压不住”的观感。
 - 触摸组只给一次加档（`touch_lift_tiers`），长按/持续滑动不会叠加；调大更容易跟手，但也更容易把中核拉高。
 - 目标档位比例（`prime_cap_ratio`、`ime_cap_ratio`）限制的是**调度目标档位**，不是硬件上限；真实重载仍可继续往上走。
+
+### 帧感知（FAS，仅 AegisAuto + 帧反馈开启）
+
+| 参数 | 默认 | 怎么设 |
+| --- | --- | --- |
+| 帧预算 | 16.0 ms | 判定超预算的基准（16 ≈ 60Hz）。高刷设备/特定应用按实际刷新率调 |
+| 帧余量 | 3.0 ms | 允许超出帧预算的余量；越小越容易触发救援，越大越省电 |
+| 救援托底时长 | 500 ms | 超预算触发后梯顶最短维持时间；期间静态限顶与静默一律让位 |
+| 救援降频等待 | 1000 ms | 连续该时长无新超预算才开始降频（快升慢降的核心） |
+| 救援降频步长 | 0.10 | 每次降托底频率的 10%，按档位取整呈现；调大降得快 |
+| 掉帧抬频窗口/目标、帧压力保持 | 150 ms / 0.70 / 1000 ms | Standard 模式的帧救援参数；AegisAuto 下仍用于静态限顶的让位窗口 |
+
+帧感知只在“帧反馈”页选中的前台应用上触发；日常不玩手游可保持默认甚至关闭帧反馈总开关。
 
 ### 采样与确认
 
@@ -144,7 +174,7 @@ APP 与 WebUI 使用同一份配置。滑杆**必须按住小圆圈拖动**才�
 
 ## 备份与回滚
 
-写入前在 `/data/adb/tempo/orig/` 保存本次开机的原始 min/max/governor，按 boot id 识别；守护另存 `run/cpufreq-backup.json`。**恢复只写 min/max，不改 governor、thermal 或限制节点**，跨开机/跨手机旧备份不可用于强行恢复。
+写入前在 `/data/adb/tempo/orig/` 保存本次开机的原始 min/max/governor，按 boot id 识别；守护另存 `run/cpufreq-backup.json`。**恢复先写回 min/max（解除 AegisAuto 锁频），再把 `scaling_governor` 写回备份值（AegisAuto 曾切换 userspace 时必须）；不改 thermal 或限制节点**，跨开机/跨手机旧备份不可用于强行恢复。
 
 ```sh
 # 在线恢复 CPU 上下限，并暂停本守护实例继续调频
@@ -179,19 +209,39 @@ rustup target add aarch64-linux-android
 .\scripts\build-android.ps1 -Release
 # 重建 WebUI、同步 APP assets、Gradle release、正式签名验证并输出 APK
 .\app\build.ps1
-.\scripts\build-module.ps1 -Version '4.2.0' `
+.\scripts\build-module.ps1 -Version '5.0.0' `
   -BuildDir $env:TEMPO_ANDROID_TARGET_DIR `
-  -Apk 'D:\aegis-build\output\Aegis-v4.2.0.apk' `
+  -Apk 'D:\aegis-build\output\Aegis-v5.0.0.apk' `
   -OutputDir 'D:\aegis-build\output'
 ```
 
 `build-module.ps1` 只打包现有 Android 二进制、`webui/dist/` 和匹配的已签名 APK，不会代替编译。需要直接使用 Cargo 时，先构建非空 `probe/dist/tempo.bpf.o`，设置 NDK linker、CC/AR 和 `CARGO_TARGET_DIR`（参照 `scripts/build-android.ps1`），再运行 `cargo build --release --target aarch64-linux-android --workspace`。不能只编译宿主程序后改名打包。
 
-正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 4.2.0 / 27，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
+正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 5.0.0 / 28，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
 
 ## 验证状态与许可
 
 此 README 描述当前实现与验证方法，**不是泛机型验收报告**。未运行的构建、回归、跨机节点验证及功耗测试不记为成功；旧版本的帧率、电流和频率记录不能代表本版结果，故不在此沿用。正式适配需记录设备/内核/ROM、参数、节点读回、测试条件及同条件对照；降低频率不自动等于降低整机功耗。
+
+### v5.0.0 变更（AegisAuto 完全接管 · 大版本）
+
+- **新增 AegisAuto 调度模式（模块默认，配置 `[mode] name`，界面同名显示）**：选中后守护切换 `scaling_governor` 为 `userspace` 并直写 `scaling_setspeed`，完全绕过内核 schedutil/walt；内核不提供 `userspace` 的机型自动退化为等效锁频接管（min=max=目标频率）。两条路径共用 eBPF 负载 EMA + 触摸/启动/帧决策。`Standard` 保留 v4 行为，界面保存即热切换。**真机（babylon/walt）无 userspace，实际走锁频路径，`status.mode.path` 可见。**
+- **日常防抖强化（AegisAuto）**：`control.auto_deadband=0.10` 目标与当前频率差值 ±10% 内不写（双向）；`control.auto_down_hold_ms=200` 目标低于当前频率须连续 200 ms 低负载才降频——内核不再兜底后压制频率来回跳动，输入法输入与界面微动不再触发降频抖动。
+- **游戏帧感知（FAS）重构（AegisAuto + 帧感知开启）**：单帧超预算即最高优先级救援，对应簇目标瞬间拉满到梯顶；托底维持 `fas_hold_ms=500`，连续 `fas_decay_after_ms=1000` 无超预算才允许按 `fas_decay_ratio=0.10` 逐级降频（快升慢降），期间静态限顶与静默让位。Standard 模式维持 v4 的短时救援/压力确认行为。
+- **修复 Android 16 帧解析（帧反馈在 A16 上完全失效的根因）**：A16 起 `dumpsys gfxinfo framestats` 表头变为 `Flags,FrameTimelineVsyncId,IntendedVsync,...` 且 `FrameCompleted` 从第 13 列移到第 17 列，v4.x 写死列号的解析器读不到任何帧；v5.0 改为按表头列名动态定位，新旧格式双兼容（真机抖音实测帧报告恢复）。
+- **安全看门狗三层防线**：① 守护内独立心跳线程每秒以 `SIGUSR1` 唤醒主循环并检查心跳，主调频循环停摆 >5 s 立即按开机备份执行紧急回退（恢复 governor + min/max）后退出；② panic 钩子（release `panic=abort`）在崩溃前先回退并写干净退出标记；③ shell `watchdog.sh` 新增进程 T 状态（SIGSTOP 冻结）连续两次检测即恢复，并保留 SIGKILL 兜底；`restore.sh` 现在会把 `scaling_governor` 写回开机备份值（先区间后 governor，governor 被拒时把 setspeed 拉回备份可用频率）。**SIGKILL 不可捕获，由 shell 看门狗覆盖；PDEATHSIG 不适用（父进程 service.sh 约 90 s 正常退出会误杀守护），故采用心跳线程方案。**
+- **配置与 UI**：配置文件与界面统一显示 `AegisAuto` / `Standard`；“参数”页拆为三个分区——**调度模式 / 日常自动调频 / 帧感知（FAS）**，帧感知参数（帧预算、帧余量、救援托底/等待/步长、掉帧窗口、压力保持）与日常参数彻底分开；首页状态显示模式与真实接管路径（userspace/锁频/待机）。修复静态两参数数据反向问题：`quiet_ratio`（静态限顶，看剧看小说）与 `quiet_cap`（完全静默，应更紧）语义与默认值对齐，本机旧配置中被调换的取值已纠正为 0.50 / 0.28。
+- **外部守护共存（真机发现并修复）**：powerkeeper 类原生守护会持续抬高 `scaling_min_freq`（v4.0 已记录的下限争写），锁频模式若硬顶会被永久打回并可能把瞬时 boost 地板固化；v5.0 增加“外部地板锁存让位”——读回被拒时锁存（地板值+拒绝时刻），2s 时效内锁频让位到地板（比放任内核在其区间自由运行更省），外部下调跟随下移、目标回升立即解除、过期自动下探。AegisAuto 被外部改写后的重夺退避固定 500ms（Standard 保持原指数退避），稳态无争写时写入归零。
+- **构建与测试**：`cargo test --workspace` 全绿（含新增的接管/死区/回退/迟滞/FAS/地板让位用例）、WebUI `node --test` 全绿；版本 5.0.0 / versionCode 28。真机验证记录见下节。
+
+### v5.0.0 真机验证（babylon · HyperOS Android 16 · walt 内核，2026-11-17）
+
+- **接管**：亮屏后 `status.mode = {name:AegisAuto, path:"pin", active:true}`（内核无 `userspace` → 等效锁频），实测 `min=max=目标频率`；息屏挂起（区间交还内核）、亮屏重新接管；`Standard ↔ AegisAuto` 经 `config.apply` 双向热切换，`restart_required=false`；APP 首页显示“AegisAuto · 锁频接管中”与 v5.0.0。
+- **日常行为**：`am start` 启动/切换时目标即拉至高档（实测超大核拉满 3360000）；静置 45s `static_cap=true`、均衡核锁到 499200（硬件最低频）；输入法连续输入 12s（搜索框 IME 已显示）效率核频率变化 **0 次**、均衡核仅 1 次过渡——打字不跳频。
+- **帧感知**：抖音选入帧反馈、帧预算压到 6ms 强制超预算：单帧报告即触发三簇 `reason=frame_burst` 且目标拉满 `2016000/2803200/3360000`；1000ms 无新超预算后按 10% 衰减（观察到 `3360000→2726400→1977600` 台阶），下一报告再救援。
+- **安全看门狗（三层实测）**：SIGTERM → 恢复 + `clean-exit` 标记，三点区间与 `orig/` 备份逐项一致；SIGKILL → shell 看门狗 `restore.sh` 恢复全部三点（含 governor）；SIGSTOP 14s → 新增 T 状态检测触发恢复（日志 `daemon frozen (state T)`）；恢复逐节点独立尝试并最多重试 3 轮，修复 v4.2“恢复单点失败即丢弃标记”的问题。
+- **测试**：宿主 `cargo test --workspace` 117 项全绿；**真机直接执行 tempod 测试体 75/75**（含 A16 帧解析、信号、writer 用例）；WebUI `node --test` 全绿；APK 同签名覆盖安装成功（CN=Aegis，v2/v3）。
+- **环境干扰记录**：设备存在 powerkeeper 类下限守护与场景类 max 改写（与 v4.0 记录一致），AegisAuto 以“地板让位 + 500ms 有界重夺”与其共存；`Scene` 应用在测试中曾被 force-stop（其 root 守护未受影响），测试结束已重新拉起。
 
 ### v4.2.0 变更（WebUI / APP 补齐，未真机复测）
 

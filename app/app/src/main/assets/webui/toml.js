@@ -21,6 +21,10 @@
 
   var DEFAULTS = {
     schema: 1,
+    /* 缺 [mode] 的旧配置按守护的兼容默认显示（Standard）；模块新装配置显式下发 AegisAuto。 */
+    mode: {
+      name: 'Standard'
+    },
     daemon: {
       log_level: 'off',
       profile_path: '/data/adb/tempo/device.toml'
@@ -67,11 +71,19 @@
       frame_burst_level: 0.70,
       reserve_ratio: 1.05,
       step_hysteresis: 0.03,
+      auto_deadband: 0.10,
+      auto_down_hold_ms: 200,
+      fas_hold_ms: 500,
+      fas_decay_after_ms: 1000,
+      fas_decay_ratio: 0.10,
       role_cap: {
         efficiency: 1.00,
         balanced: 1.00,
         prime: 1.00
       }
+    },
+    aegis_frame: {
+      frame_budget_ms: 16.0
     },
     charge: {
       stop_at_percent: 80,
@@ -576,6 +588,9 @@
     var d = DEFAULTS;
     return {
       schema: 1,
+      mode: {
+        name: pickString(src, 'mode.name', d.mode.name)
+      },
       daemon: {
         log_level: pickString(src, 'daemon.log_level', d.daemon.log_level),
         profile_path: pickString(src, 'daemon.profile_path', d.daemon.profile_path)
@@ -623,11 +638,19 @@
         frame_burst_level: pickNumber(src, 'control.frame_burst_level', d.control.frame_burst_level),
         reserve_ratio: pickNumber(src, 'control.reserve_ratio', d.control.reserve_ratio),
         step_hysteresis: pickNumber(src, 'control.step_hysteresis', d.control.step_hysteresis),
+        auto_deadband: pickNumber(src, 'control.auto_deadband', d.control.auto_deadband),
+        auto_down_hold_ms: pickNumber(src, 'control.auto_down_hold_ms', d.control.auto_down_hold_ms),
+        fas_hold_ms: pickNumber(src, 'control.fas_hold_ms', d.control.fas_hold_ms),
+        fas_decay_after_ms: pickNumber(src, 'control.fas_decay_after_ms', d.control.fas_decay_after_ms),
+        fas_decay_ratio: pickNumber(src, 'control.fas_decay_ratio', d.control.fas_decay_ratio),
         role_cap: {
           efficiency: pickNumber(src, 'control.role_cap.efficiency', d.control.role_cap.efficiency),
           balanced: pickNumber(src, 'control.role_cap.balanced', d.control.role_cap.balanced),
           prime: pickNumber(src, 'control.role_cap.prime', d.control.role_cap.prime)
         }
+      },
+      aegis_frame: {
+        frame_budget_ms: pickNumber(src, 'aegis_frame.frame_budget_ms', d.aegis_frame.frame_budget_ms)
       },
       charge: {
         stop_at_percent: pickNumber(src, 'charge.stop_at_percent', d.charge.stop_at_percent),

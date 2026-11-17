@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '4.2.0';
+  var APP_VERSION = '5.0.0';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -92,10 +92,43 @@
   /*
    * 参数分组。区间与 config.rs 的 validate() 一一对应，
    * 客户端只做即时提示，最终以服务端检查结果为准。
+   *
+   * v5.0 起按 section 分区：模式 / 日常自动调频 / 帧感知（FAS）。
+   * 帧感知参数与日常参数彻底分开，不玩手游的日常用户可以完全忽略 FAS 区。
    */
+  var CFG_SECTIONS = [
+    {
+      id: 'mode',
+      title: '调度模式',
+      desc: 'AegisAuto 由软件完全接管调频（内核有 userspace 就直写 scaling_setspeed，没有则等效锁频接管）；Standard 保留厂商内核协同。保存后立即热切换，无需重启。'
+    },
+    {
+      id: 'daily',
+      title: '日常自动调频',
+      desc: '日常软件该省电省电、启动与切换该高频就高频、输入法输入不乱跳频、静态看剧看小说合理使用静默压缩。'
+    },
+    {
+      id: 'frame',
+      title: '帧感知（FAS）',
+      desc: '仅对“帧反馈”页选中的应用生效：单帧超预算直接把对应簇拉满救援，快升慢降。日常不玩手游可保持默认。'
+    }
+  ];
+
   var CFG_GROUPS = [
     {
+      id: 'mode',
+      section: 'mode',
+      title: '调度模式与接管防抖',
+      desc: '模式对外即 AegisAuto / Standard；防抖三项仅在 AegisAuto 下生效。',
+      fields: [
+        { path: 'mode.name', label: '调度模式', kind: 'select', options: ['AegisAuto', 'Standard'], tip: 'AegisAuto：完全接管调频——内核提供 userspace governor 时切换并直写 scaling_setspeed；不提供时等效锁定 min=max（内核无权变频），两条路共用同一套 eBPF 负载 EMA、触摸/启动/帧感知决策与安全看门狗。Standard：保留厂商 walt/schedutil，Aegis 只约束上下限（v4 行为）。保存后立即热切换。' },
+        { path: 'control.auto_deadband', label: '写频死区', min: 0, max: 0.30, step: 0.01, decimals: 2, tip: 'AegisAuto：目标频率与当前频率差值在该比例以内不写（双向死区），压制 sysfs 往返与频率来回跳动；0 = 每次都写。' },
+        { path: 'control.auto_down_hold_ms', label: '降频迟滞', min: 50, max: 2000, step: 10, integer: true, unit: 'ms', tip: 'AegisAuto：目标低于当前频率必须连续低负载该时长才允许降频（内核不再兜底时的防抖强化）。' }
+      ]
+    },
+    {
       id: 'quiet',
+      section: 'daily',
       title: '静默与静态限顶',
       desc: '前台空闲时能压到多低、落到最低频有多快；静态时每簇顶频收缩到多低，前台一忙或任何交互当拍放开。',
       fields: [
@@ -103,27 +136,25 @@
         { path: 'control.floor_exit_ratio', label: '静默退出阈值', min: 0.02, max: 0.40, step: 0.01, decimals: 2, tip: '前台负载达到该比例后退出静默；也是静态限顶的“当拍放开”阈值（按瞬时前台负载判定）。' },
         { path: 'control.floor_enter_ratio', label: '静默进入阈值', min: 0.005, max: 0.20, step: 0.005, decimals: 3, tip: '前台阶梯负载持续低于该比例，视为没有有效前台工作；也是静态限顶的进入阈值（按平滑前台负载判定）。' },
         { path: 'control.down_step_ms', label: '降档间隔', min: 15, max: 200, step: 1, integer: true, unit: 'ms', tip: '每次下降一档的最小间隔。' },
-        { path: 'control.quiet_ratio', label: '静态限顶比例', min: 0.05, max: 0.95, step: 0.01, decimals: 2, tip: '静态（前台低需求、无触摸/启动/帧压力）时该簇 scaling_max_freq 收缩到硬件频率跨度的该比例；前台瞬时负载达到退出阈值或任何交互当拍放开，只压“用户没在用”的后台突发。0.5 ≈ 频率跨度一半；1 = 关闭静态限顶。' },
-        { path: 'control.quiet_cap', label: '完全静默限顶比例', min: 0.05, max: 0.90, step: 0.01, decimals: 2, tip: '完全静默（静默态）时在静态限顶基础上进一步收紧的顶频比例；退出静默立即回到静态限顶比例。' }
+        { path: 'control.quiet_ratio', label: '静态限顶比例', min: 0.05, max: 0.95, step: 0.01, decimals: 2, tip: '一般静态（前台低需求、无触摸/启动/帧压力，但仍在活动）时该簇顶频收缩到硬件频率跨度的该比例；前台瞬时负载达到退出阈值或任何交互当拍放开。0.5 ≈ 频率跨度一半；1 = 关闭静态限顶。看剧、看小说的静态场景由它压缩。' },
+        { path: 'control.quiet_cap', label: '完全静默限顶比例', min: 0.05, max: 0.90, step: 0.01, decimals: 2, tip: '完全静默（静默态，连前台活动都没有）时在静态限顶基础上进一步收紧的顶频比例，应 ≤ 静态限顶比例；退出静默立即回到静态限顶比例。' }
       ]
     },
     {
       id: 'touch',
-      title: '触摸与帧',
-      desc: '触摸、前台切换与掉帧时的一次性抬频，用来保住交互手感。',
+      section: 'daily',
+      title: '触摸与启动',
+      desc: '触摸、前台切换与应用启动时的一次性抬频，用来保住交互手感。',
       fields: [
         { path: 'control.touch_lift_ms', label: '触摸抬频窗口', min: 20, max: 600, step: 10, integer: true, unit: 'ms', tip: '一次触摸后维持抬频的时间。' },
         { path: 'control.touch_lift_tiers', label: '触摸抬升档数', min: 1, max: 3, step: 1, integer: true, tip: '触摸提升档数，不直接抬升超大核。' },
         { path: 'control.launch_lift_ms', label: '启动抬频窗口', min: 200, max: 1500, step: 50, integer: true, unit: 'ms', tip: '应用启动与亮屏解锁后的抬频窗口；窗口内静态限顶不生效。' },
-        { path: 'control.launch_tier_ratio', label: '启动档位比例', min: 0.30, max: 0.90, step: 0.01, decimals: 2, tip: '启动与前台切换的预热档位。' },
-        { path: 'control.frame_slack_ms', label: '帧余量', min: 0.5, max: 20.0, step: 0.5, decimals: 1, unit: 'ms', tip: '渲染时间允许超出帧预算的余量。' },
-        { path: 'control.frame_burst_ms', label: '掉帧抬频窗口', min: 40, max: 1000, step: 10, integer: true, unit: 'ms', tip: '检测到帧超时后的一次性抬频时间。' },
-        { path: 'control.frame_burst_level', label: '掉帧抬频目标', min: 0.10, max: 1.0, step: 0.01, decimals: 2, tip: '掉帧抬频窗口内允许达到的频率比例。' },
-        { path: 'control.pressure_hold_ms', label: '帧压力保持', min: 300, max: 5000, step: 100, integer: true, unit: 'ms', tip: '连续超预算反馈后维持抬档状态的时间；期间静态限顶不生效。' }
+        { path: 'control.launch_tier_ratio', label: '启动档位比例', min: 0.30, max: 0.90, step: 0.01, decimals: 2, tip: '启动与前台切换的预热档位。' }
       ]
     },
     {
       id: 'shift',
+      section: 'daily',
       title: '换档与目标档位',
       desc: '设置升档确认时间及不同场景的调度目标档位。',
       fields: [
@@ -136,11 +167,12 @@
     },
     {
       id: 'governor',
-      title: '变频节流（walt）',
-      desc: '接管厂商 walt 的换档节奏：只改“多久允许换一次档”，不设置任何频率上限，也不锁最高频。',
+      section: 'daily',
+      title: '变频节流（仅 Standard 模式）',
+      desc: 'Standard 模式下接管厂商 walt 的换档节奏：只改“多久允许换一次档”，不设置任何频率上限。AegisAuto 完全接管时本组不写入。',
       fields: [
-        { path: 'governor.smooth', label: '启用换档接管', kind: 'bool', tip: '关闭后完全保持厂商原始 walt 行为，下面四项同时失效。' },
-        { path: 'governor.prediction', label: '预测换档', kind: 'bool', tip: 'walt 的 pl。开启会放大短时唤醒，是顶频尖峰的主要来源；建议关闭。' },
+        { path: 'governor.smooth', label: '启用换档接管', kind: 'bool', tip: '关闭后完全保持厂商原始 walt 行为，下面四项同时失效。仅 Standard 模式生效。' },
+        { path: 'governor.prediction', label: '预测换档', kind: 'bool', tip: 'walt 的 pl。预测会放大短时唤醒，是顶频尖峰的主要来源；建议关闭。' },
         { path: 'governor.up_rate_limit_us', label: '升频最小间隔', min: 0, max: 100000, step: 1000, integer: true, unit: 'µs', tip: '两次升频之间的最小间隔。0 = 不限制；越大平均频率越低，但过大可能拖慢重载响应。保存后立即生效。' },
         { path: 'governor.down_rate_limit_us', label: '降频最小间隔', min: 0, max: 200000, step: 1000, integer: true, unit: 'µs', tip: '两次降频之间的最小间隔。0 = 负载一落就立刻降档；实测加降频节流反而把高频挂住、平均频率更高。保存后立即生效。' },
         { path: 'governor.reapply_ms', label: '参数补写周期', min: 0, max: 600000, step: 5000, integer: true, unit: 'ms', tip: '被厂商或其它模块改回默认时的重写周期。0 = 只在启动/保存时写一次。保存后立即生效。' }
@@ -148,6 +180,7 @@
     },
     {
       id: 'sample',
+      section: 'daily',
       title: '采样与确认',
       desc: '事件采样密度与静默确认时间；采样越稀，自身唤醒越少。',
       fields: [
@@ -156,6 +189,22 @@
         { path: 'events.quiet_decay_ms', label: '静默延迟', min: 20, max: 2000, step: 10, integer: true, unit: 'ms', tip: '最后一次触摸后至少经过该时间才允许进入静默。' },
         { path: 'control.floor_settle_ms', label: '静默确认时间', min: 10, max: 1000, step: 10, integer: true, unit: 'ms', tip: '前台负载持续低于进入阈值多久才确认静默。' },
         { path: 'daemon.log_level', label: '日志级别', kind: 'select', options: LOG_LEVELS, tip: 'off = 完全不写日志（默认，最省电）；error/warn 只记异常；info 及以上用于排查。修改后需重启服务。' }
+      ]
+    },
+    {
+      id: 'frame',
+      section: 'frame',
+      title: '帧感知救援（FAS）',
+      desc: 'AegisAuto 下单帧超预算即把对应簇瞬间拉满（最高优先级救援）；托底维持与快升慢降由下面三个参数控制。',
+      fields: [
+        { path: 'aegis_frame.frame_budget_ms', label: '帧预算', min: 6, max: 40, step: 0.5, decimals: 1, unit: 'ms', tip: '判定超预算的基准帧耗时（16 ≈ 60Hz）。渲染时间超过“帧预算 + 帧余量”即触发救援。' },
+        { path: 'control.frame_slack_ms', label: '帧余量', min: 0.5, max: 20.0, step: 0.5, decimals: 1, unit: 'ms', tip: '渲染时间允许超出帧预算的余量。' },
+        { path: 'control.fas_hold_ms', label: '救援托底时长', min: 100, max: 5000, step: 50, integer: true, unit: 'ms', tip: '超预算触发后，救援频率（梯顶）最短维持时间；期间静态限顶与静默一律让位。' },
+        { path: 'control.fas_decay_after_ms', label: '救援降频等待', min: 200, max: 10000, step: 100, integer: true, unit: 'ms', tip: '距最近一次超预算帧连续达到该时长、且期间无新超预算，才允许开始降频（快升慢降）。' },
+        { path: 'control.fas_decay_ratio', label: '救援降频步长', min: 0.05, max: 0.50, step: 0.01, decimals: 2, tip: '救援后的每次降频步长（相对当前托底频率的比例）；0.10 = 每次降 10%，按频率档位取整呈现。' },
+        { path: 'control.frame_burst_ms', label: '掉帧抬频窗口', min: 40, max: 1000, step: 10, integer: true, unit: 'ms', tip: '检测到帧超时后的一次性抬频时间；期间静态限顶不生效。' },
+        { path: 'control.frame_burst_level', label: '掉帧抬频目标', min: 0.10, max: 1.0, step: 0.01, decimals: 2, tip: '掉帧抬频窗口内允许达到的频率比例（Standard 模式的帧救援上限）。' },
+        { path: 'control.pressure_hold_ms', label: '帧压力保持', min: 300, max: 5000, step: 100, integer: true, unit: 'ms', tip: '连续超预算反馈后维持抬档状态的时间；期间静态限顶不生效。' }
       ]
     }
   ];
@@ -389,7 +438,19 @@
   function renderHero(data) {
     var status = data.status;
     var running = !!status;
-    var mode = running ? '自适应调度' : '等待连接';
+    var modeInfo = running && status.mode && typeof status.mode === 'object' ? status.mode : null;
+    var modeText;
+    if (!running) {
+      modeText = '等待连接';
+    } else if (modeInfo && modeInfo.takeover) {
+      // AegisAuto：展示真实接管路径（userspace 或等效锁频）。
+      modeText = 'AegisAuto · ' + (modeInfo.active
+        ? (modeInfo.path === 'userspace' ? 'userspace 接管中' : '锁频接管中')
+        : '待机（未接管）');
+    } else {
+      modeText = (modeInfo && modeInfo.name) ? 'Standard · 内核协同' : '自适应调度';
+    }
+    var mode = modeText;
     var quiet = running && status.control && status.control.quiet;
     var staticCap = running && status.control && status.control.static_cap;
     var reclaim = running && status.writer && status.writer.respect_external;
@@ -897,20 +958,30 @@
     }
 
     var errors = validateConfigModel(state.cfg.draft);
+    var renderGroup = function (group) {
+      return '' +
+        '<section class="card cfg-group">' +
+          '<header class="cfg-group__head">' +
+            '<div><h2>' + escapeHtml(group.title) + '</h2><p>' + escapeHtml(group.desc) + '</p></div>' +
+            '<button class="ghost-btn ghost-btn--sm" data-action="cfg-reset" data-group="' + group.id + '">恢复默认</button>' +
+          '</header>' +
+          group.fields.map(function (def) {
+            return renderCfgField(def, state.cfg.draft, errors);
+          }).join('') +
+        '</section>';
+    };
     return '' +
       '<div class="section-title"><h2>参数</h2><span>修改后保存生效</span></div>' +
       renderConfigDegrade() +
-      CFG_GROUPS.map(function (group) {
+      CFG_SECTIONS.map(function (section) {
+        var groups = CFG_GROUPS.filter(function (group) { return group.section === section.id; });
+        if (!groups.length) return '';
         return '' +
-          '<section class="card cfg-group">' +
-            '<header class="cfg-group__head">' +
-              '<div><h2>' + escapeHtml(group.title) + '</h2><p>' + escapeHtml(group.desc) + '</p></div>' +
-              '<button class="ghost-btn ghost-btn--sm" data-action="cfg-reset" data-group="' + group.id + '">恢复默认</button>' +
-            '</header>' +
-            group.fields.map(function (def) {
-              return renderCfgField(def, state.cfg.draft, errors);
-            }).join('') +
-          '</section>';
+          '<div class="cfg-section">' +
+            '<h3>' + escapeHtml(section.title) + '</h3>' +
+            '<p>' + escapeHtml(section.desc) + '</p>' +
+          '</div>' +
+          groups.map(renderGroup).join('');
       }).join('') +
       renderClusterCaps(errors) +
       renderSavebar(errors);

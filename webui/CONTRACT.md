@@ -85,9 +85,9 @@ tempoctl --config /data/adb/tempo/config.toml status --socket /data/adb/tempo/ru
 {
   "ok": true,
   "service": "Aegis",
-  "version": "3.0.0",
+  "version": "5.0.0",
   "stage": "active",
-  "mode": "adaptive",
+  "mode": { "name": "AegisAuto", "takeover": true, "path": "pin", "active": true },
   "scheduler_writes": true,
   "schema": 1,
   "platform": "kalama",

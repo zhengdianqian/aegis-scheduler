@@ -34,6 +34,8 @@ mod screen;
 mod touch;
 mod vendor_policy;
 mod writer;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod watchdog;
 
 #[derive(Debug, Parser)]
 #[command(

@@ -7,7 +7,9 @@
 param(
     [switch]$Release,
     [string]$Ndk = $env:ANDROID_NDK_HOME,
-    [int]$ApiLevel = 26
+    [int]$ApiLevel = 26,
+    # 探针源未改动且 probe/dist/tempo.bpf.o 已就位时可跳过（本机无 nightly/bpf-linker）。
+    [switch]$SkipProbe
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,9 +49,13 @@ $env:AR_aarch64_linux_android = Join-Path $toolchain "llvm-ar.exe"
 Write-Host "CARGO_TARGET_DIR=$target"
 Write-Host "linker=$linker"
 
-# tempod embeds the probe object, so build it first.
-& (Join-Path $PSScriptRoot "build-probe.ps1")
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# tempod embeds the probe object, so build it first (unless already provided).
+if (-not $SkipProbe) {
+    & (Join-Path $PSScriptRoot "build-probe.ps1")
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} elseif (-not (Test-Path (Join-Path $root "probe\dist\tempo.bpf.o"))) {
+    throw "-SkipProbe requires an existing probe/dist/tempo.bpf.o"
+}
 
 Push-Location $root
 try {
