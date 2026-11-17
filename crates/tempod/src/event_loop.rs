@@ -475,13 +475,24 @@ pub fn run(
     let mut last_start_us: u64 = 0;
     let mut pending_start_us: Option<u64> = None;
     let mut launch_invalidated_us: u64 = 0;
+    // Doze 轮询节拍（仅息屏期间每 120s 一次）。
+    let mut last_doze_us: u64 = 0;
 
     loop {
         // 每次醒来刷新心跳：看门狗线程据此判断主调频循环是否卡死。
         watchdog::beat();
-        if writer
-            .as_ref()
-            .is_some_and(|writer| writer.last_error.is_some())
+        // 接管活跃度决定心跳频率：亮屏接管 1s 快拍（卡死 5s 内发现），
+        // 息屏/未接管 5 分钟慢拍，不再按秒唤醒阻断深睡。
+        watchdog::set_active(config.mode.name.is_auto() && screen_on);
+        // 写入错误时把复核定时器提到 1s 快速重试——但**息屏接管挂起期间绝不能
+        // 这么做**：外部下限争抢会让 error 长期存在，实测把息屏复核永久钉在
+        // 1s、主循环每秒醒一次（15/15 秒采样恒 +1），阻断深睡。挂起期间内核
+        // 拥有调频权，错误无需秒级响应，交给按秒退避的常规复核即可。
+        let standby_auto = config.mode.name.is_auto() && !screen_on;
+        if !standby_auto
+            && writer
+                .as_ref()
+                .is_some_and(|writer| writer.last_error.is_some())
             && ceiling_backoff.expedite()
         {
             ceiling_timer.arm(now_us() + 1_000_000);
@@ -671,6 +682,9 @@ pub fn run(
                             state.screen_on = on;
                             state.quiet = controller.is_quiet();
                             state.static_cap = controller.is_static_cap();
+                            if on {
+                                state.doze = false;
+                            }
                             state.frame_active = false;
                         }
                         commit(&decisions, &mut writer, &status);
@@ -922,6 +936,45 @@ pub fn run(
             if token == CEILING_TIMER {
                 ceiling_timer.drain();
                 let now = now_us();
+                // 屏幕状态周期兜底：inotify 边沿可能丢失（实测漏掉一次息屏后
+                // 按亮屏继续接管、持续写频率），每拍重读面板状态自愈。
+                if let Some(watcher) = screen.as_mut() {
+                    while let Some(on) = watcher.refresh() {
+                        screen_on = on;
+                        if let Ok(mut state) = status.lock() {
+                            state.screen_on = on;
+                            state.quiet = controller.is_quiet();
+                            state.static_cap = controller.is_static_cap();
+                            if on {
+                                state.doze = false;
+                            }
+                        }
+                        if let Some(writer) = writer.as_mut() {
+                            writer.set_auto(
+                                config.mode.name.is_auto(),
+                                screen_on,
+                                config.control.auto_deadband,
+                            );
+                        }
+                        let at = now_us();
+                        let decisions = controller.on_screen(at, on);
+                        commit(&decisions, &mut writer, &status);
+                        refresh_frame(&config, &foreground, &mut frame, &status, on);
+                        match controller.next_deadline(at) {
+                            Some(deadline) => deadline_source.arm(deadline.at_us),
+                            None => deadline_source.disarm(),
+                        }
+                        ceiling_timer.arm(now_us() + ceiling_backoff.reset());
+                    }
+                }
+                // Doze 低频识别：仅息屏期间每 120s 查一次 deviceidle，亮屏即清。
+                if !screen_on && now.saturating_sub(last_doze_us) >= 120_000_000 {
+                    last_doze_us = now;
+                    let doze = power::doze_active();
+                    if let Ok(mut state) = status.lock() {
+                        state.doze = doze;
+                    }
+                }
                 // 厂商或其它模块可能把 walt 参数改回默认；按配置周期补写。
                 // AegisAuto 不写 walt 节流参数（内核 governor 不再决策换档）。
                 let reapply_us = config.governor.reapply_ms.saturating_mul(1000);

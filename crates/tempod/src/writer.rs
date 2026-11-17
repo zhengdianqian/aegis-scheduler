@@ -866,8 +866,12 @@ fn apply_auto(
     policy.idle_floor = decision.idle;
     let now = Instant::now();
     let reference = policy.last_target;
+    // 死区只压“降向”：AegisAuto 下内核不再兜底，升频方向若也挡在 ±deadband
+    // 里会造成欠频卡顿（4.2 流畅度回退的来源之一）；升频立即写入，防抖交给
+    // 控制器的降频迟滞（auto_down_hold_ms）与降档步进。
     let within_deadband = reference != 0
-        && f64::from(target.abs_diff(reference)) <= f64::from(reference) * f64::from(deadband);
+        && target < reference
+        && f64::from(reference - target) <= f64::from(reference) * f64::from(deadband);
 
     match path {
         AutoPath::Pin => {
@@ -1610,22 +1614,22 @@ mod tests {
     }
 
     #[test]
-    fn auto_deadband_suppresses_small_moves_both_directions() {
+    fn auto_deadband_only_softens_downward_moves() {
         let sysfs = Sysfs::new();
         let mut writer = sysfs.writer();
-        // 密集频点：相邻档位相差 <10%，用来验证双向死区。
+        // 密集频点：相邻档位相差 <10%。
         writer.policies[0].freqs = vec![100, 300, 500, 540, 580, 620, 700, 1000];
         writer.set_auto(true, true, 0.10);
 
         writer.apply(&[decision(540, 540, false)]).unwrap();
         assert_eq!(sysfs.range(), (540, 540));
-        // 上行 7.4%（540→580）在 ±10% 内：不写。
+        // 上行 7.4%（540→580）：升频不再被死区挡住，立即写入（否则欠频卡顿）。
         writer.apply(&[decision(580, 580, false)]).unwrap();
-        assert_eq!(sysfs.range(), (540, 540), "上行死区内保持不写");
+        assert_eq!(sysfs.range(), (580, 580), "升频必须立即生效");
         // 上行 14.8%：写入。
         writer.apply(&[decision(620, 620, false)]).unwrap();
         assert_eq!(sysfs.range(), (620, 620));
-        // 下行 6.5%（620→580）在 ±10% 内：不写。
+        // 下行 6.5%（620→580）在 10% 死区内：不写。
         writer.apply(&[decision(580, 580, false)]).unwrap();
         assert_eq!(sysfs.range(), (620, 620), "下行死区内保持不写");
         // 下行 19.4%：写入。

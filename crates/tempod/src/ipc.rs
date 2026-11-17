@@ -35,6 +35,8 @@ pub struct RuntimeStatus {
     pub static_cap: bool,
     /// 温度低于保护线时为 true：正在按退避节奏夺回外部（云控）写下的频率上限。
     pub respect_external: bool,
+    /// Doze（deviceidle IDLE）；仅息屏期间每 120s 查询一次，亮屏即清。
+    pub doze: bool,
     pub decisions: Vec<Decision>,
     pub touch_sources: usize,
     pub touch_events: u64,
@@ -228,6 +230,7 @@ pub fn status_json(
         "screen": {
             "on": runtime.screen_on,
             "source": runtime.screen_source,
+            "doze": runtime.doze,
         },
         "frame": {
             "available": runtime.frame_available,

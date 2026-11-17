@@ -1,6 +1,6 @@
 # Aegis
 
-**v5.0.0 · versionCode 28**｜Android arm64 CPU 分档自适应调频（新增 **AegisAuto** 完全接管模式）、可选帧反馈（Aegis Frame）、充电控制。
+**v5.1.0 · versionCode 29**｜Android arm64 CPU 分档自适应调频（**AegisAuto** 完全接管模式）、可选帧反馈（Aegis Frame）、充电控制。
 模块 id：`aegis_scheduler`；APP 包名：`com.aegis.scheduler`；支持通过 KernelSU / Magisk 安装。
 作者：**默默的阿文**。本项目为独立编写与独立署名，不包含第三方模块源码，详见 [PROVENANCE.md](PROVENANCE.md)。
 
@@ -14,7 +14,7 @@ Standard 模式下模块根据设备实际 cpufreq policy 生成档案，**主�
 
 1. 确认设备已 root，保留可用的模块禁用/救砖途径。先禁用其他调频及充电控制模块并重启，避免备份到其限制值；仅自动迁移旧 `tempo_sched`，不会自动识别所有竞争模块。
 2. 首次安装前保存现有 CPU policy、充电状态及旧配置；升级前备份 `/data/adb/tempo/`。**不要把另一台手机的 `profile/` 或 `orig/` 拷到本机使用。**
-3. 在模块管理器刷入 `Aegis-v5.0.0.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v5.0.0.apk`。已有不同签名 APP 可能无法覆盖安装（4.2.0 起为内测签名，需先卸载旧签名 APP）。
+3. 在模块管理器刷入 `Aegis-v5.1.0.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v5.1.0.apk`。已有不同签名 APP 可能无法覆盖安装（4.2.0 起为内测签名，需先卸载旧签名 APP）。
 4. 打开 Aegis，在 root 管理器中为 APP **单独授权超级用户权限**。随模块安装不等于已获 root；也可使用模块管理器支持的 WebUI。
 5. 服务等待开机完成（最多 180 秒）、解锁检查（最多 120 秒）及额外 30 秒，再生成档案、校验配置、备份并启动守护；默认还有 20 秒 cpufreq 只读保护。不要把启动保护期当成调频失效。
 6. 检查状态、探针、频表和读回错误，再逐项检查触摸/长按、冷启动、前台切换、阅读、视频和息屏；充电只允许隔离假节点的沙盒测试，禁止真机充电控制测试。每次只改一类参数，保留原配置和同条件对照记录。
@@ -209,15 +209,15 @@ rustup target add aarch64-linux-android
 .\scripts\build-android.ps1 -Release
 # 重建 WebUI、同步 APP assets、Gradle release、正式签名验证并输出 APK
 .\app\build.ps1
-.\scripts\build-module.ps1 -Version '5.0.0' `
+.\scripts\build-module.ps1 -Version '5.1.0' `
   -BuildDir $env:TEMPO_ANDROID_TARGET_DIR `
-  -Apk 'D:\aegis-build\output\Aegis-v5.0.0.apk' `
+  -Apk 'D:\aegis-build\output\Aegis-v5.1.0.apk' `
   -OutputDir 'D:\aegis-build\output'
 ```
 
 `build-module.ps1` 只打包现有 Android 二进制、`webui/dist/` 和匹配的已签名 APK，不会代替编译。需要直接使用 Cargo 时，先构建非空 `probe/dist/tempo.bpf.o`，设置 NDK linker、CC/AR 和 `CARGO_TARGET_DIR`（参照 `scripts/build-android.ps1`），再运行 `cargo build --release --target aarch64-linux-android --workspace`。不能只编译宿主程序后改名打包。
 
-正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 5.0.0 / 28，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
+正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 5.1.0 / 29，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
 
 ## 验证状态与许可
 
@@ -242,6 +242,17 @@ rustup target add aarch64-linux-android
 - **安全看门狗（三层实测）**：SIGTERM → 恢复 + `clean-exit` 标记，三点区间与 `orig/` 备份逐项一致；SIGKILL → shell 看门狗 `restore.sh` 恢复全部三点（含 governor）；SIGSTOP 14s → 新增 T 状态检测触发恢复（日志 `daemon frozen (state T)`）；恢复逐节点独立尝试并最多重试 3 轮，修复 v4.2“恢复单点失败即丢弃标记”的问题。
 - **测试**：宿主 `cargo test --workspace` 117 项全绿；**真机直接执行 tempod 测试体 75/75**（含 A16 帧解析、信号、writer 用例）；WebUI `node --test` 全绿；APK 同签名覆盖安装成功（CN=Aegis，v2/v3）。
 - **环境干扰记录**：设备存在 powerkeeper 类下限守护与场景类 max 改写（与 v4.0 记录一致），AegisAuto 以“地板让位 + 500ms 有界重夺”与其共存；`Scene` 应用在测试中曾被 force-stop（其 root 守护未受影响），测试结束已重新拉起。
+
+### v5.1.0 变更（实机复测后的修复，MIX FOLD 3 / babylon 内核）
+
+- **静态压缩修复（视频/阅读）**：5.0 实测抖音信息流播放时前台负载 0.09~0.20，超过普通静态进入阈值0.05/退出阈值0.12，静态限顶在播放时被立刻放出、形同未压缩。5.1 为视频/阅读类改用**进入0.20 / 释放0.35** 的专用阈值（常驻解码负载保持压缩，快速滑动/重渲染≥0.35 或任何交互当拍放行），普通类维持0.05/0.12 不变。实机复测：哔哩哔哩主页、抖音信息流播放均保持 `static_cap=true`、中核贴限顶频。
+- **静默限顶对调修复**：实机配置出现 `quiet_ratio=0.28 / quiet_cap=0.50`（静默反而比静态更松，即“静默反了”）。5.1 增加校验 `quiet_cap <= quiet_ratio`（守护端拒绝 + WebUI 保存前提示），并把该机配置改回 0.50/0.28。
+- **流畅度回退修复（AegisAuto）**：`auto_deadband` 死区改为**只压降向**（升频立即写入），负载升档在 AegisAuto 下跳过 `up_confirm` 确认直达目标（内核 walt 不再兜底时，确认窗+EMA 叠加会造成明显迟滞）；防抖仍由降频迟滞 `auto_down_hold_ms` 与降档步进负责。Standard 模式路径不变。
+- **息屏完全交还（省电）**：①心跳看门狗由固定每秒发 `SIGUSR1` 改为**亮屏接管1s快拍 / 息屏·未接管5分钟慢拍**（实测旧版息屏30s上下文切换163次、按秒唤醒阻断深睡）；②屏幕状态增加周期兜底重读（实测漏掉一次息屏边沿后会整轮按亮屏继续接管、30s 写频率179次），并把 `brightness>0` 纳入亮屏判定（AOD 下 bl_power 不可靠）；③息屏期间接管挂起（`path=null`、写入≈0）保持不变。
+- **Doze 识别**：新增 `screen.doze` 状态，仅息屏期间每120s查询一次 `deviceidle`，亮屏即清；识别失败不影响息屏交还主逻辑。
+- **system_server 高占用归因**：干净30s窗口 A/B（全运行17% / 停本模块21% / 停 freezer、aegisd 均无显著差异）证明**非本模块引起**；此前75%的尖峰伴随 CachedAppOptimizer 7万+缺页（内存压缩风暴、load24），属瞬态。守护自身仅4线程、无子进程、亮屏约26次/10s自愿切换。
+- **核心休眠**：该内核无 `core_ctl`（8核常在线），静态时各簇 pin 目标即梯底（中核499MHz级），模块不持有唤醒锁、不阻止 cpuidle；未引入额外热插拔管理。
+- 构建与测试：Rust 单元/集成测试 121 项通过（含新增视频/阅读静态限顶、静默对调校验、死区降向语义3组用例）；WebUI 契约测试通过。**帧感知仍严格按“选中应用才启用”**，未改动其判定链路。
 
 ### v4.2.0 变更（WebUI / APP 补齐，未真机复测）
 

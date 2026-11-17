@@ -64,7 +64,7 @@ impl ScreenWatcher {
             return Err(error);
         }
 
-        let on = read_bl_power(&device).unwrap_or(0) == 0;
+        let on = panel_on(&device);
         Ok(Self { fd, device, on })
     }
 
@@ -103,7 +103,7 @@ impl ScreenWatcher {
             }
         }
 
-        let now_on = read_bl_power(&self.device).unwrap_or(0) == 0;
+        let now_on = panel_on(&self.device);
         if now_on == self.on {
             None
         } else {
@@ -173,6 +173,20 @@ fn read_bl_power(device: &Path) -> Option<u32> {
         .trim()
         .parse()
         .ok()
+}
+
+/// 面板是否真的点亮。`bl_power==0`（unblank）在 AOD/异常路径下可能与实际
+/// 画面不一致（实测息屏期间 brightness 已为 0 但 bl_power 仍报 unblank，
+/// 导致息屏后仍按亮屏接管、持续写频率）：因此 brightness>0 才算亮。
+/// brightness 节点缺失的面板退回只看 bl_power。
+fn panel_on(device: &Path) -> bool {
+    if read_bl_power(device).unwrap_or(1) != 0 {
+        return false;
+    }
+    match std::fs::read_to_string(device.join("brightness")) {
+        Ok(text) => text.trim().parse::<u32>().unwrap_or(0) > 0,
+        Err(_) => true,
+    }
 }
 
 fn c_path(path: &Path) -> std::ffi::CString {

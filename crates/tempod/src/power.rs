@@ -97,6 +97,24 @@ pub fn thermal_c() -> Option<f32> {
     hottest_thermal()
 }
 
+/// Doze（deviceidle IDLE）识别。仅在息屏期间由事件循环每 120s 调用一次：
+/// 亮屏期间不查询，避免为识别本身制造 system_server 负载；查询失败按非
+/// Doze 处理（息屏交还内核的主逻辑不依赖该值，它只用于状态展示）。
+pub fn doze_active() -> bool {
+    let Ok(output) = std::process::Command::new("/system/bin/dumpsys")
+        .args(["-t", "2", "deviceidle"])
+        .output()
+    else {
+        return false;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(rest) = line.trim().strip_prefix("mState=") {
+            return rest.trim() == "IDLE";
+        }
+    }
+    false
+}
+
 /// Thermal zones that matter for the CPU guard. The sensor list is cached on
 /// first use: reading a zone backed by `qti_qmi_sensor_v2` performs a QMI
 /// transaction and can block for milliseconds, so walking all ~100 zones on

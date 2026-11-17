@@ -32,6 +32,11 @@ const OVER_BUDGET_SAMPLE_GAP_US: u64 = 2_500_000;
 // 低占用时的偶发掉帧不再把整机抬到最高档。
 const BURST_LIFT_TIERS: usize = 1;
 const PRESSURE_LIFT_TIERS: usize = 2;
+/// 内容消费类（视频/阅读）静态限顶的进入/释放阈值（前台负载比例）。
+/// 进入 0.20：覆盖播放时的解码/排版常驻负载（实测0.09~0.20）；
+/// 释放 0.35：与快速滑动/重渲染（实测≥0.35）分离，两段之间保持压缩。
+const CONSUME_STATIC_ENTER: f32 = 0.20;
+const CONSUME_STATIC_EXIT: f32 = 0.35;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -327,15 +332,25 @@ impl Controller {
             fg_now = fg_now.max(cluster.fg_raw);
             fg_ema = fg_ema.max(cluster.fg_ema);
         }
+        // 内容消费（视频/阅读）：解码与排版线程常驻，前台负载长期高于普通静态
+        // 阈值（实测抖音信息流播放0.09~0.20），按普通阈值会一直被放出限顶、
+        // 静态形同虚设。消费类用更宽的进入阈值与更高的释放阈值保持压缩；
+        // 触摸/启动/帧压力仍当拍放行，快速滑动（前台负载≥0.35）也会立即放行。
+        let consuming = matches!(self.app_class, AppClass::Video | AppClass::Reading);
+        let (enter, exit) = if consuming {
+            (CONSUME_STATIC_ENTER, CONSUME_STATIC_EXIT)
+        } else {
+            (
+                self.config.control.floor_enter_ratio,
+                self.config.control.floor_exit_ratio,
+            )
+        };
         if self.static_cap {
             // 前台负载回升或任何交互（触摸、启动、抬档、压力）都立刻放行上限。
-            if fg_now >= self.config.control.floor_exit_ratio || !self.interaction_clear(ts_us) {
+            if fg_now >= exit || !self.interaction_clear(ts_us) {
                 self.static_cap = false;
             }
-        } else if self.fg_tracking
-            && fg_ema <= self.config.control.floor_enter_ratio
-            && self.interaction_clear(ts_us)
-        {
+        } else if self.fg_tracking && fg_ema <= enter && self.interaction_clear(ts_us) {
             self.static_cap = true;
         }
     }
@@ -1064,6 +1079,11 @@ impl Controller {
                         _ => 0,
                     };
                     target.min(self.target_tier(index, ts_us, false))
+                } else if self.is_auto() {
+                    // AegisAuto 接管后内核 walt 不再兜底，负载升档若还要等
+                    // up_confirm 确认（+EMA 平滑）会比保留内核调度的 4.x 明显
+                    // 迟滞。直接给出负载目标，由死区与降频迟滞负责防抖。
+                    desired
                 } else {
                     0
                 };
@@ -1071,7 +1091,8 @@ impl Controller {
                     let step = if matches!(
                         base_reason,
                         DecisionReason::Launch | DecisionReason::Foreground
-                    ) {
+                    ) || (self.is_auto() && !event)
+                    {
                         immediate - old_tier
                     } else {
                         self.config.control.max_up_step.max(1) as usize

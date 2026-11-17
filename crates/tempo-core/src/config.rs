@@ -618,6 +618,15 @@ impl Config {
         if !(0.05..=0.90).contains(&c.quiet_cap) {
             bad.push("control.quiet_cap must be 0.05..=0.90".to_owned());
         }
+        // 语义约束：quiet_cap（完全静默）必须比 quiet_ratio（静态浏览）更紧。
+        // 实测出现过两个值对调（0.28/0.50），导致静默反而比静态更松、
+        // “静默反了”的直觉判断成立，这里直接拒绝该组合。
+        if c.quiet_cap > c.quiet_ratio {
+            bad.push(
+                "control.quiet_cap must be <= control.quiet_ratio (完全静默限顶不得高于静态限顶，两个值疑似对调)"
+                    .to_owned(),
+            );
+        }
         if !(0.005..=0.20).contains(&c.floor_enter_ratio) {
             bad.push("control.floor_enter_ratio must be 0.005..=0.20".to_owned());
         }
@@ -910,6 +919,23 @@ mod tests {
         let mut cfg = Config::default();
         cfg.control.fas_decay_ratio = 0.01;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn quiet_values_must_not_be_swapped() {
+        let mut cfg = Config::default();
+        // 实机手改配置里出现过 quiet_ratio=0.28 / quiet_cap=0.50 的对调。
+        cfg.control.quiet_ratio = 0.28;
+        cfg.control.quiet_cap = 0.50;
+        let error = cfg.validate().expect_err("对调必须被拒绝");
+        assert!(
+            error.to_string().contains("quiet_cap must be <= control.quiet_ratio"),
+            "错误信息必须指明对调：{error}"
+        );
+        // 正常取值（静态 0.50 / 静默 0.28）不受影响。
+        cfg.control.quiet_ratio = 0.50;
+        cfg.control.quiet_cap = 0.28;
+        cfg.validate().expect("正常取值必须通过");
     }
 
     #[test]

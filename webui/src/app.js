@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '5.0.0';
+  var APP_VERSION = '5.1.0';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -136,7 +136,7 @@
         { path: 'control.floor_exit_ratio', label: '静默退出阈值', min: 0.02, max: 0.40, step: 0.01, decimals: 2, tip: '前台负载达到该比例后退出静默；也是静态限顶的“当拍放开”阈值（按瞬时前台负载判定）。' },
         { path: 'control.floor_enter_ratio', label: '静默进入阈值', min: 0.005, max: 0.20, step: 0.005, decimals: 3, tip: '前台阶梯负载持续低于该比例，视为没有有效前台工作；也是静态限顶的进入阈值（按平滑前台负载判定）。' },
         { path: 'control.down_step_ms', label: '降档间隔', min: 15, max: 200, step: 1, integer: true, unit: 'ms', tip: '每次下降一档的最小间隔。' },
-        { path: 'control.quiet_ratio', label: '静态限顶比例', min: 0.05, max: 0.95, step: 0.01, decimals: 2, tip: '一般静态（前台低需求、无触摸/启动/帧压力，但仍在活动）时该簇顶频收缩到硬件频率跨度的该比例；前台瞬时负载达到退出阈值或任何交互当拍放开。0.5 ≈ 频率跨度一半；1 = 关闭静态限顶。看剧、看小说的静态场景由它压缩。' },
+        { path: 'control.quiet_ratio', label: '静态限顶比例', min: 0.05, max: 0.95, step: 0.01, decimals: 2, tip: '一般静态（前台低需求、无触摸/启动/帧压力，但仍在活动）时该簇顶频收缩到硬件频率跨度的该比例；前台瞬时负载达到退出阈值或任何交互当拍放开。0.5 ≈ 频率跨度一半；必须 ≥ 完全静默限顶比例。看剧、看小说由视频/阅读类的宽阈值（进入0.20、释放0.35）保持压缩。' },
         { path: 'control.quiet_cap', label: '完全静默限顶比例', min: 0.05, max: 0.90, step: 0.01, decimals: 2, tip: '完全静默（静默态，连前台活动都没有）时在静态限顶基础上进一步收紧的顶频比例，应 ≤ 静态限顶比例；退出静默立即回到静态限顶比例。' }
       ]
     },
@@ -881,6 +881,9 @@
       var budget = '静默进入预算需 ≤ 300ms（当前 ' + Math.round(events.quiet_decay_ms + control.floor_settle_ms) + 'ms）';
       errors['events.quiet_decay_ms'] = budget;
       errors['control.floor_settle_ms'] = budget;
+    }
+    if (control.quiet_cap > control.quiet_ratio) {
+      errors['control.quiet_cap'] = '完全静默限顶比例不能大于静态限顶比例（两个值疑似对调，守护会拒绝保存）';
     }
     return errors;
   }

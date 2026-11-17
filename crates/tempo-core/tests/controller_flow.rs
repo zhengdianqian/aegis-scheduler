@@ -99,6 +99,60 @@ fn default_caps_stay_at_hardware_max_in_every_app_class_and_event() {
 }
 
 #[test]
+fn consumption_class_static_cap_survives_playback_load_until_heavy_render() {
+    // 视频/阅读类：解码与排版常驻负载（实测0.09~0.20）不应放出静态限顶；
+    // 快速滑动/重渲染（≥0.35）或任何交互当拍放行。普通类维持 0.05/0.12。
+    let mut controller = Controller::new(profile(), Config::default());
+    controller.on_app_class(0, AppClass::Video);
+
+    // 进入：无交互 + 前台负载 0.15（低于视频类进入阈值 0.20）。
+    for ts in (100..=700).step_by(100) {
+        controller.on_demand(demand(ts, 0.15));
+    }
+    assert!(controller.is_static_cap(), "播放级负载下应保持静态限顶");
+    assert!(!controller.is_quiet(), "这是静态限顶而非静默");
+    let compressed = controller.cap_khz(1);
+    assert!(
+        compressed < controller.profile().clusters[1].max_khz,
+        "中核上限应被收缩，实际 {compressed}"
+    );
+
+    // 播放波动 0.05→0.20 之间：仍在压缩段。
+    for ts in (800..=1_400).step_by(100) {
+        controller.on_demand(demand(ts, 0.10));
+    }
+    assert!(controller.is_static_cap(), "轻微波动不应放出限顶");
+
+    // 重渲染/快速滑动 0.40（≥释放阈值0.35）：当拍放行。
+    controller.on_demand(demand(1_500, 0.40));
+    assert!(!controller.is_static_cap(), "重渲染必须立刻恢复完整上限");
+    assert_eq!(
+        controller.cap_khz(1),
+        controller.profile().clusters[1].max_khz
+    );
+}
+
+#[test]
+fn default_class_keeps_the_tight_enter_exit_pair() {
+    let mut controller = Controller::new(profile(), Config::default());
+    controller.on_app_class(0, AppClass::Default);
+    // 前台跟踪可用但负载为 0（真机 foreground_active 取决于 pid 集合，
+    // 与负载无关，这里手工构造等价样本）。
+    for ts in (100..=700).step_by(100) {
+        controller.on_demand(DemandSample {
+            ts_us: ts * MS,
+            cluster_busy: vec![0.0; 3],
+            foreground_busy: vec![0.0; 3],
+            foreground_active: true,
+        });
+    }
+    assert!(controller.is_static_cap());
+    // 0.12 已达到普通类退出阈值（视频类阈值是0.35，二者互不串用）。
+    controller.on_demand(demand(800, 0.12));
+    assert!(!controller.is_static_cap());
+}
+
+#[test]
 fn cluster_ratios_use_real_frequencies_independently_of_roles_and_ladders() {
     for count in 1..=6 {
         let mut device = profile();

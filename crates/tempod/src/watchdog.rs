@@ -29,11 +29,19 @@ use crate::writer::{self, EmergencyPolicy};
 
 /// 主事件循环允许的最大无心跳时长。
 const STALL: Duration = Duration::from_secs(5);
-/// 心跳线程每秒拍一次。
+/// 心跳线程每秒拍一次（仅接管且亮屏期间）。
 const BEAT: Duration = Duration::from_secs(1);
+/// 未接管/息屏期间的心跳间隔：息屏按秒发信号会阻断深睡（实测息屏期间
+/// 每秒唤醒一次、30s 上下文切换 160+ 次），接管挂起后最长 5 分钟拍一次
+/// 仅作卡死兜底，功耗可忽略。
+const BEAT_IDLE: Duration = Duration::from_secs(300);
+/// 息屏/未接管时允许的心跳时长（心跳间隔本身 5 分钟，放宽到 10 分钟）。
+const STALL_IDLE: Duration = Duration::from_secs(600);
 
 static HEARTBEAT_US: AtomicU64 = AtomicU64::new(0);
 static EMERGENCY_DONE: AtomicBool = AtomicBool::new(false);
+/// 接管是否活跃（AegisAuto 且亮屏）。事件循环每次醒来刷新。
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 struct Restore {
     policies: Vec<EmergencyPolicy>,
@@ -58,6 +66,11 @@ pub fn register(policies: Vec<EmergencyPolicy>, run_dir: PathBuf, log_path: Path
 /// 主循环每次醒来调用：刷新心跳时间戳。
 pub fn beat() {
     HEARTBEAT_US.store(crate::event_loop::now_us(), Ordering::Relaxed);
+}
+
+/// 接管活跃度（AegisAuto 且亮屏）：决定心跳频率与停摆判定阈值。
+pub fn set_active(active: bool) {
+    ACTIVE.store(active, Ordering::Relaxed);
 }
 
 /// 执行紧急回退（幂等）。成功后写入干净退出标记，shell 看门狗不再重复恢复。
@@ -105,7 +118,22 @@ pub fn spawn_heartbeat_thread() -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("aegis-watchdog".to_owned())
         .spawn(|| loop {
-            std::thread::sleep(BEAT);
+            // 息屏/未接管时慢拍：不阻断深睡，也不做无意义的信号唤醒。
+            let active = ACTIVE.load(Ordering::Relaxed);
+            std::thread::sleep(if active { BEAT } else { BEAT_IDLE });
+            let active = ACTIVE.load(Ordering::Relaxed);
+            if !active {
+                // 非接管期间内核拥有调频权，只做低频停摆兜底，不发信号。
+                let last = HEARTBEAT_US.load(Ordering::Relaxed);
+                if last != 0
+                    && crate::event_loop::now_us().saturating_sub(last)
+                        > STALL_IDLE.as_micros() as u64
+                {
+                    emergency("heartbeat stale while disengaged; main loop stuck");
+                    std::process::exit(70);
+                }
+                continue;
+            }
             // 阻塞在 signalfd 上的主循环会被该信号唤醒（不改变退出语义）。
             unsafe {
                 libc::kill(libc::getpid(), libc::SIGUSR1);
