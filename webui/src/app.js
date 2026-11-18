@@ -11,7 +11,7 @@
   var Tempo = (global.Tempo = global.Tempo || {});
 
   var MAX_LOG_LINES = 300;
-  var APP_VERSION = '5.1.0';
+  var APP_VERSION = '5.2.0';
 
   var ROLE = {
     efficiency: { label: '能效核', color: '#63a7ff' },
@@ -464,6 +464,17 @@
     }
     var uptime = running ? formatDuration(status.uptime_ms) : '--';
     var version = 'v' + APP_VERSION;
+    // 负载源诊断：eBPF 精度增强（默认）或 /proc/stat 标准回退，
+    // 回退原因挂在悬浮提示里（status.load_source_reason）。
+    var loadSource = '--';
+    var loadReason = '';
+    if (running && status) {
+      var source = String(status.load_source || '');
+      loadReason = String(status.load_source_reason || '');
+      if (source === 'ebpf') loadSource = 'eBPF 增强';
+      else if (source === 'proc_stat') loadSource = 'proc/stat 回退';
+      else if (source === 'unavailable') loadSource = '不可用';
+    }
 
     return '' +
       '<section class="card hero">' +
@@ -481,6 +492,7 @@
           '<div class="meta__cell"><span>版本</span><b>' + escapeHtml(version) + '</b></div>' +
           '<div class="meta__cell"><span>平台</span><b>' + escapeHtml(running ? (status.platform || '--') : '--') + '</b></div>' +
           '<div class="meta__cell"><span>运行时长</span><b>' + escapeHtml(uptime) + '</b></div>' +
+          '<div class="meta__cell" title="' + escapeHtml(loadReason) + '"><span>负载源</span><b>' + escapeHtml(loadSource) + '</b></div>' +
         '</div>' +
       '</section>';
   }
@@ -498,9 +510,10 @@
 
     var current = state.data.freqs[index];
     var hasCurrent = isFinite(Number(current)) && Number(current) > 0;
-    var span = Math.max(1, Number(cluster.max_khz) - Number(cluster.min_khz));
+    // 圆弧与中心数值一比一：当前频率 ÷ 该簇硬件最高频率（0..1），
+    // 不再按 min..max 归一化，圆环占比即真实频率占用。
     var ratio = hasCurrent
-      ? clamp01((Number(current) - Number(cluster.min_khz)) / span)
+      ? clamp01(Number(current) / Math.max(1, Number(cluster.max_khz)))
       : 0;
     var pct = Math.max(ratio * 100, hasCurrent ? 1.5 : 0);
 
@@ -2184,7 +2197,8 @@
           var current = data.freqs[i];
           var usage = data.usage[i];
           var cluster = clusters[i];
-          var ratio = current > 0 ? clamp01((current - cluster.min_khz) / Math.max(1, cluster.max_khz - cluster.min_khz)) : 0;
+          // 与首次渲染同口径：圆弧 = 当前频率 ÷ 硬件最高频率（一比一）。
+          var ratio = current > 0 ? clamp01(current / Math.max(1, cluster.max_khz)) : 0;
           cards[i].querySelector('.ring').style.setProperty('--pct', Math.max(ratio * 100, current > 0 ? 1.5 : 0) + '%');
           cards[i].querySelector('.ring__inner b').textContent = formatGhz(current);
           cards[i].querySelector('.bar--usage i').style.width = (typeof usage === 'number' ? formatPercent(usage) : '0%');

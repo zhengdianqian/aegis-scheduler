@@ -18,6 +18,11 @@ use crate::writer::CpufreqWriter;
 pub struct RuntimeStatus {
     pub probe: String,
     pub probe_error: Option<String>,
+    /// 当前负载源："ebpf"（精度增强包）/ "proc_stat"（标准回退）/
+    /// "unavailable"（两路源都不可用）。诊断包据此显示数据来源。
+    pub load_source: String,
+    /// 负载源回退原因（启动不可用、缓存命中或运行时安全阀）。
+    pub load_reason: Option<String>,
     pub cpu_count: usize,
     pub events: u64,
     pub active_events: u64,
@@ -227,6 +232,8 @@ pub fn status_json(
             "switches": runtime.switches.iter().sum::<u64>(),
             "error": runtime.probe_error,
         },
+        "load_source": runtime.load_source,
+        "load_source_reason": runtime.load_reason,
         "screen": {
             "on": runtime.screen_on,
             "source": runtime.screen_source,

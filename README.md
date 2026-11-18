@@ -1,6 +1,6 @@
 # Aegis
 
-**v5.1.0 · versionCode 29**｜Android arm64 CPU 分档自适应调频（**AegisAuto** 完全接管模式）、可选帧反馈（Aegis Frame）、充电控制。
+**v5.2.0 · versionCode 30**｜Android arm64 CPU 分档自适应调频（**AegisAuto** 完全接管模式）、可选帧反馈（Aegis Frame）、充电控制。
 模块 id：`aegis_scheduler`；APP 包名：`com.aegis.scheduler`；支持通过 KernelSU / Magisk 安装。
 作者：**默默的阿文**。本项目为独立编写与独立署名，不包含第三方模块源码，详见 [PROVENANCE.md](PROVENANCE.md)。
 
@@ -14,7 +14,7 @@ Standard 模式下模块根据设备实际 cpufreq policy 生成档案，**主�
 
 1. 确认设备已 root，保留可用的模块禁用/救砖途径。先禁用其他调频及充电控制模块并重启，避免备份到其限制值；仅自动迁移旧 `tempo_sched`，不会自动识别所有竞争模块。
 2. 首次安装前保存现有 CPU policy、充电状态及旧配置；升级前备份 `/data/adb/tempo/`。**不要把另一台手机的 `profile/` 或 `orig/` 拷到本机使用。**
-3. 在模块管理器刷入 `Aegis-v5.1.0.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v5.1.0.apk`。已有不同签名 APP 可能无法覆盖安装（4.2.0 起为内测签名，需先卸载旧签名 APP）。
+3. 在模块管理器刷入 `Aegis-v5.2.0.zip` 并重启。模块包含匹配 APK，开机后尝试自动安装/更新；安装失败见 `/data/adb/tempo/Aegis.log`，下次启动重试，也可手动安装 `Aegis-v5.2.0.apk`。已有不同签名 APP 可能无法覆盖安装（4.2.0 起为内测签名，需先卸载旧签名 APP）。
 4. 打开 Aegis，在 root 管理器中为 APP **单独授权超级用户权限**。随模块安装不等于已获 root；也可使用模块管理器支持的 WebUI。
 5. 服务等待开机完成（最多 180 秒）、解锁检查（最多 120 秒）及额外 30 秒，再生成档案、校验配置、备份并启动守护；默认还有 20 秒 cpufreq 只读保护。不要把启动保护期当成调频失效。
 6. 检查状态、探针、频表和读回错误，再逐项检查触摸/长按、冷启动、前台切换、阅读、视频和息屏；充电只允许隔离假节点的沙盒测试，禁止真机充电控制测试。每次只改一类参数，保留原配置和同条件对照记录。
@@ -39,6 +39,7 @@ $CTL logs --lines 80
 ## 控制逻辑与边界
 
 - 每簇从实际频表按索引抽取档位；默认最多 8 档，可设 6–10，原始频点不足时保留现有档位。负载经 EMA 平滑，升档需确认，常规降档一次一档；亮屏、前台切换、应用启动有独立短窗口。**单纯负载上升不作为应用启动事件。**
+- **负载源（v5.2 起抽象为 `LoadSource`）**：默认 eBPF 精度增强包（sched_switch 时间差按 CPU/簇聚合，比 /proc/stat 的 tick 粒度更细）；设备不支持、加载失败或运行时连续读取异常时自动静默回退标准 `/proc/stat` 采集（同量纲、同采样周期，决策层零改动），回退原因见 `status.load_source_reason` 与 WebUI“负载源”。帧感知数据源与负载源相互独立，帧感知默认关闭不受影响。
 - **AegisAuto 完全接管**：亮屏且模式为 AegisAuto 时，目标频率（负载 EMA + 触摸/启动/帧决策的产物）直接写入 `scaling_setspeed`（userspace 路径）或以 min=max 锁定（等效路径）；内核 governor 不再自行换档。±`auto_deadband` 死区内不写、降频需连续 `auto_down_hold_ms` 低负载；息屏挂起接管（区间交还内核），亮屏重新接管，切到 Standard 立即恢复原始区间与 governor。守护卡死（心跳停摆 >5s）、任意线程 panic、SIGTERM/INT、进程被 SIGSTOP（shell 看门狗 10s）或 SIGKILL（shell 看门狗）都会按开机备份恢复 `scaling_governor` 与 min/max——`orig/` 备份含 governor，恢复顺序为先区间后 governor，governor 回写失败时把 `scaling_setspeed` 拉回备份的可用频率兜底。
 - 同一触摸接触会话固定一次加档目标，不因持续移动或长按叠加；静态长按不重复续 boost；prime 角色不参与触摸加档，但仍可响应负载、启动和帧压力。
 - 低负载下中核偶发顶频来自厂商 `walt`：`pl=1` 的预测会把短时唤醒放大成一次最高频，实测 10 秒轻滑命中 `2707200` 达 80 次。`[governor]` 段只写 `walt/pl` 与 `walt/{up,down}_rate_limit_us`（默认关预测、升频 40 ms 节流、降频不节流），**不设置任何频率上限、不改 min/max**，且仅在 Standard 模式写入（AegisAuto 下内核 governor 不再决策，跳过）；同场景命中降到 0、平均频率 1187→1038 MHz、顶频驻留 9~10 ms→0~1 ms，Settings 滑动 0 掉帧、冷启动耗时无回归。降频加节流会把高频“挂”住并抬高平均频率，故默认不给降频节流。
@@ -73,7 +74,7 @@ APP / WebUI 共用控制服务和配置，提供状态、调度、帧反馈选�
 | `[mode]` | `name="AegisAuto"`（默认）或 `"Standard"`，与界面显示一致。AegisAuto：切换 `scaling_governor` 为 `userspace` 并直写 `scaling_setspeed`；内核无 `userspace` 时等效锁频（min=max=目标频率）。Standard：v4 行为。保存后热切换，无需重启 |
 | `[daemon]` | `log_level="off"`（默认不写日志，可用界面临时改 `info` 排查）；`profile_path="/data/adb/tempo/profile/device.toml"`（模块服务也显式传入该路径） |
 | `[governor]` | `smooth=true` 总开关；`prediction=false`（对应 `walt/pl`）；`up_rate_limit_us=40000`（0–100000）、`down_rate_limit_us=0`（0–200000）、`reapply_ms=60000`（0–600000）。只改换档节奏，不设置任何频率上下限；界面上这五项保存后立即生效 |
-| `[events]` | `runtime_quantum_us=250000`（500–300000 µs）、`demand_step=0.10`（0.01–0.20）：探针观察与发布阈值；`screen_path=""` 自动发现屏幕节点；`quiet_decay_ms=60`：最近触摸后的静默等待 |
+| `[events]` | `runtime_quantum_us=250000`（500–300000 µs）、`demand_step=0.10`（0.01–0.20）：探针观察与发布阈值（也是标准回退源的采样周期）；`screen_path=""` 自动发现并监听**全部**背光面板（任一面板点亮即亮屏，v5.2）；`quiet_decay_ms=60`：最近触摸后的静默等待 |
 | `[control]` 静默 | `floor_enter_ratio=0.05`、`floor_exit_ratio=0.12`（退出必须高于进入）、`floor_settle_ms=60`；`quiet_decay_ms + floor_settle_ms ≤ 300` |
 | 负载分档 | `tier_table_max=8`（6–10）、`up_confirm_ms=120`（40–400）、`down_step_ms=45`（15–200）、`max_up_step=2`（1–4）、`demand_smooth_ms=200`（50–1000） |
 | 交互窗口 | `touch_lift_tiers=1`（1–3）、`touch_lift_ms=150`（20–600）、`launch_lift_ms=1000`（200–1500）、`launch_tier_ratio=0.62`（0.30–0.90）；比例按档位索引计算，不是固定 GHz |
@@ -209,19 +210,26 @@ rustup target add aarch64-linux-android
 .\scripts\build-android.ps1 -Release
 # 重建 WebUI、同步 APP assets、Gradle release、正式签名验证并输出 APK
 .\app\build.ps1
-.\scripts\build-module.ps1 -Version '5.1.0' `
+.\scripts\build-module.ps1 -Version '5.2.0' `
   -BuildDir $env:TEMPO_ANDROID_TARGET_DIR `
-  -Apk 'D:\aegis-build\output\Aegis-v5.1.0.apk' `
+  -Apk 'D:\aegis-build\output\Aegis-v5.2.0.apk' `
   -OutputDir 'D:\aegis-build\output'
 ```
 
 `build-module.ps1` 只打包现有 Android 二进制、`webui/dist/` 和匹配的已签名 APK，不会代替编译。需要直接使用 Cargo 时，先构建非空 `probe/dist/tempo.bpf.o`，设置 NDK linker、CC/AR 和 `CARGO_TARGET_DIR`（参照 `scripts/build-android.ps1`），再运行 `cargo build --release --target aarch64-linux-android --workspace`。不能只编译宿主程序后改名打包。
 
-正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 5.1.0 / 29，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
+正式 APP 构建需本机 `app/keystore/keystore.properties` 提供 `storeFile`、`storePassword`、`keyAlias`、`keyPassword` 并指向正式密钥库；发布脚本要求 Aegis 正式证书、v2/v3 签名且不可调试，不会回退 debug。**密钥、密码、签名配置、SDK 本机路径及下载依赖不要提交仓库。** 候选产物版本应为 5.2.0 / 30，脚本从 Gradle 读取版本并核验成品；依赖缺失或校验失败必须停止发布，不得跳过签名检查。
 
 ## 验证状态与许可
 
 此 README 描述当前实现与验证方法，**不是泛机型验收报告**。未运行的构建、回归、跨机节点验证及功耗测试不记为成功；旧版本的帧率、电流和频率记录不能代表本版结果，故不在此沿用。正式适配需记录设备/内核/ROM、参数、节点读回、测试条件及同条件对照；降低频率不自动等于降低整机功耗。
+
+### v5.2.0 变更（eBPF 负载精度增强包 · 面板/备份两处实机根因修复）
+
+- **eBPF 负载采集精度增强包（默认启用，不可用自动静默回退）**：新增统一 `LoadSource` 接口（初始化/读取/可用性/关闭），决策层只消费同量纲的归一化样本、**不感知数据源**（本轮未改任何决策算法）。默认源 `EbpfSource` 包装 `tempo.bpf.o`（`tracepoint/sched/sched_switch`，BPF 侧只记录切换时间差并按 CPU/簇聚合，用户态读 Map 归一化）；设备不支持、加载失败或探测缓存判定“内核与版本均未变化的已知不可用”时，静默回退 `ProcStatSource`（/proc/stat 每 CPU 计数差值 + top-app 线程 `/proc/<tid>/stat` 归因，timerfd 按 `runtime_quantum_us` 同周期采样，口径与 WebUI 占用采样逐字节一致），回退后行为与标准 Aegis 一致、用户无感。首次探测结果缓存于 `/data/adb/tempo/ebpf-probe.cache`（内核/ROM/版本变化才重探）；运行时连续 5 次读 Map 失败或数据异常触发**安全阀永久回退**并记录原因。诊断：`status.load_source`（`ebpf`/`proc_stat`/`unavailable`）与 `load_source_reason`，WebUI 总览新增“负载源”卡片（悬浮显示原因），关键路径日志即使 `log_level=off` 也随 stdout 落盘。详见 [docs/ebpf-load-source.md](docs/ebpf-load-source.md)。
+- **修复“频率居高不下、占用率不高、卡着下不去”（实机根因 ×2）**：① **面板监听漂移**——重启后活跃背光面板注册顺序改变（MIX FOLD 3 双屏，实测 `panel1` 不再随亮灭屏变化），单面板监听把亮屏误判为息屏，Aegis 长期待机不接管；v5.2 监听 `/sys/class/backlight` **全部面板、任一面板点亮即亮屏**（折叠机开合双屏语义同样正确），周期兜底重读保留。② **开机助推备份污染**——开机引导期间厂商临时把 `scaling_min_freq` 抬到频段上半区（实机备份抓到 min=硬件最高频），旧版把该值当“原始下限”并在息屏/退出时恢复，频率被永久钉高；v5.2 对 `pristine` 下限做**跨度中点净化**（daemon `discover` 与 `cpufreq_backup.sh` 双路一致，同开机旧备份热升级自愈重写），上限不净化（热/电压保护必须保留）。
+- **圆环 1:1 显示（APP/WebUI）**：总览页三簇频率圆环占比改为 `当前频率 ÷ 硬件最高频率`，与中心显示的 GHz 数值一比一对应（原按 min..max 归一化会与数值错位）。
+- **交付与测试**：`LoadSource` 接口层单测（mock 源验证决策层不依赖具体实现）、降级路径模拟测试（加载失败、缓存跳过、Map 连续失败安全阀、样本数据异常）、/proc/stat 归一化纯函数测试全部通过；宿主 `cargo test --workspace` **138 项全绿**、WebUI `node --test` 全绿、`aarch64-linux-android` 目标编译检查通过；版本 5.2.0 / versionCode 30。eBPF 依赖与启用条件见 [docs/ebpf-load-source.md](docs/ebpf-load-source.md)，真机验证清单见 [docs/ebpf-device-checklist.md](docs/ebpf-device-checklist.md)（人工执行）。
 
 ### v5.0.0 变更（AegisAuto 完全接管 · 大版本）
 

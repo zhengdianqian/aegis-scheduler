@@ -25,6 +25,7 @@ mod governor;
 mod ipc;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod launch;
+mod load;
 mod power;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod probe;

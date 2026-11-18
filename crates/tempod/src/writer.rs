@@ -156,7 +156,7 @@ impl CpufreqWriter {
             policies.push(Policy {
                 cluster,
                 dir,
-                pristine_min: live_min,
+                pristine_min: sanitize_pristine_min(live_min, hw_min, hw_max),
                 pristine_max: live_max,
                 original_governor,
                 hw_min: hw_min.min(hw_max),
@@ -580,6 +580,22 @@ fn read_required(path: &Path) -> Result<u32, String> {
     read_u32(path)
         .filter(|value| *value > 0)
         .ok_or_else(|| format!("read {}: invalid or unavailable frequency", path.display()))
+}
+
+/// 开机频率助推净化（v5.2）。开机引导期间厂商会把 scaling_min_freq 临时抬到
+/// 频段上半区（实测启动后 70 s 的“原始备份”抓到 min=硬件最高频）。把助推值
+/// 当作 pristine 恢复，会在息屏挂起/退出时把频率重新钉死在高位——“频率居高
+/// 不下、占用率不高、卡着下不去”的成因之一。真正持久的厂商/用户下限不会超
+/// 过频率跨度中点，超过即视为助推残留，恢复时交还硬件最低频；上限不净化
+/// （热/电压保护必须原样保留）。与 packaging/cpufreq_backup.sh 的净化一致。
+pub(crate) fn sanitize_pristine_min(live_min: u32, hw_min: u32, hw_max: u32) -> u32 {
+    let hw_min = hw_min.min(hw_max);
+    let span = f64::from(hw_max) - f64::from(hw_min);
+    if span > 0.0 && f64::from(live_min) > f64::from(hw_min) + span * 0.5 {
+        hw_min
+    } else {
+        live_min.min(hw_max)
+    }
 }
 
 fn read_range(dir: &Path) -> Result<(u32, u32), String> {
@@ -1044,6 +1060,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempo_core::controller::DecisionReason;
+
+    #[test]
+    fn boot_boost_min_is_sanitized_but_real_floor_is_kept() {
+        // 实机（kalama）：开机约 70 s 的原始备份抓到 min=硬件最高频/接近最高，
+        // 属于开机引导助推残留，恢复时必须交还硬件最低频。
+        assert_eq!(sanitize_pristine_min(2_016_000, 307_200, 2_016_000), 307_200);
+        assert_eq!(sanitize_pristine_min(2_707_200, 499_200, 2_803_200), 499_200);
+        assert_eq!(sanitize_pristine_min(2_956_800, 595_200, 3_360_000), 595_200);
+        // 持久的厂商/用户下限（不超过频率跨度中点）原样保留。
+        assert_eq!(sanitize_pristine_min(600_000, 307_200, 2_016_000), 600_000);
+        assert_eq!(sanitize_pristine_min(307_200, 307_200, 2_016_000), 307_200);
+        // 恰好中点不算助推；span=0 时不动。
+        assert_eq!(sanitize_pristine_min(1_161_600, 307_200, 2_016_000), 1_161_600);
+        assert_eq!(sanitize_pristine_min(100, 100, 100), 100);
+    }
 
     struct Sysfs(PathBuf);
     impl Sysfs {

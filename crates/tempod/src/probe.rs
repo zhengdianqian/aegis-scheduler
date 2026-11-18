@@ -4,9 +4,10 @@
 
 //! Runtime probe session.
 //!
-//! The BPF object is embedded at compile time. If it is missing, or loading
-//! fails, the daemon reports the reason and disables scheduling: there is no
-//! degraded sampling fallback.
+//! The BPF object is embedded at compile time. Loading this session is the
+//! eBPF 精度增强包（默认启用）；当对象缺失、加载失败或探测缓存判定不可用时，
+//! `crate::load` 会静默回退到标准 /proc/stat 源（降级是一等公民），并记录
+//! 明确原因。运行时读取 Map 连续失败由 `crate::load` 的安全阀永久回退。
 //!
 //! The session owns the loaded object and the events ring. Its ring fd is
 //! registered directly in the control loop's epoll set, so a meaningful demand
@@ -96,7 +97,6 @@ pub struct ProbeSession {
     ebpf: Ebpf,
     ring: RingBuf<aya::maps::MapData>,
     ring_fd: RawFd,
-    cpu_count: usize,
     shape: Vec<ClusterShape>,
     foreground_pids: HashSet<u32>,
     events: u64,
@@ -169,7 +169,6 @@ impl ProbeSession {
             ebpf,
             ring,
             ring_fd,
-            cpu_count,
             shape,
             foreground_pids,
             events: 0,
@@ -183,16 +182,8 @@ impl ProbeSession {
         })
     }
 
-    pub fn foreground_count(&self) -> usize {
-        self.foreground_pids.len()
-    }
-
     pub fn foreground_error(&self) -> Option<&str> {
         self.foreground_error.as_deref()
-    }
-
-    pub fn cpu_count(&self) -> usize {
-        self.cpu_count
     }
 
     pub fn foreground_ids(&self) -> Vec<u32> {
@@ -207,12 +198,14 @@ impl ProbeSession {
 
     /// Consumes everything currently in the ring and, when the batch moved a
     /// cluster enough to matter, returns one snapshot for the whole batch.
-    pub fn drain(&mut self) -> Option<DemandSnapshot> {
+    ///
+    /// `Err` 表示 Map 读取类故障（供 `crate::load` 的运行时安全阀计数），
+    /// `Ok(None)` 只是“本拍无新观测”，两者不可混淆。
+    pub fn drain(&mut self) -> Result<Option<DemandSnapshot>, String> {
         let Self {
             ebpf,
             ring,
             ring_fd: _,
-            cpu_count: _,
             shape,
             foreground_pids,
             events,
@@ -248,34 +241,31 @@ impl ProbeSession {
             }
         }
 
-        let ts_us = latest_ts_us?;
+        let Some(ts_us) = latest_ts_us else {
+            return Ok(None);
+        };
 
         // The probe publishes a quantized demand ratio per cluster; the
         // control loop consumes that observation directly instead of
         // re-deriving a ratio over an arbitrary user-space interval.
-        let counters = Array::<_, ClusterState>::try_from(ebpf.map("CLUSTERS")?)
-            .map_err(|error| format!("open cluster counters: {error}"))
-            .ok()?;
+        let map = ebpf
+            .map("CLUSTERS")
+            .ok_or_else(|| "open cluster counters: map missing".to_owned())?;
+        let counters = Array::<_, ClusterState>::try_from(map)
+            .map_err(|error| format!("read cluster counters: {error}"))?;
 
         let mut cluster_busy = Vec::with_capacity(shape.len());
         let mut cluster_foreground = Vec::with_capacity(shape.len());
         let mut fg_switches = Vec::with_capacity(shape.len());
         let mut switches = Vec::with_capacity(shape.len());
         for index in 0..shape.len() {
-            match counters.get(&(index as u32), 0) {
-                Ok(state) => {
-                    cluster_busy.push(state.busy_bp as f32 / 1_000.0);
-                    cluster_foreground.push(state.fg_bp as f32 / 1_000.0);
-                    fg_switches.push(state.fg_switches);
-                    switches.push(state.switches);
-                }
-                Err(_) => {
-                    cluster_busy.push(0.0);
-                    cluster_foreground.push(0.0);
-                    fg_switches.push(0);
-                    switches.push(0);
-                }
-            }
+            let state = counters
+                .get(&(index as u32), 0)
+                .map_err(|error| format!("cluster counters get: {error}"))?;
+            cluster_busy.push(state.busy_bp as f32 / 1_000.0);
+            cluster_foreground.push(state.fg_bp as f32 / 1_000.0);
+            fg_switches.push(state.fg_switches);
+            switches.push(state.switches);
         }
 
         let foreground_active = !foreground_pids.is_empty();
@@ -286,13 +276,13 @@ impl ProbeSession {
             || foreground_active != *last_reported_foreground_active
             || foreground_changed;
         if !significant {
-            return None;
+            return Ok(None);
         }
         last_reported_busy.clone_from(&cluster_busy);
         last_reported_foreground.clone_from(&cluster_foreground);
         *last_reported_foreground_active = foreground_active;
 
-        Some(DemandSnapshot {
+        Ok(Some(DemandSnapshot {
             ts_us,
             busy: cluster_busy,
             foreground: cluster_foreground,
@@ -302,7 +292,12 @@ impl ProbeSession {
             events: *events,
             active_events: *active_events,
             foreground_changed,
-        })
+        }))
+    }
+
+    /// 事件环的 epoll 描述符（由 `crate::load` 注册到控制循环）。
+    pub fn ring_fd(&self) -> RawFd {
+        self.ring_fd
     }
 }
 

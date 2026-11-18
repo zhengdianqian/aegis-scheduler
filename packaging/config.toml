@@ -1,4 +1,4 @@
-# Aegis v5.0.0 默认配置，schema=1，AegisAuto 完全接管为默认模式。
+# Aegis v5.2.0 默认配置，schema=1，AegisAuto 完全接管为默认模式。
 # 开机从 sysfs 推导拓扑；capacity 缺失时估算，频表缺失时仅保留端点。
 schema = 1
 

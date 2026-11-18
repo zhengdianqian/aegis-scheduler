@@ -27,8 +27,10 @@ use crate::foreground::ForegroundResolver;
 use crate::governor;
 use crate::ipc::{self, ControlContext, Outcome, RuntimeStatus};
 use crate::launch::{self, WakePipe};
+use crate::load::{
+    self, EbpfSource, LoadManager, LoadSample, LoadSource, ProcStatSource, SourceKind,
+};
 use crate::power;
-use crate::probe::{self, ProbeSession};
 use crate::screen::ScreenWatcher;
 use crate::touch::TouchWatcher;
 use crate::watchdog;
@@ -45,9 +47,11 @@ const CHARGE_TIMER: Token = Token(12);
 const CONFIG_WATCH: Token = Token(13);
 const VERIFY: Token = Token(14);
 const CEILING_TIMER: Token = Token(15);
+/// 标准回退源（/proc/stat）的采样定时器；eBPF 活动时保持停摆。
+const DEMAND: Token = Token(16);
 const WAKE: Token = Token(100);
 const SIGNAL: Token = Token(101);
-const FIRST_CONNECTION: usize = 16;
+const FIRST_CONNECTION: usize = 17;
 
 fn write_clean_exit_marker(run_dir: &Path) -> io::Result<()> {
     let temporary = run_dir.join(".clean-exit.tmp");
@@ -234,7 +238,7 @@ pub fn run(
                 .register(&mut watcher, SCREEN, Interest::READABLE)
                 .map_err(|error| context("register screen watcher", error))?;
             tracing::info!(
-                device = %watcher.device().display(),
+                panels = %watcher.source(),
                 on = watcher.is_on(),
                 "display state source attached"
             );
@@ -253,39 +257,86 @@ pub fn run(
     if let Ok(mut state) = status.lock() {
         state.screen_on = screen_on;
         state.screen_source = match screen.as_ref() {
-            Some(watcher) => watcher.device().display().to_string(),
+            Some(watcher) => watcher.source().to_owned(),
             None => "unavailable".to_owned(),
         };
     }
 
-    let mut probe = match ProbeSession::open(&profile, &config) {
-        Ok(mut session) => {
-            poll.registry()
-                .register(&mut session, PROBE, Interest::READABLE)
-                .map_err(|error| context("register probe ring", error))?;
-            if let Err(error) = session.set_screen(screen_on) {
+    // 负载数据源：默认尝试 eBPF 精度增强包；不可用、缓存判定已知不可用或
+    // 加载失败时静默回退标准 /proc/stat 源（降级是一等公民）。两路源都拿
+    // 不到才不调度（与旧版“探针不可用则不调度”一致）。
+    let data_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("/data/adb/tempo"));
+    let cpu_count = profile
+        .clusters
+        .iter()
+        .flat_map(|cluster| cluster.cpus.iter().copied())
+        .max()
+        .map(|cpu| cpu as usize + 1)
+        .unwrap_or(1);
+    let cluster_count = profile.clusters.len();
+    let mut load: Option<LoadManager> = match load::open_manager(
+        data_dir,
+        &load::kernel_release(),
+        env!("CARGO_PKG_VERSION"),
+        cluster_count,
+        || {
+            EbpfSource::open(&profile, &config)
+                .map(|source| Box::new(source) as Box<dyn LoadSource>)
+        },
+        || {
+            ProcStatSource::open(&profile, &config)
+                .map(|source| Box::new(source) as Box<dyn LoadSource>)
+        },
+    ) {
+        Ok((mut manager, report)) => {
+            if let Some(fd) = manager.ebpf_fd() {
+                poll.registry()
+                    .register(&mut mio::unix::SourceFd(&fd), PROBE, Interest::READABLE)
+                    .map_err(|error| context("register load source ring", error))?;
+            }
+            if let Some(fd) = manager.timer_fd() {
+                poll.registry()
+                    .register(&mut mio::unix::SourceFd(&fd), DEMAND, Interest::READABLE)
+                    .map_err(|error| context("register load source timer", error))?;
+            }
+            if let Err(error) = manager.set_screen(screen_on) {
                 tracing::warn!(%error, "screen gate could not be applied");
             }
             if let Ok(mut state) = status.lock() {
-                state.probe = "ready".to_owned();
-                state.cpu_count = session.cpu_count();
-                state.foreground_pids = session.foreground_count();
-                state.foreground_error = session.foreground_error().map(str::to_owned);
+                state.load_source = report.kind.as_str().to_owned();
+                state.load_reason = report.reason.clone();
+                state.cpu_count = cpu_count;
+                state.foreground_pids = manager.foreground_ids().len();
+                state.foreground_error = manager.foreground_error();
+                if report.kind == SourceKind::Ebpf {
+                    state.probe = "ready".to_owned();
+                    tracing::info!(cpu_count, "runtime probe attached (eBPF 精度增强包)");
+                } else {
+                    state.probe = "disabled".to_owned();
+                    state.probe_error = report.reason.clone();
+                    tracing::warn!(
+                        reason = report.reason.as_deref().unwrap_or_default(),
+                        "eBPF 精度增强包不可用，已回退标准 /proc/stat 负载源"
+                    );
+                }
             }
-            tracing::info!(cpu_count = session.cpu_count(), "runtime probe attached");
-            Some(session)
+            Some(manager)
         }
         Err(error) => {
-            tracing::error!(%error, "runtime probe disabled; scheduling stays off");
+            tracing::error!(%error, "no load source available; scheduling stays off");
             if let Ok(mut state) = status.lock() {
                 state.probe = "disabled".to_owned();
-                state.probe_error = Some(error);
+                state.probe_error = Some(error.clone());
+                state.load_source = "unavailable".to_owned();
+                state.load_reason = Some(error);
             }
             None
         }
     };
 
-    if probe.is_some() {
+    if load.is_some() {
         writer = discover_writer(&status);
         if let Some(writer) = writer.as_mut() {
             writer.arm_guard(Duration::from_millis(config.control.startup_guard_ms));
@@ -367,9 +418,6 @@ pub fn run(
     // the only timer is a one-shot reservation boundary. When no switch is
     // writable the capability is reported as false instead of silently
     // pretending to control charging.
-    let data_dir = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("/data/adb/tempo"));
     // 真机隔离调度测试显式禁用充电控制，不打开 watcher，也不触碰充电节点。
     let charge_disabled =
         std::env::var_os("AEGIS_NO_CHARGE").as_deref() == Some(std::ffi::OsStr::new("1"));
@@ -444,8 +492,8 @@ pub fn run(
     }
 
     let mut foreground = ForegroundResolver::new();
-    if let Some(session) = probe.as_ref() {
-        let ids = session.foreground_ids();
+    if let Some(manager) = load.as_ref() {
+        let ids = manager.foreground_ids();
         foreground.resolve(&ids);
         if let Ok(mut state) = status.lock() {
             state.foreground_package = foreground.package().map(str::to_owned);
@@ -571,83 +619,46 @@ pub fn run(
                 continue;
             }
 
-            if token == PROBE {
-                if let Some(session) = probe.as_mut() {
-                    if controller.is_screen_on() {
-                        if let Some(sample) = session.drain() {
-                            // 探针现在按 200 ms 出样本；静态页面里这些样本的
-                            // busy/foreground 几乎不变，状态快照不需要每拍重写。
-                            if sample.foreground_changed
-                                && sample.ts_us.saturating_sub(last_foreground_us) >= 2_000_000
-                            {
-                                last_foreground_us = sample.ts_us;
-                                let ids = session.foreground_ids();
-                                let previous = foreground.package().map(str::to_owned);
-                                foreground.resolve(&ids);
-                                let package_changed = foreground.package() != previous.as_deref();
-                                if let Ok(mut state) = status.lock() {
-                                    state.foreground_package =
-                                        foreground.package().map(str::to_owned);
-                                    state.foreground_pids = ids.len();
-                                }
-                                // IME overlays change the focused window without
-                                // changing the app; only a real package switch
-                                // earns the warm-start lift.
-                                if package_changed {
-                                    pending_start_us = None;
-                                    launch_invalidated_us = sample.ts_us;
-                                    let decisions = controller.on_foreground_changed(sample.ts_us);
-                                    commit(&decisions, &mut writer, &status);
-                                    match controller.next_deadline(sample.ts_us) {
-                                        Some(deadline) => deadline_source.arm(deadline.at_us),
-                                        None => deadline_source.disarm(),
-                                    }
-                                }
-                                if refresh_frame_sidecar(&mut config, &mut frame_stamp, &frame_path) {
-                                    tracing::info!("frame feedback configuration reloaded from sidecar");
-                                }
-                                refresh_frame(&config, &foreground, &mut frame, &status, screen_on);
-                                if let Some(collector) = frame.as_mut() {
-                                    collector
-                                        .request(foreground.package().unwrap_or(""), sample.ts_us);
-                                }
-                                // Workload class: reading / video / IME change
-                                // the floor and cap policy, not just the load.
-                                let app_class = app_class_of(foreground.package(), &config);
-                                if let Ok(mut state) = status.lock() {
-                                    state.app_class = app_class.as_str().to_owned();
-                                }
-                                let app_class_decisions = controller.on_app_class(sample.ts_us, app_class);
-                                if !app_class_decisions.is_empty() {
-                                    commit(&app_class_decisions, &mut writer, &status);
-                                    match controller.next_deadline(sample.ts_us) {
-                                        Some(deadline) => deadline_source.arm(deadline.at_us),
-                                        None => deadline_source.disarm(),
-                                    }
-                                }
-                            }
-                            let decisions = controller.on_demand(DemandSample {
-                                ts_us: sample.ts_us,
-                                cluster_busy: sample.busy.clone(),
-                                foreground_busy: sample.foreground.clone(),
-                                foreground_active: sample.foreground_active,
-                            });
-                            // 负载突增交给需求换档；倍速播放和弹幕不是应用启动。
-                            let quiet = controller.is_quiet();
-                            let static_cap = controller.is_static_cap();
-                            // One lock for both the sample snapshot and the
-                            // smoothed usage: the WebUI only needs the newest
-                            // values, and a static page must not pay for a
-                            // second mutex round trip per sample.
-                            record(&status, Some(&sample), Some(quiet), Some(static_cap));
-                            commit(&decisions, &mut writer, &status);
-                            match controller.next_deadline(sample.ts_us) {
-                                Some(deadline) => deadline_source.arm(deadline.at_us),
-                                None => deadline_source.disarm(),
-                            }
-                        }
+            if token == PROBE || token == DEMAND {
+                if let Some(manager) = load.as_mut() {
+                    // 每个事件源只消费自己活动的负载源：eBPF 走事件环，
+                    // 标准回退走采样定时器。两路的 fd 都在启动时注册，切换
+                    // 时关闭的一路由内核自动从 epoll 摘除。
+                    let wanted = if token == PROBE {
+                        SourceKind::Ebpf
                     } else {
-                        let _ = session.drain();
+                        SourceKind::ProcStat
+                    };
+                    if manager.kind() == wanted {
+                        let outcome = if controller.is_screen_on() {
+                            manager.read()
+                        } else {
+                            // 息屏只排空产出、不喂给决策（与旧版探针一致）。
+                            let _ = manager.read();
+                            Ok(None)
+                        };
+                        match outcome {
+                            Ok(Some(sample)) => deliver_sample(
+                                &sample,
+                                manager,
+                                &mut controller,
+                                &mut writer,
+                                &status,
+                                &mut foreground,
+                                &mut config,
+                                &mut frame,
+                                &mut frame_stamp,
+                                &frame_path,
+                                &deadline_source,
+                                screen_on,
+                                &mut last_foreground_us,
+                                &mut pending_start_us,
+                                &mut launch_invalidated_us,
+                            ),
+                            Ok(None) => {}
+                            Err(error) => tracing::debug!(%error, "load source read failed"),
+                        }
+                        apply_load_switch(manager, &status);
                     }
                 }
                 continue;
@@ -669,8 +680,8 @@ pub fn run(
                         ceiling_timer.arm(now_us() + ceiling_backoff.reset());
                         refresh_frame_sidecar(&mut config, &mut frame_stamp, &frame_path);
                         refresh_frame(&config, &foreground, &mut frame, &status, on);
-                        if let Some(session) = probe.as_mut() {
-                            if let Err(error) = session.set_screen(on) {
+                        if let Some(manager) = load.as_mut() {
+                            if let Err(error) = manager.set_screen(on) {
                                 tracing::warn!(%error, "screen gate could not be applied");
                             }
                         }
@@ -955,6 +966,13 @@ pub fn run(
                                 screen_on,
                                 config.control.auto_deadband,
                             );
+                        }
+                        // 周期兜底发现的屏幕边沿同样要同步负载源的屏幕门：
+                        // 否则标准回退源的采样定时器不会随自愈的亮屏边沿启动。
+                        if let Some(manager) = load.as_mut() {
+                            if let Err(error) = manager.set_screen(on) {
+                                tracing::warn!(%error, "screen gate could not be applied");
+                            }
                         }
                         let at = now_us();
                         let decisions = controller.on_screen(at, on);
@@ -1349,9 +1367,113 @@ fn commit(
     }
 }
 
+/// 把一拍归一化负载样本喂给决策层。样本可能来自 eBPF 精度增强包，也可能
+/// 来自标准 /proc/stat 回退——字段与量纲完全一致，决策层不感知数据源。
+#[allow(clippy::too_many_arguments)]
+fn deliver_sample(
+    sample: &LoadSample,
+    manager: &LoadManager,
+    controller: &mut Controller,
+    writer: &mut Option<CpufreqWriter>,
+    status: &Arc<Mutex<RuntimeStatus>>,
+    foreground: &mut ForegroundResolver,
+    config: &mut Config,
+    frame: &mut Option<AegisFrameCollector>,
+    frame_stamp: &mut Option<String>,
+    frame_path: &Path,
+    deadline_source: &OneShotTimer,
+    screen_on: bool,
+    last_foreground_us: &mut u64,
+    pending_start_us: &mut Option<u64>,
+    launch_invalidated_us: &mut u64,
+) {
+    // 负载样本按量子拍出；静态页面里 busy/foreground 几乎不变，状态快照
+    // 不需要每拍重写。
+    if sample.foreground_changed
+        && sample.ts_us.saturating_sub(*last_foreground_us) >= 2_000_000
+    {
+        *last_foreground_us = sample.ts_us;
+        let ids = manager.foreground_ids();
+        let previous = foreground.package().map(str::to_owned);
+        foreground.resolve(&ids);
+        let package_changed = foreground.package() != previous.as_deref();
+        if let Ok(mut state) = status.lock() {
+            state.foreground_package = foreground.package().map(str::to_owned);
+            state.foreground_pids = ids.len();
+        }
+        // IME overlays change the focused window without
+        // changing the app; only a real package switch
+        // earns the warm-start lift.
+        if package_changed {
+            *pending_start_us = None;
+            *launch_invalidated_us = sample.ts_us;
+            let decisions = controller.on_foreground_changed(sample.ts_us);
+            commit(&decisions, writer, status);
+            match controller.next_deadline(sample.ts_us) {
+                Some(deadline) => deadline_source.arm(deadline.at_us),
+                None => deadline_source.disarm(),
+            }
+        }
+        if refresh_frame_sidecar(config, frame_stamp, frame_path) {
+            tracing::info!("frame feedback configuration reloaded from sidecar");
+        }
+        refresh_frame(config, foreground, frame, status, screen_on);
+        if let Some(collector) = frame.as_mut() {
+            collector.request(foreground.package().unwrap_or(""), sample.ts_us);
+        }
+        // Workload class: reading / video / IME change
+        // the floor and cap policy, not just the load.
+        let app_class = app_class_of(foreground.package(), config);
+        if let Ok(mut state) = status.lock() {
+            state.app_class = app_class.as_str().to_owned();
+        }
+        let app_class_decisions = controller.on_app_class(sample.ts_us, app_class);
+        if !app_class_decisions.is_empty() {
+            commit(&app_class_decisions, writer, status);
+            match controller.next_deadline(sample.ts_us) {
+                Some(deadline) => deadline_source.arm(deadline.at_us),
+                None => deadline_source.disarm(),
+            }
+        }
+    }
+    let decisions = controller.on_demand(DemandSample {
+        ts_us: sample.ts_us,
+        cluster_busy: sample.busy.clone(),
+        foreground_busy: sample.foreground.clone(),
+        foreground_active: sample.foreground_active,
+    });
+    // 负载突增交给需求换档；倍速播放和弹幕不是应用启动。
+    let quiet = controller.is_quiet();
+    let static_cap = controller.is_static_cap();
+    // One lock for both the sample snapshot and the
+    // smoothed usage: the WebUI only needs the newest
+    // values, and a static page must not pay for a
+    // second mutex round trip per sample.
+    record(status, Some(sample), Some(quiet), Some(static_cap));
+    commit(&decisions, writer, status);
+    match controller.next_deadline(sample.ts_us) {
+        Some(deadline) => deadline_source.arm(deadline.at_us),
+        None => deadline_source.disarm(),
+    }
+}
+
+/// 运行时安全阀触发后，把新的负载源与回退原因同步进诊断状态（只写一次）。
+fn apply_load_switch(manager: &mut LoadManager, status: &Arc<Mutex<RuntimeStatus>>) {
+    let Some(reason) = manager.take_switched() else {
+        return;
+    };
+    if let Ok(mut state) = status.lock() {
+        state.load_source = manager.kind().as_str().to_owned();
+        state.load_reason = Some(reason.clone());
+        state.probe = "disabled".to_owned();
+        state.probe_error = Some(reason.clone());
+    }
+    tracing::warn!(%reason, "load source switched to standard /proc/stat");
+}
+
 fn record(
     status: &Arc<Mutex<RuntimeStatus>>,
-    sample: Option<&probe::DemandSnapshot>,
+    sample: Option<&LoadSample>,
     quiet: Option<bool>,
     static_cap: Option<bool>,
 ) {
