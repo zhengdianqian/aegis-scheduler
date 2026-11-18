@@ -3,28 +3,24 @@
 # Copyright (c) 2026 默默的阿文
 #
 # Captures the live policy limits before the first write of a boot.
-# Hardware extrema are not a substitute for vendor/user limits: restoring them
-# would silently remove an existing ceiling. The governor is captured live.
+# The maximum is captured live: hardware extrema are not a substitute for a
+# vendor/user ceiling, and restoring an extreme would silently remove it.
 #
-# v5.2 净化：开机引导期间厂商会把 scaling_min_freq 临时抬到频段上半区
-# （实测开机 ~70 s 时 min=硬件最高频）。把助推残留记为“原始下限”会在恢复时
-# 把频率重新钉死在高位，因此超过频率跨度中点的下限一律按硬件最低频记录
-# （上、下限区别对待：上限必须原样保留，热/电压保护不能丢）。
+# v5.2 下限净化：备份可能抓在开机引导助推期（实测 min=硬件最高频）或外部
+# 守护（powerkeeper）活动地板期（实测 min=672000 被固化）。"恢复/交还内核"
+# 的语义是把下限还给硬件最低频——内核默认即如此，外部需要地板时会自行再抬；
+# 上限必须原样保留（热/电压保护不能丢）。cpuinfo 不可读时保留实测值。
 
 DATA=/data/adb/tempo
 ORIG=$DATA/orig
 ROOT=/sys/devices/system/cpu/cpufreq
 
-# 读取原始下限并按跨度中点判定是否为开机助推残留，输出净化后的值。
+# 输出该策略的恢复下限：cpuinfo_min_freq（不可读时退回实测值）。
 sanitize_min() {
     live=$1
     dir=$2
     hwmin=$(cat "$dir/cpuinfo_min_freq" 2>/dev/null)
-    hwmax=$(cat "$dir/cpuinfo_max_freq" 2>/dev/null)
-    [ -n "$hwmin" ] && [ -n "$hwmax" ] || { printf '%s\n' "$live"; return; }
-    [ "$hwmin" -le "$hwmax" ] 2>/dev/null || { printf '%s\n' "$live"; return; }
-    span=$((hwmax - hwmin))
-    if [ "$span" -gt 0 ] && [ "$live" -gt $((hwmin + span / 2)) ]; then
+    if [ -n "$hwmin" ] && [ "$hwmin" -gt 0 ] 2>/dev/null; then
         printf '%s\n' "$hwmin"
     else
         printf '%s\n' "$live"
@@ -34,7 +30,7 @@ sanitize_min() {
 boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || exit 1
 [ -n "$boot_id" ] || exit 1
 if [ -f "$ORIG/boot_id" ] && [ "$(cat "$ORIG/boot_id" 2>/dev/null)" = "$boot_id" ]; then
-    # 同一次开机的既有备份：重新校验下限，净化历史助推残留（支持热升级自愈）。
+    # 同一次开机的既有备份：把下限统一净化为硬件最低频（热升级自愈）。
     for dir in "$ROOT"/policy*; do
         [ -d "$dir" ] || continue
         name=${dir##*/}
@@ -44,7 +40,7 @@ if [ -f "$ORIG/boot_id" ] && [ "$(cat "$ORIG/boot_id" 2>/dev/null)" = "$boot_id"
         cleaned=$(sanitize_min "$live" "$dir")
         if [ "$cleaned" != "$live" ]; then
             printf '%s\n' "$cleaned" > "$saved" || exit 1
-            echo "aegis: sanitized boot-boost minimum for $name ($live -> $cleaned)"
+            echo "aegis: sanitized preserved minimum for $name ($live -> $cleaned)"
         fi
     done
     exit 0

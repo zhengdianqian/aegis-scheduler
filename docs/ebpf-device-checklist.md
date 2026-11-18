@@ -10,10 +10,10 @@
       `version=5.2.0 / versionCode=30`，APP 显示 v5.2.0。
 - [ ] 确认配置保持 `[mode] name = "AegisAuto"`、`log_level` 建议临时调为
       `info`（验收后按需改回 `off`）。
-- [ ] 旧备份自愈检查：`cat /data/adb/tempo/orig/policy0/min_freq` 应 ≤ 频率跨度
-      中点（5.2 起 `cpufreq_backup.sh` 对同开机的旧备份做净化重写）；
-      若文件仍为 2016000 这类助推值，手工 `rm -rf /data/adb/tempo/orig` 后
-      重跑 `sh /data/adb/modules/aegis_scheduler/scripts/cpufreq_backup.sh`。
+- [ ] 旧备份自愈检查：`cat /data/adb/tempo/orig/policy0/min_freq` 应 **== 该簇
+      `cpuinfo_min_freq`**（5.2 起下限一律净化为硬件最低频；`cpufreq_backup.sh`
+      对同开机的旧备份做自愈重写）；`run/cpufreq-backup.json` 的 `min_freq`
+      同样为硬件最低频（daemon 重启时重新抓取并净化）。
 
 ## 1. 负载源与回退（核心验收）
 
@@ -60,8 +60,9 @@
       `scaling_cur_freq` 随负载起落；`actual_freq_khz` 不再恒贴硬件最高频。
 - [ ] 息屏 10 min（或过夜抽样）：`dumpsys battery` 无异常耗电回归；
       `status.screen.doze` 正确；唤醒后接管恢复。
-- [ ] 备份净化：`cat /data/adb/tempo/run/cpufreq-backup.json` 的 `min_freq`
-      均 ≤ 该簇频率跨度中点（开机助推值已被净化为硬件最低频）。
+- [ ] 备份净化：`cat /data/adb/tempo/run/cpufreq-backup.json` 与
+      `/data/adb/tempo/orig/policy*/min_freq` 的 `min_freq` 均 **== 对应簇的
+      `cpuinfo_min_freq`**（开机助推值、外部活动地板均被净化为硬件最低频）。
 
 ## 4. 圆环 1:1 显示（APP 与 WebUI）
 

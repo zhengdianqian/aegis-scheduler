@@ -156,7 +156,7 @@ impl CpufreqWriter {
             policies.push(Policy {
                 cluster,
                 dir,
-                pristine_min: sanitize_pristine_min(live_min, hw_min, hw_max),
+                pristine_min: sanitize_pristine_min(hw_min, hw_max),
                 pristine_max: live_max,
                 original_governor,
                 hw_min: hw_min.min(hw_max),
@@ -582,20 +582,15 @@ fn read_required(path: &Path) -> Result<u32, String> {
         .ok_or_else(|| format!("read {}: invalid or unavailable frequency", path.display()))
 }
 
-/// 开机频率助推净化（v5.2）。开机引导期间厂商会把 scaling_min_freq 临时抬到
-/// 频段上半区（实测启动后 70 s 的“原始备份”抓到 min=硬件最高频）。把助推值
-/// 当作 pristine 恢复，会在息屏挂起/退出时把频率重新钉死在高位——“频率居高
-/// 不下、占用率不高、卡着下不去”的成因之一。真正持久的厂商/用户下限不会超
-/// 过频率跨度中点，超过即视为助推残留，恢复时交还硬件最低频；上限不净化
-/// （热/电压保护必须原样保留）。与 packaging/cpufreq_backup.sh 的净化一致。
-pub(crate) fn sanitize_pristine_min(live_min: u32, hw_min: u32, hw_max: u32) -> u32 {
-    let hw_min = hw_min.min(hw_max);
-    let span = f64::from(hw_max) - f64::from(hw_min);
-    if span > 0.0 && f64::from(live_min) > f64::from(hw_min) + span * 0.5 {
-        hw_min
-    } else {
-        live_min.min(hw_max)
-    }
+/// 开机频率助推与外部活动地板净化（v5.2）。备份在开机引导期或外部守护
+/// （powerkeeper）活动期抓取，实测既出现过 min=硬件最高频（助推残留，钉死在
+/// 高位），也出现过 min=672000 这类短暂地板被固化成恢复值（空闲被垫高）。
+/// “恢复/交还内核”的正确语义是把下限还给硬件最低频——内核默认即如此，外部
+/// 需要地板时会自行再抬；上限不净化（热/电压保护必须原样保留）。
+/// `hw_min` 由调用方在 cpuinfo 不可读时以实测值兜底。与 packaging/
+/// cpufreq_backup.sh 的净化一致。
+pub(crate) fn sanitize_pristine_min(hw_min: u32, hw_max: u32) -> u32 {
+    hw_min.min(hw_max)
 }
 
 fn read_range(dir: &Path) -> Result<(u32, u32), String> {
@@ -1062,18 +1057,17 @@ mod tests {
     use tempo_core::controller::DecisionReason;
 
     #[test]
-    fn boot_boost_min_is_sanitized_but_real_floor_is_kept() {
-        // 实机（kalama）：开机约 70 s 的原始备份抓到 min=硬件最高频/接近最高，
-        // 属于开机引导助推残留，恢复时必须交还硬件最低频。
-        assert_eq!(sanitize_pristine_min(2_016_000, 307_200, 2_016_000), 307_200);
-        assert_eq!(sanitize_pristine_min(2_707_200, 499_200, 2_803_200), 499_200);
-        assert_eq!(sanitize_pristine_min(2_956_800, 595_200, 3_360_000), 595_200);
-        // 持久的厂商/用户下限（不超过频率跨度中点）原样保留。
-        assert_eq!(sanitize_pristine_min(600_000, 307_200, 2_016_000), 600_000);
-        assert_eq!(sanitize_pristine_min(307_200, 307_200, 2_016_000), 307_200);
-        // 恰好中点不算助推；span=0 时不动。
-        assert_eq!(sanitize_pristine_min(1_161_600, 307_200, 2_016_000), 1_161_600);
-        assert_eq!(sanitize_pristine_min(100, 100, 100), 100);
+    fn pristine_min_restores_hardware_floor() {
+        // 备份抓取瞬间的 live 值（助推 min=硬件最高频、powerkeeper 活动地板
+        // 672000）不进入本函数：discover 传入的是 cpuinfo_min_freq（不可读时
+        // 才以实测值兜底）。恢复/交还 = 硬件下限，且永不超过硬件上限。
+        assert_eq!(sanitize_pristine_min(307_200, 2_016_000), 307_200);
+        assert_eq!(sanitize_pristine_min(499_200, 2_803_200), 499_200);
+        assert_eq!(sanitize_pristine_min(595_200, 3_360_000), 595_200);
+        // cpuinfo 不可读的兜底路径：透传调用方给的实测值。
+        assert_eq!(sanitize_pristine_min(672_000, 2_016_000), 672_000);
+        // 异常数据（下限高于上限）夹到上限内。
+        assert_eq!(sanitize_pristine_min(2_016_000, 1_000_000), 1_000_000);
     }
 
     struct Sysfs(PathBuf);

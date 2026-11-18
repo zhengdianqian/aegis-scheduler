@@ -195,8 +195,12 @@ while [ "$waited" -lt 120 ]; do
     sleep 1
 done
 if [ "$waited" -ge 120 ]; then
-    log "keyguard still up after ${waited}s; leaving cpufreq untouched"
-    exit 0
+    # v5.2：锁屏开机（充电夜间重启等场景）不再放弃启动——原分支直接退出，
+    # 整个开机周期既没有调度器，开机助推留下的下限地板也无人回收（2026-11-18
+    # 实测 keyguard 超时后 min 卡在 672000/614400/864000）。等待的价值只剩
+    # “抓备份时更平静”，而 v5.2 起备份下限一律净化为硬件最低频、守护自身还有
+    # 启动沉降与只读保护，因此超时后记录日志并继续启动。
+    log "keyguard still up after ${waited}s; starting anyway (v5.2: sanitized backup + daemon guards cover the rest)"
 fi
 sleep 30
 
